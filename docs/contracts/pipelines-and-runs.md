@@ -20,7 +20,15 @@ Four things, four responsibilities. None of them is a new execution abstraction:
    (`dispatch/pipeline_launch.py:162`, `:211`): resolve → drift check → `assert_runnable`
    → presets → coerce inputs → `plan_pipeline` → `inject_policy_gates` (`:278`) →
    `PipelineBridge.start_pipeline` (`dispatch/pipeline_bridge.py:561`). The record is
-   stamped `bundle_ref = pipeline:<pack>/<name>`.
+   stamped `bundle_ref = pipeline:<pack>/<name>`. Before the bridge, the admission door
+   (`admission_door.decide_admission`, #2190) decides once over the inputs: the holdout,
+   intake and licence doors and the policies' required checks. **Input expectations
+   (ADR-0142):** an input spec may declare `role:` (`training` · `validation` · `test` ·
+   `golden`) and `verdict: required`; the door then refuses a value that is not a `dataset:`
+   ref, a ref the registry does not hold, a version with another role, or one with no intake
+   verdict when it is required, and records every check under `admission.expectations`. An
+   unknown role or another `verdict:` value fails `parse_pipeline_def`
+   (`engine.pipeline.dataset_expectations`).
 2. **Advance** — `_advance` (`:783`) submits every ready step by kind (`_submit_step`,
    `:862`): a `flow:` leg becomes its own `Run` (`_submit_flow_leg`, `:957`) and runs
    `execute_leg` (`dispatch/leg_executor.py:114`); a `task:` leg invokes an operator;
