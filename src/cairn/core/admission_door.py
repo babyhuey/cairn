@@ -115,12 +115,17 @@ def _runtime_policies() -> list[Any]:
 
 
 async def _check_expectations(inputs: dict[str, Any], expectations: dict[str, dict[str, str]],
-                              store: Any, decision: AdmissionDecision) -> None:
+                              store: Any, decision: AdmissionDecision, *, workspace_id: str) -> None:
     """ADR-0142 D2 — each input that declares ``role:`` / ``verdict: required`` is checked against
     the version it was given: a value that is not a ``dataset:`` ref, a ref the registry does not
     hold, a different role, or no verdict when one is required refuses the launch. Every check
-    is recorded, passed or not."""
+    is recorded, passed or not.
+
+    Workspace-scoped like the intake and holdout doors: another workspace's version is "not
+    registered" here — the same answer as a name nobody holds, so a refusal never tells one
+    tenant what another has (ADR-0051 §4) — and its role and verdict are never read."""
     from cairn.core.dataset_roles import DEFAULT_ROLE  # noqa: PLC0415 — off the hot import path
+    from cairn.core.intake import normalize_verdict  # noqa: PLC0415
     from cairn.core.storage.artifacts import parse_dataset_ref  # noqa: PLC0415
 
     for name, want in sorted(expectations.items()):
@@ -142,11 +147,17 @@ async def _check_expectations(inputs: dict[str, Any], expectations: dict[str, di
             except Exception as exc:  # noqa: BLE001 — a registry that cannot answer refuses, never admits unchecked
                 problem = f"the registry could not be read ({type(exc).__name__})"
             else:
+                if meta is not None and (meta.get("workspace_id") or "") not in ("", workspace_id):
+                    meta = None  # another tenant's version: never read, reported as absent
                 if meta is None:
                     problem = "is not registered"
         if meta is not None:
             entry["role"] = str(meta.get("role") or DEFAULT_ROLE)
-            entry["verdict"] = meta.get("verdict")
+            try:
+                # an unreadable verdict is no verdict, as the intake door treats it
+                entry["verdict"] = normalize_verdict(meta.get("verdict")) if meta.get("verdict") else None
+            except ValueError:
+                entry["verdict"] = None
             if "role" in want and entry["role"] != want["role"]:
                 problem = f"is a {entry['role']} version; this input takes a {want['role']} one"
             elif want.get("verdict") and not entry["verdict"]:
@@ -216,7 +227,7 @@ async def decide_admission(
     decision.intake = {"checked": bool(intake.checked), "warnings": list(intake.warnings)}
 
     if expectations:
-        await _check_expectations(inputs, expectations, store, decision)
+        await _check_expectations(inputs, expectations, store, decision, workspace_id=workspace_id)
 
     licence = await check_license_for_inputs(inputs)
     decision.licence = licence.as_record() if hasattr(licence, "as_record") else {"ok": bool(getattr(licence, "ok", True))}

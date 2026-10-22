@@ -118,3 +118,54 @@ async def test_the_launch_door_refuses_before_any_record_exists(store, monkeypat
     with pytest.raises(AdmissionRefusedError, match="is a test version; this input takes a training one"):
         await launch_pipeline_def(d, inputs={**_GOOD, "train_version": "dataset:demo-test@1"}, bridge=_Bridge())
     assert _Bridge.started is False
+
+
+async def test_another_workspaces_version_is_never_read_and_reads_as_absent(store):
+    """A version registered in another workspace is "not registered" here: the same text as a
+    name nobody holds, so the refusal tells this tenant nothing about the other's data."""
+    await store.register(ArtifactDescriptor(uri="file:///d/theirs.jsonl", kind="dataset", content_hash="h-theirs"),
+                         producer_run_id="prep")
+    await store.register_dataset_version("their-train", "h-theirs", actor="prep", role="training",
+                                         workspace_id="other-tenant")
+    await store.set_dataset_version_verdict("their-train", 1, verdict="admitted", reasons=[], report={})
+    theirs = await _decide(store, train_version="dataset:their-train@1")
+    nobody = await _decide(store, train_version="dataset:nobody-train@1")
+    (t,) = [e for e in theirs.expectations if e["input"] == "train_version"]
+    assert theirs.refused and t["ok"] is False and "role" not in t and "verdict" not in t
+    reason = [r for r in theirs.refusing_reasons if "train_version" in r][0]
+    assert reason.endswith("is not registered")
+    assert reason.replace("their-train", "X") == [r for r in nobody.refusing_reasons
+                                                    if "train_version" in r][0].replace("nobody-train", "X")
+
+
+class _Meta:
+    """A registry that answers with fixed rows, or raises."""
+
+    def __init__(self, rows=None, error=None):
+        self.rows, self.error = rows or {}, error
+
+    async def get_dataset_version_meta(self, name, version=None):
+        if self.error:
+            raise self.error
+        return self.rows.get(name)
+
+
+async def test_a_registry_that_cannot_answer_refuses():
+    from cairn.core.admission_door import AdmissionDecision, _check_expectations
+
+    decision = AdmissionDecision()
+
+    await _check_expectations({"t": "dataset:demo-train@1"}, {"t": {"role": "training"}},
+                              _Meta(error=OSError("down")), decision, workspace_id="default")
+    assert decision.refusing_reasons == ["input 't' (dataset:demo-train@1) the registry could not be read (OSError)"]
+
+
+async def test_an_unreadable_verdict_is_no_verdict():
+    from cairn.core.admission_door import AdmissionDecision, _check_expectations
+
+    decision = AdmissionDecision()
+    rows = {"demo-train": {"role": "training", "verdict": "looks-fine", "workspace_id": "default"}}
+    await _check_expectations({"t": "dataset:demo-train@1"}, {"t": {"role": "training", "verdict": "required"}},
+                              _Meta(rows), decision, workspace_id="default")
+    assert decision.expectations[0]["verdict"] is None
+    assert "has no intake verdict" in decision.refusing_reasons[0]

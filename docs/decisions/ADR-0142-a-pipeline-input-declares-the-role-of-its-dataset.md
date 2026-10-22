@@ -49,7 +49,7 @@ value, refuses the launch when:
 - the version has another role;
 - `verdict: required` is declared and the version has no intake verdict.
 
-A registry that cannot answer refuses too. Every check, passed or not, is recorded under
+A registry that cannot answer refuses too. The check is workspace-scoped like the intake and holdout doors: another workspace's version is never read and is reported as "is not registered", the same answer as a name nobody holds, so a refusal tells one tenant nothing about another's data (ADR-0051 §4). An unreadable verdict counts as none. Every check, passed or not, is recorded under
 `admission.expectations` on the pipeline record (input, ref, expected and found role and
 verdict, `ok`), next to the holdout, intake and licence decisions.
 
