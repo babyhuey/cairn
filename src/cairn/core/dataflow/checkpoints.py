@@ -23,7 +23,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from cairn.core.dataflow.contract import DataflowSpec, ResumeFrom
 from cairn.core.storage.artifacts import ArtifactDescriptor, ArtifactStore
@@ -108,11 +108,20 @@ async def relay_local_checkpoints(
 
 
 async def find_resume_checkpoint(
-    store: ArtifactStore, key: str,
+    store: ArtifactStore, key: str, *,
+    workspace_id: Optional[str] = None,
+    run_workspace: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
 ) -> Optional[ResumeFrom]:
     """H6c — the newest registered, still-readable checkpoint for ``key``,
     as the ``resume_from`` block the runner consumes. ``None`` when there is
-    nothing to resume from (fresh legs cost one registry query)."""
+    nothing to resume from (fresh legs cost one registry query).
+
+    ``workspace_id`` keeps the search inside one workspace: a checkpoint counts
+    only when ``run_workspace(producer_run_id)`` (the workspace of the run that
+    relayed it) is that workspace. The spec key is a hash of the spec, so two
+    workspaces running the same spec share it; without this a leg could resume
+    from another workspace's bytes. A producer run that cannot be read does not
+    count — the leg starts fresh instead."""
     try:
         records = await store.list_artifacts(kind="dataset", limit=200)
     except Exception:  # noqa: BLE001 — a registry hiccup means "no resume"
@@ -122,6 +131,8 @@ async def find_resume_checkpoint(
     for r in records:
         s = dict(getattr(r, "stats", {}) or {})
         if not s.get("checkpoint") or str(s.get("spec_key", "")) != key:
+            continue
+        if workspace_id is not None and not await _produced_in(r, workspace_id, run_workspace):
             continue
         if best is None or int(s.get("stage_index", -1)) > int(
                 dict(best.stats).get("stage_index", -1)):
@@ -150,6 +161,19 @@ async def find_resume_checkpoint(
         + [{"index": idx, "stage": manifest.get("stage", ""),
             "stats": dict(manifest.get("stats") or {})}],
     )
+
+
+async def _produced_in(record: Any, workspace_id: str,
+                       run_workspace: Optional[Callable[[str], Awaitable[Optional[str]]]]) -> bool:
+    """Whether ``record`` was relayed by a run of ``workspace_id``. Unknown is no."""
+    producer = str(getattr(record, "producer_run_id", "") or "")
+    if not producer or run_workspace is None:
+        return False
+    try:
+        return await run_workspace(producer) == workspace_id
+    except Exception:  # noqa: BLE001 — an unreadable producer is not this workspace's
+        _log.debug("checkpoint producer %s unreadable", producer, exc_info=True)
+        return False
 
 
 __all__ = ["find_resume_checkpoint", "relay_local_checkpoints", "spec_key"]

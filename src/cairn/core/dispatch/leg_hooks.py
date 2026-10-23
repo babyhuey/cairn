@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from cairn.core._time import utc_now_iso
+from cairn.core.workspace import DEFAULT_WORKSPACE
 
 logger = logging.getLogger("cairn.dispatch.leg_hooks")
 
@@ -269,6 +270,16 @@ class FlowLegHooks:
         await self.emit(self.run_id, "leg_readopted", {
             "leg": self.leg_ref, "step_id": self.step_id, **detail})
 
+    async def _run_workspace(self, run_id: str) -> Optional[str]:
+        """The workspace a run's record names (``None`` when it cannot be read)."""
+        try:
+            run = await self.run_store.get(run_id)
+        except Exception:  # noqa: BLE001 — unreadable is unknown
+            return None
+        if run is None:
+            return None
+        return str(getattr(run, "workspace_id", "") or "") or DEFAULT_WORKSPACE
+
     def resume_provider(self) -> Callable[[str], Awaitable[Any]]:
         from cairn.core.dataflow.checkpoints import find_resume_checkpoint  # noqa: PLC0415 — cycle
 
@@ -277,7 +288,12 @@ class FlowLegHooks:
         async def _lookup(key: str):
             if store is None:
                 return None
-            return await find_resume_checkpoint(store, key)
+            # Only this leg's workspace's checkpoints: the one its run record names.
+            ws = await self._run_workspace(self.run_id)
+            if ws is None:
+                return None
+            return await find_resume_checkpoint(store, key, workspace_id=ws,
+                                                run_workspace=self._run_workspace)
 
         return _lookup
 
