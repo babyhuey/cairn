@@ -243,7 +243,9 @@ async def execute_leg(
         # An engine whose job runs on another machine (the SSH engine) declares
         # `needs_durable_inputs`: a control-plane path means nothing there, so its
         # refs resolve to the durable copy whenever one exists (ADR-0149).
-        durable = bool(getattr(engine, "needs_durable_inputs", False))
+        from cairn.core.dataflow.engine import needs_durable_inputs  # noqa: PLC0415 - cycle: engine → contract ← this module
+
+        durable = needs_durable_inputs(engine)
         try:
             config = await resolve_dataset_refs_in_config(
                 build_artifact_store(), config, prefer_durable=durable)

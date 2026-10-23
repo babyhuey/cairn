@@ -27,6 +27,7 @@ import re
 import shlex
 import shutil
 from collections.abc import Iterable, Mapping
+from urllib.parse import urlparse
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -93,11 +94,16 @@ def remote_env_names() -> tuple[list[str], list[str]]:
     A problem names the variable and the rule, never a value."""
     names: list[str] = []
     problems: list[str] = []
-    for name in re.split(r"[\s,]+", _selected("remote_env", "").strip()):
-        if not name or name in names:
+    entries = [e for e in re.split(r"[\s,]+", _selected("remote_env", "").strip()) if e]
+    for pos, name in enumerate(entries, start=1):
+        if name in names:
             continue
         if not _ENV_NAME.match(name):
-            problems.append(f"{name!r} is not an environment variable name")
+            # Only the entry's position and its leading name characters: whatever
+            # follows (`HF_TOKEN=hf_…`) may be a value pasted in by mistake.
+            lead = re.match(r"[A-Za-z0-9_]*", name).group()
+            problems.append(f"entry {pos}{f' (starting {lead!r})' if lead else ''} "
+                            "is not an environment variable name")
         elif any(m in name.upper() for m in _CREDENTIAL_MARKERS):
             problems.append(f"{name} looks like a credential; credentials stay on the box "
                             "(an instance role or the box's own environment), never in the job")
@@ -108,15 +114,22 @@ def remote_env_names() -> tuple[list[str], list[str]]:
     return names, problems
 
 
-def _control_plane_only(value: Any) -> str:
-    """The location of a launch-resolved dataset version (``<uri>#sha256=<hash>``,
-    see ``resolve_dataset_refs_in_config``) when it is a control-plane path
-    (``file://`` or absolute), else ``""``. A plain path with no pin is an
-    upstream leg's hand-off, which :meth:`BuiltinSshEngine._localize_inputs` ships."""
+def _control_plane_only(value: Any, where: str = "") -> list[tuple[str, str]]:
+    """``(where, location)`` for every launch-resolved dataset version
+    (``<uri>#sha256=<hash>``, see ``resolve_dataset_refs_in_config``) in ``value``,
+    searched through nested dicts and lists, whose location is a control-plane
+    path: absolute, or any ``file:`` URI (``file:///x`` and ``file:/x`` alike, the
+    registry's ``local_path`` semantics). A plain path with no pin is an upstream
+    leg's hand-off, which :meth:`BuiltinSshEngine._localize_inputs` ships."""
+    if isinstance(value, dict):
+        return [hit for k, v in value.items()
+                for hit in _control_plane_only(v, f"{where}.{k}" if where else str(k))]
+    if isinstance(value, list):
+        return [hit for i, v in enumerate(value) for hit in _control_plane_only(v, f"{where}[{i}]")]
     if not isinstance(value, str) or "#sha256=" not in value:
-        return ""
+        return []
     loc = value.partition("#")[0]
-    return loc if loc.startswith(("file://", "/")) else ""
+    return [(where, loc)] if loc.startswith("/") or urlparse(loc).scheme == "file" else []
 
 
 def _remote_command() -> str:
@@ -272,19 +285,17 @@ class BuiltinSshEngine:
         _, env_problems = remote_env_names()
         if env_problems:
             problems.append("remote_env: " + "; ".join(env_problems))
+        found = _control_plane_only(spec.config, "spec config")
         for ref in spec.stages:
-            for key, value in ref.config.items():
-                for item in value if isinstance(value, list) else [value]:
-                    loc = _control_plane_only(item)
-                    if loc:
-                        problems.append(
-                            f"stage {ref.stage!r} config {key!r}: dataset version {loc} has no "
-                            f"durable copy and exists only on the control plane, which the box "
-                            f"behind {self._target!r} cannot read. Configure the object store "
-                            "on the control plane (CAIRN_ARTIFACT_STORE=s3 and "
-                            "CAIRN_ARTIFACT_S3_BUCKET) and register the version again while "
-                            "its file is still there, or re-run the step that produced it; "
-                            "the ref then resolves to the durable copy")
+            found += _control_plane_only(ref.config, f"stage {ref.stage!r} config")
+        for where, loc in found:
+            problems.append(
+                f"{where}: dataset version {loc} has no durable copy and exists only on "
+                f"the control plane, which the box behind {self._target!r} cannot read. "
+                "Configure the object store on the control plane (CAIRN_ARTIFACT_STORE=s3 "
+                "and CAIRN_ARTIFACT_S3_BUCKET) and register the version again while its "
+                "file is still there, or re-run the step that produced it; the ref then "
+                "resolves to the durable copy")
         return problems
 
     async def _exec_ctx(self, ctx: Any) -> SimpleNamespace:
@@ -412,8 +423,13 @@ class BuiltinSshEngine:
             # reconstructable after a control-plane restart. `mode`/`image` ride
             # along as the run's PROVENANCE: "which build produced this adapter?"
             # is otherwise unanswerable after the fact (#1776).
-            meta={"job_handle": dataclasses.asdict(jh), "exec_input": inp.model_dump(),
-                  "mode": mode, "image": image},
+            # ADR-0149 D2: the meta is persisted on the pipeline step and served by
+            # the API, so the exec input goes WITHOUT its env (the job-channel
+            # token, MLFLOW_TRACKING_PASSWORD, forwarded values); only the NAMES
+            # are kept. Nothing after submit needs the values: poll reads `fetch`.
+            meta={"job_handle": dataclasses.asdict(jh),
+                  "exec_input": inp.model_dump(exclude={"env"}),
+                  "env_names": sorted(env), "mode": mode, "image": image},
         )
 
     def _rebuild(self, handle: EngineJobHandle):
@@ -440,9 +456,12 @@ class BuiltinSshEngine:
 
     async def cancel(self, handle: EngineJobHandle) -> None:
         remote_exec, jh, _ = self._rebuild(handle)
-        # the target connection's key — the credential submit used (it logs a
-        # warning itself when the box cannot be reached)
-        await remote_exec._cancel(jh, connection=self._target)
+        # the key of the connection the job was submitted with (the target only
+        # for a handle saved before that was recorded). A cancel that did not
+        # reach the box is an error to the caller, never "sent" (ADR-0149 D4).
+        if not await remote_exec._cancel(jh, connection=self._target):
+            raise EngineError(f"could not cancel {handle.job_id}: the box was not reached "
+                              "and the job may still be running")
 
     # ── H6b/d (#1248, ADR-0088 D4): pull declared checkpoints off the box ──
     async def fetch_checkpoints(self, handle: EngineJobHandle, dest_dir: Path) -> bool:

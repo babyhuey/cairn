@@ -1,8 +1,9 @@
 """remote/exec: the job's env file and the credential cancel reconnects with.
 
 * ``runner.sh`` exports the job's environment (the spec, the job-channel token,
-  forwarded settings). It is made owner-only BEFORE any of that is written, so
-  another account on the box can never read it, even briefly.
+  forwarded settings). A stale copy is removed first, and the file is CREATED
+  with mode 0600 (SFTP open attrs), so it is never readable by another account
+  on the box, assuming the SFTP server honours the create mode (OpenSSH does).
 * Submit authenticates with the compute.ssh connection's ``PRIVATE_KEY``. Cancel
   runs later with no operation context, and used to reconnect with
   ``SSH_PRIVATE_KEY`` from the control plane's env instead: with the documented
@@ -63,10 +64,8 @@ class _Conn:
             async def __aenter__(s): return s
             async def __aexit__(s, *a): return False
             async def put(s, local, remote): events.append(("put", local))
-            async def chmod(s, path, mode): events.append(("chmod", path, mode))
-
-            def open(s, path, mode):
-                events.append(("open", path, mode))
+            def open(s, path, mode, attrs=None):
+                events.append(("open", path, mode, getattr(attrs, "permissions", None)))
 
                 class _F:
                     async def __aenter__(f): return f
@@ -103,13 +102,15 @@ def _bind_connection(monkeypatch, key="CONN-KEY", *, exists=True):
     return seen
 
 
-async def test_runner_is_owner_only_before_anything_is_written(monkeypatch):
+async def test_runner_is_created_owner_only(monkeypatch):
     events, _ = _wire(monkeypatch)
     await RemoteExecOp().submit(RemoteExecInput(command="run", env={"CAIRN_ENGINE_TOKEN": "tok"}), _ctx())
-    runner = [e for e in events if len(e) > 1 and str(e[1]).endswith("runner.sh")]
-    kinds = [e[0] for e in runner]
-    assert kinds == ["open", "chmod", "write"], kinds
-    assert runner[1][2] == 0o600
+    runner = [e for e in events if e[0] != "run" and str(e[1]).endswith("runner.sh")]
+    assert [e[0] for e in runner] == ["open", "write"], runner
+    assert runner[0][3] == 0o600                      # the mode is set when it is created
+    # a stale runner.sh is removed first, so the create mode always applies
+    rm = next(e[1] for e in events if e[0] == "run" and e[1].startswith("rm -f"))
+    assert "runner.sh" in rm
     # the value is in the file, not on any command line
     assert not any("tok" in e[1] for e in events if e[0] == "run")
 
@@ -170,3 +171,101 @@ async def test_cancel_that_cannot_authenticate_says_so(monkeypatch, caplog):
         assert await remote_exec._cancel(h) is False
     assert "PermissionError" in caplog.text and "box" in caplog.text
     assert "CONN-KEY" not in caplog.text
+
+
+# ── the job's account: cancel works with no workspace in scope ──────────────
+
+
+async def test_submit_records_the_account_and_workspace(monkeypatch):
+    _wire(monkeypatch)
+    ctx = _ctx()
+    ctx.compute.account_id = "acct-1"
+    h = await RemoteExecOp().submit(RemoteExecInput(command="run"), ctx)
+    assert h.meta["account_id"] == "acct-1"
+    assert h.meta["workspace_id"]
+
+
+async def test_cancel_resolves_in_the_jobs_recorded_account(monkeypatch):
+    _, params_seen = _wire(monkeypatch)
+    seen_kw: list = []
+
+    async def fake_resolve(name, **kw):
+        seen_kw.append(kw)
+        return type("RC", (), {"name": name, "config": {"host": "box"},
+                               "secrets": {"PRIVATE_KEY": "CONN-KEY"}})()
+    monkeypatch.setattr(connections, "resolve_connection", fake_resolve)
+    h = JobHandle(job_id="box:/w", backend="ssh", meta={
+        "host": "box", "user": "ubuntu", "port": 22, "workdir": "/w",
+        "connection": "gpu", "account_id": "acct-1"})
+    assert await remote_exec._cancel(h) is True
+    assert seen_kw == [{"account_id": "acct-1"}]
+    assert params_seen[0]["private_key"] == "CONN-KEY"
+
+
+def _real_connection(monkeypatch, tmp_path):
+    """A real sqlite connection store holding the deployment's `gpu` connection,
+    with auth ON and no workspace in scope (the learning-gate abort, a run
+    cancel outside its scope). Nothing about the account is stubbed."""
+    from cairn.core.connections import Connection, SqliteConnectionStore
+
+    db = str(tmp_path / "connections.db")
+    monkeypatch.setenv("CAIRN_CONNECTIONS_DB", db)
+    monkeypatch.delenv("CAIRN_STORAGE", raising=False)
+    monkeypatch.delenv("CAIRN_WORKSPACE", raising=False)
+    monkeypatch.setenv("GPU_SSH_KEY", "CONN-KEY")
+    store = SqliteConnectionStore(db)
+    return store, Connection(name="gpu", kind="compute.ssh", account_id="default",
+                             config={"host": "box", "user": "ubuntu", "port": "22"},
+                             secrets={"PRIVATE_KEY": "GPU_SSH_KEY"})
+
+
+async def test_cancel_with_auth_on_and_no_workspace_in_scope(monkeypatch, tmp_path):
+    store, conn = _real_connection(monkeypatch, tmp_path)
+    await store.create(conn)
+    store.close()
+    monkeypatch.setenv("CAIRN_JWT_SECRET", "s" * 40)
+    _, params_seen = _wire(monkeypatch)
+    h = JobHandle(job_id="box:/w", backend="ssh", meta={
+        "host": "box", "user": "ubuntu", "port": 22, "workdir": "/w",
+        "connection": "gpu", "account_id": "default"})
+    assert await remote_exec._cancel(h) is True
+    assert params_seen[0]["private_key"] == "CONN-KEY"
+
+
+class _Registry:
+    def get(self, name):
+        return RemoteExecOp
+
+
+async def test_a_run_cancel_counts_only_jobs_it_reached(monkeypatch, tmp_path):
+    """dispatcher.cancel → cancel_remote_jobs_for_run, with auth on and no scope:
+    the job is reached with the recorded account; a box that cannot be reached is
+    not counted as cancelled (the record is still closed)."""
+    from cairn.core.operator import job_store as js
+    from cairn.core.operator.job_control import cancel_remote_jobs_for_run
+    from cairn.core.operator.job_store import RUNNING, InMemoryRemoteJobStore, RemoteJobRecord
+
+    store, conn = _real_connection(monkeypatch, tmp_path)
+    await store.create(conn)
+    store.close()
+    monkeypatch.setenv("CAIRN_JWT_SECRET", "s" * 40)
+    jobs = InMemoryRemoteJobStore()
+    monkeypatch.setattr(js, "get_remote_job_store", lambda: jobs)
+    meta = {"host": "box", "user": "ubuntu", "port": 22, "workdir": "/w",
+            "connection": "gpu", "account_id": "default"}
+    await jobs.register(RemoteJobRecord(run_id="r-1", node_name="n1", provider="remote/exec",
+                                        job_id="box:/w", backend="ssh", status=RUNNING,
+                                        job_meta=meta, workspace_id="ws-a"))
+    _, params_seen = _wire(monkeypatch)
+    assert await cancel_remote_jobs_for_run("r-1", registry=_Registry()) == 1
+    assert params_seen[0]["private_key"] == "CONN-KEY"
+
+    async def unreachable(params):
+        raise PermissionError("Permission denied")
+    monkeypatch.setattr(remote_exec, "_connect", unreachable)
+    remote_exec._reset_conn_cache()
+    await jobs.register(RemoteJobRecord(run_id="r-2", node_name="n1", provider="remote/exec",
+                                        job_id="box:/w2", backend="ssh", status=RUNNING,
+                                        job_meta={**meta, "workdir": "/w2"}, workspace_id="ws-a"))
+    assert await cancel_remote_jobs_for_run("r-2", registry=_Registry()) == 0
+    assert (await jobs.get("r-2:n1")).status == "cancelled"

@@ -261,7 +261,7 @@ def test_a_cancel_that_cannot_reach_the_box_says_so(monkeypatch, caplog):
     monkeypatch.setattr(remote_exec, "_connect", fake_connect)
     remote_exec._reset_conn_cache()
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.WARNING), pytest.raises(EngineError, match="may still be running"):
         asyncio.run(BuiltinSshEngine("gpu").cancel(_handle(".cairn-jobs/j9")))
     text = caplog.text
     assert ".cairn-jobs/j9" in text and "box" in text and "PermissionError" in text
@@ -301,3 +301,104 @@ def test_a_checkpoint_pull_back_that_cannot_reach_the_box_says_so(monkeypatch, t
         assert asyncio.run(BuiltinSshEngine("gpu").fetch_checkpoints(_handle(), tmp_path)) is False
     assert "PermissionError" in caplog.text and "CONN-KEY" not in caplog.text
 
+
+
+# ── the persisted handle carries no env value (StepState.handle, GET /pipelines/{id}) ──
+
+
+def test_the_persisted_handle_records_no_env_value(monkeypatch):
+    """The handle's meta is persisted verbatim on the pipeline step and served by
+    GET /pipelines/{id}: it must name what was forwarded, never the values."""
+    import json as _json
+
+    import operator_dataflow.engines_ssh as mod
+
+    _bind_connection(monkeypatch)
+    captured = _capture_submit(monkeypatch)
+    monkeypatch.setattr(mod, "live_channel_env_for",
+                        lambda run, node: {"CAIRN_ENGINE_TOKEN": "engine-tok-value"})
+    monkeypatch.setenv("CAIRN_REMOTE_ENV", "CAIRN_CHECKPOINT_BUCKET")
+    monkeypatch.setenv("CAIRN_CHECKPOINT_BUCKET", "ckpt-bucket-value")
+    monkeypatch.setenv("MLFLOW_TRACKING_PASSWORD", "mlflow-pw-value")
+    handle = _submit(DataflowSpec(stages=[StageRef(stage="noop")], parent_run="run-p"))
+    # the job itself got the values …
+    env = captured["inp"].env
+    assert env["CAIRN_ENGINE_TOKEN"] == "engine-tok-value"
+    assert env["MLFLOW_TRACKING_PASSWORD"] == "mlflow-pw-value"
+    # … the persisted handle does not
+    stored = _json.dumps(handle.model_dump())
+    for value in ("engine-tok-value", "mlflow-pw-value", "ckpt-bucket-value"):
+        assert value not in stored, value
+    # and the handle still drives poll/cancel/result after a restart
+    _, _, inp = BuiltinSshEngine("gpu")._rebuild(handle)
+    assert inp.env == {} and inp.fetch
+
+
+# ── cancel follows the handle's own connection and reports failure ───────────
+
+
+def test_cancel_prefers_the_connection_recorded_in_the_handle(monkeypatch):
+    seen = _bind_connection(monkeypatch, key="CONN-KEY")
+
+    async def fake_connect(params):
+        return _Conn()
+    monkeypatch.setattr(remote_exec, "_connect", fake_connect)
+    remote_exec._reset_conn_cache()
+    h = _handle()
+    h.meta["job_handle"]["meta"]["connection"] = "gpu-at-submit"
+    asyncio.run(BuiltinSshEngine("gpu-now").cancel(h))
+    assert seen == ["gpu-at-submit"]
+
+
+def test_a_failed_cancel_is_not_reported_as_sent(monkeypatch):
+    from cairn.core.dispatch.leg_executor import cancel_recorded_job
+
+    _bind_connection(monkeypatch, key="CONN-KEY")
+
+    async def fake_connect(params):
+        raise PermissionError("Permission denied")
+    monkeypatch.setattr(remote_exec, "_connect", fake_connect)
+    remote_exec._reset_conn_cache()
+    h = _handle()
+    persisted = {"job_id": h.job_id, "engine": h.engine, "meta": h.meta}
+    assert asyncio.run(cancel_recorded_job(BuiltinSshEngine("gpu"), persisted)) is False
+
+
+# ── a malformed remote_env entry never echoes what follows the name ──────────
+
+
+@pytest.mark.parametrize("entry", ["HF_TOKEN=hf_abcSECRETVALUE", "MY_VAR:hf_abcSECRETVALUE",
+                                   "=hf_abcSECRETVALUE"])
+def test_a_malformed_entry_does_not_echo_its_value(monkeypatch, entry):
+    _bind_connection(monkeypatch)
+    _capture_submit(monkeypatch)
+    monkeypatch.setenv("CAIRN_REMOTE_ENV", f"AWS_DEFAULT_REGION {entry}")
+    with pytest.raises(EngineError) as e:
+        _submit(_spec())
+    assert "hf_abcSECRETVALUE" not in str(e.value)
+    assert "entry 2" in str(e.value)
+
+
+# ── control-plane-only versions anywhere in the config ───────────────────────
+
+
+@pytest.mark.parametrize("config", [
+    {"inputs": {"train": "file:///srv/a.jsonl#sha256=h"}},
+    {"inputs": [{"uri": "/srv/a.jsonl#sha256=h"}]},
+    {"dataset_uri": "file:/srv/a.jsonl#sha256=h"},
+])
+def test_a_local_version_nested_or_single_slash_is_refused(monkeypatch, config):
+    _bind_connection(monkeypatch)
+    captured = _capture_submit(monkeypatch)
+    with pytest.raises(EngineError, match="durable"):
+        _submit(_spec(**config))
+    assert "inp" not in captured
+
+
+def test_a_local_version_in_the_spec_config_is_refused(monkeypatch):
+    _bind_connection(monkeypatch)
+    _capture_submit(monkeypatch)
+    spec = DataflowSpec(stages=[StageRef(stage="noop")],
+                        config={"dataset_uri": "file:///srv/a.jsonl#sha256=h"})
+    with pytest.raises(EngineError, match="durable"):
+        _submit(spec)

@@ -116,6 +116,7 @@ def test_cancel_delegates_to_exec(monkeypatch):
 
     async def fake_cancel(jh, *, connection=""):
         seen["workdir"], seen["connection"] = jh.meta["workdir"], connection
+        return True
     monkeypatch.setattr(remote_exec, "_cancel", fake_cancel)
 
     asyncio.run(BuiltinSshEngine("fixbox").cancel(_handle("/jobs/y")))

@@ -25,7 +25,7 @@ import time
 import uuid
 from types import SimpleNamespace
 
-from cairn.core.operator import as_ssh_params
+from cairn.core.operator import as_ssh_params, current_workspace
 from cairn.core.operator import Operation, OperationContext, ReportSpec, register_operator
 from cairn.core.operator.jobs import JobHandle, JobStatus
 
@@ -121,6 +121,13 @@ def _reset_conn_cache() -> None:
     _conn_cache.clear()
 
 
+def _owner_only():
+    """SFTP attrs that create a file 0600 (asyncssh is loaded: a connection exists)."""
+    import asyncssh  # noqa: PLC0415 - optional dep (see _require_ssh)
+
+    return asyncssh.SFTPAttrs(permissions=0o600)
+
+
 def _runner(command: str, env: dict) -> str:
     # capture the exit code + stream stdout/stderr to a log. The command is the
     # workflow author's (trusted) and is written to a file — not interpolated.
@@ -163,11 +170,17 @@ async def _submit(inp: RemoteExecInput, ctx: OperationContext) -> JobHandle:
         meta={"host": p["host"], "user": p["user"], "port": p["port"], "workdir": workdir,
               "known_hosts": p["known_hosts"]},  # #601: cancel needs it (host-key verify)
     )
-    # Cancel runs later with no ctx: the connection's NAME rides in the handle so
-    # it reconnects with the same credential this submit used (never a value).
+    # Cancel runs later with no ctx, possibly outside any workspace scope: the
+    # connection's NAME and the ACCOUNT it resolved in ride in the handle, so it
+    # reconnects with the same credential this submit used (ADR-0149 D4). Names
+    # only — never a value. The workspace is recorded for the reader.
     connection = str(getattr(ctx.compute, "name", "") or "").strip()
     if connection:
         handle.meta["connection"] = connection
+        account = str(getattr(ctx.compute, "account_id", "") or "").strip()
+        if account:
+            handle.meta["account_id"] = account
+        handle.meta["workspace_id"] = current_workspace()
     # #551: idempotent submit — if a prior dispatch to this (stable) workdir is
     # still running, ADOPT it instead of clearing state + launching a second
     # process. Closes the crash-between-submit-and-register double-spend window and
@@ -191,7 +204,7 @@ async def _submit(inp: RemoteExecInput, ctx: OperationContext) -> JobHandle:
     # new job "succeeded" (or failed) before it has even started. Clear all
     # per-run state files up front so poll can never observe stale state.
     await conn.run(
-        f"rm -f {q}/exit_code {q}/pid {q}/stdout.log {q}/metrics.json", check=False,
+        f"rm -f {q}/exit_code {q}/pid {q}/stdout.log {q}/metrics.json {q}/runner.sh", check=False,
     )
     # #552: expose the run_id on the box so per-run artifacts (e.g. S3 checkpoint
     # keys, used by cairn-train-local) are stable across relaunches and never
@@ -203,11 +216,9 @@ async def _submit(inp: RemoteExecInput, ctx: OperationContext) -> JobHandle:
         for local in inp.upload:
             await sftp.put(local, f"{workdir}/")
         # runner.sh carries the job's env (the spec, the job-channel token, forwarded
-        # settings): owner-only BEFORE anything is written, so another account on
-        # the box never reads it. `open("w")` creates/truncates; the chmod covers a
-        # file left by an earlier submit to the same workdir too.
-        async with sftp.open(f"{workdir}/runner.sh", "w") as f:
-            await sftp.chmod(f"{workdir}/runner.sh", 0o600)
+        # settings): it is CREATED owner-only (0600, removed above so the mode always
+        # applies), so another account on the box never reads it (ADR-0149 D2).
+        async with sftp.open(f"{workdir}/runner.sh", "w", attrs=_owner_only()) as f:
             await f.write(_runner(inp.command, env))
     # launch detached; record the pid for poll/cancel.
     # #601: the launch MUST be backgrounded INSIDE a group, not with a trailing
@@ -348,15 +359,20 @@ async def _job_ssh_params(handle: JobHandle, connection: str = "") -> dict:
     ``PRIVATE_KEY`` of the compute.ssh connection that submitted it — the one
     credential submit used, resolved through the same helper (#1544).
 
-    ``connection`` (the engine's own target) wins over the name in the handle.
-    A handle that names none was persisted before the name was recorded, and
-    keeps the old ambient ``SSH_PRIVATE_KEY``. A named connection that does
-    not resolve raises: guessing another credential is not a fallback."""
-    name = (connection or str(handle.meta.get("connection") or "")).strip()
+    The connection the HANDLE names wins; ``connection`` (the engine's target)
+    is used only for a handle saved before names were recorded, and a handle
+    that names none and has no target keeps the old ambient ``SSH_PRIVATE_KEY``.
+    The account recorded at submit scopes the lookup, so it needs no workspace
+    in scope (a learning-gate abort, a run cancel); without one, the lookup is
+    the caller's scope. A named connection that does not resolve raises:
+    guessing another credential is not a fallback."""
+    name = (str(handle.meta.get("connection") or "") or connection).strip()
     if name:
         from cairn.core.operator import resolve_connection  # noqa: PLC0415 - lazy: core is absent on a data-plane box
 
-        compute = await resolve_connection(name)
+        account = str(handle.meta.get("account_id") or "").strip()
+        compute = await (resolve_connection(name, account_id=account) if account
+                         else resolve_connection(name))
         if compute is None:
             raise LookupError(f"compute.ssh connection {name!r} is unknown or disabled")
         key = as_ssh_params(SimpleNamespace(compute=compute), operator="remote/exec")["private_key"]
@@ -377,7 +393,7 @@ async def _job_ssh_params(handle: JobHandle, connection: str = "") -> dict:
 def _unreachable(what: str, handle: JobHandle, connection: str, e: Exception) -> None:
     """Say that a reconnect failed — where, through which connection, and the
     error's TYPE (never its text: an SSH or key-import error may quote input)."""
-    name = (connection or str(handle.meta.get("connection") or "")).strip() or "SSH_PRIVATE_KEY"
+    name = (str(handle.meta.get("connection") or "") or connection).strip() or "SSH_PRIVATE_KEY"
     detail = str(e) if isinstance(e, LookupError) else type(e).__name__
     logger.warning("remote/exec: %s for %s:%s failed via %s (%s)", what,
                    handle.meta.get("host"), handle.meta.get("workdir"), name, detail)
@@ -389,7 +405,7 @@ async def _cancel(handle: JobHandle, *, connection: str = "") -> bool:
     not be reached, since the job may still be running and billing."""
     workdir = handle.meta.get("workdir")
     if not workdir:
-        return False
+        return True  # nothing was launched, so nothing is left running
     try:
         conn = await _get_conn(await _job_ssh_params(handle, connection))  # #337: reused connection
         # #603: kill the whole PROCESS GROUP, not just the pid file's pid. The pid
@@ -435,7 +451,10 @@ class RemoteExecOp(Operation[RemoteExecInput, RemoteExecOutput]):
         return await _poll(handle, inp, ctx)
 
     async def cancel(self, handle: JobHandle) -> None:
-        await _cancel(handle)
+        if not await _cancel(handle):
+            # reported to the caller (the control worker logs it) instead of "sent"
+            raise RuntimeError(
+                f"remote/exec could not cancel {handle.job_id}; the remote process may still be running")
 
     # in-process fallback (when the remote_job executor isn't selected): submit + poll once.
     async def run(self, inp: RemoteExecInput, ctx: OperationContext) -> RemoteExecOutput:
