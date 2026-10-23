@@ -32,6 +32,7 @@ class _SFTP:
     async def __aenter__(self): return self
     async def __aexit__(self, *a): return False
     async def put(self, local, remote): pass
+    async def chmod(self, path, mode): pass
     async def get(self, remote, local, recurse=False): pass
     def open(self, path, mode):
         class _F:

@@ -16,12 +16,14 @@ host-key verified via ``known_hosts`` (NEVER disabled). asyncssh is the optional
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shlex
 import tempfile
 import time
 import uuid
+from types import SimpleNamespace
 
 from cairn.core.operator import as_ssh_params
 from cairn.core.operator import Operation, OperationContext, ReportSpec, register_operator
@@ -30,6 +32,8 @@ from cairn.core.operator.jobs import JobHandle, JobStatus
 from operator_remote.schemas.exec import RemoteExecInput, RemoteExecOutput
 
 _JOBROOT = ".cairn-jobs"
+
+logger = logging.getLogger("operator_remote.exec")
 
 #: #2606 — the detached launch writes its pid file asynchronously, AFTER the launch
 #: command has returned, so a poll in the first moments can find neither ``pid`` nor
@@ -159,6 +163,11 @@ async def _submit(inp: RemoteExecInput, ctx: OperationContext) -> JobHandle:
         meta={"host": p["host"], "user": p["user"], "port": p["port"], "workdir": workdir,
               "known_hosts": p["known_hosts"]},  # #601: cancel needs it (host-key verify)
     )
+    # Cancel runs later with no ctx: the connection's NAME rides in the handle so
+    # it reconnects with the same credential this submit used (never a value).
+    connection = str(getattr(ctx.compute, "name", "") or "").strip()
+    if connection:
+        handle.meta["connection"] = connection
     # #551: idempotent submit — if a prior dispatch to this (stable) workdir is
     # still running, ADOPT it instead of clearing state + launching a second
     # process. Closes the crash-between-submit-and-register double-spend window and
@@ -193,7 +202,12 @@ async def _submit(inp: RemoteExecInput, ctx: OperationContext) -> JobHandle:
     async with conn.start_sftp_client() as sftp:
         for local in inp.upload:
             await sftp.put(local, f"{workdir}/")
+        # runner.sh carries the job's env (the spec, the job-channel token, forwarded
+        # settings): owner-only BEFORE anything is written, so another account on
+        # the box never reads it. `open("w")` creates/truncates; the chmod covers a
+        # file left by an earlier submit to the same workdir too.
         async with sftp.open(f"{workdir}/runner.sh", "w") as f:
+            await sftp.chmod(f"{workdir}/runner.sh", 0o600)
             await f.write(_runner(inp.command, env))
     # launch detached; record the pid for poll/cancel.
     # #601: the launch MUST be backgrounded INSIDE a group, not with a trailing
@@ -328,14 +342,27 @@ async def _poll(handle: JobHandle, inp: RemoteExecInput, ctx: OperationContext) 
     return JobStatus(state="succeeded", output=result.model_dump(), metrics=metrics)
 
 
-async def _cancel(handle: JobHandle) -> None:
-    # best-effort: reconnect from the handle's host/user/port + the ambient key
-    # (SSH_PRIVATE_KEY) — the control worker's cancel has no ctx (#127), mirroring
-    # train/vast's env-key fallback. A cancel failure must never crash the loop.
-    workdir = handle.meta.get("workdir")
-    if not workdir:
-        return
-    params = {
+async def _job_ssh_params(handle: JobHandle, connection: str = "") -> dict:
+    """Reconnect params for a job submitted earlier, outside any ctx (cancel, the
+    checkpoint relay): WHERE the job is comes from the handle; the KEY is the
+    ``PRIVATE_KEY`` of the compute.ssh connection that submitted it — the one
+    credential submit used, resolved through the same helper (#1544).
+
+    ``connection`` (the engine's own target) wins over the name in the handle.
+    A handle that names none was persisted before the name was recorded, and
+    keeps the old ambient ``SSH_PRIVATE_KEY``. A named connection that does
+    not resolve raises: guessing another credential is not a fallback."""
+    name = (connection or str(handle.meta.get("connection") or "")).strip()
+    if name:
+        from cairn.core.operator import resolve_connection  # noqa: PLC0415 - lazy: core is absent on a data-plane box
+
+        compute = await resolve_connection(name)
+        if compute is None:
+            raise LookupError(f"compute.ssh connection {name!r} is unknown or disabled")
+        key = as_ssh_params(SimpleNamespace(compute=compute), operator="remote/exec")["private_key"]
+    else:
+        key = os.environ.get("SSH_PRIVATE_KEY")
+    return {
         "host": handle.meta.get("host"), "user": handle.meta.get("user"),
         "port": int(handle.meta.get("port") or 22),
         # #601: use the connection's known_hosts (carried in the handle at submit).
@@ -343,10 +370,28 @@ async def _cancel(handle: JobHandle) -> None:
         # never SSH'd here (e.g. the server, when the job ran on the remote worker)
         # silently failed and orphaned the remote process.
         "known_hosts": handle.meta.get("known_hosts"),
-        "private_key": os.environ.get("SSH_PRIVATE_KEY"),
+        "private_key": key,
     }
+
+
+def _unreachable(what: str, handle: JobHandle, connection: str, e: Exception) -> None:
+    """Say that a reconnect failed — where, through which connection, and the
+    error's TYPE (never its text: an SSH or key-import error may quote input)."""
+    name = (connection or str(handle.meta.get("connection") or "")).strip() or "SSH_PRIVATE_KEY"
+    detail = str(e) if isinstance(e, LookupError) else type(e).__name__
+    logger.warning("remote/exec: %s for %s:%s failed via %s (%s)", what,
+                   handle.meta.get("host"), handle.meta.get("workdir"), name, detail)
+
+
+async def _cancel(handle: JobHandle, *, connection: str = "") -> bool:
+    """Kill the job's process group. Best-effort (a cancel failure must never crash
+    the loop — #127) but never silent: ``False`` plus a warning when the box could
+    not be reached, since the job may still be running and billing."""
+    workdir = handle.meta.get("workdir")
+    if not workdir:
+        return False
     try:
-        conn = await _get_conn(params)  # #337: reused connection
+        conn = await _get_conn(await _job_ssh_params(handle, connection))  # #337: reused connection
         # #603: kill the whole PROCESS GROUP, not just the pid file's pid. The pid
         # file names runner.sh (the wrapper), which `setsid` makes a group leader;
         # the real trainer (cairn-train-local) is its CHILD in that group. Plain
@@ -360,8 +405,10 @@ async def _cancel(handle: JobHandle) -> None:
             f'{{ kill -TERM -"$p" 2>/dev/null; sleep 1; kill -KILL -"$p" 2>/dev/null; }}',
             check=False,
         )
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        _unreachable("cancel (the remote process may still be running)", handle, connection, e)
+        return False
+    return True
 
 
 @register_operator(name="remote/exec", version="0.1.0", capabilities=["remote.exec"],
