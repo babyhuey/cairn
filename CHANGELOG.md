@@ -22,7 +22,10 @@ A patch release: two additive core features for the training and dataset-prepara
 - Dataset-version registration from a flow takes the role a stage gives (`register_role`), which may be `training`, `validation` or `test`; any other role, `golden` included, refuses the leg before anything registers. Without it the version keeps the dataset's default role, as before. The holdout door therefore sees a test split a flow registers as `test`.
 - A pipeline input may declare the role of the dataset version it takes (ADR-0146): `role: training | validation | test | golden` and `verdict: required`. The launch door then refuses a value that is not a registered `dataset:` ref, a version with another role (a test set passed as training data), or one with no intake verdict when one is required, before any record exists, and records each check under `admission.expectations`. An unknown role or another `verdict:` value fails when the pipeline loads. A pipeline that declares neither is decided as before.
 
-## [0.2.0] - 2026-10-22
+### Changed
+- The example pack `cairn-pack-hello` is 0.2.2 in this release (0.2.0 shipped it as 0.2.1).
+
+## [0.2.0] - 2026-10-23
 
 A minor release: it changes behaviour that operators, operator packs and library callers rely on (`docs/compatibility.md`: a break pre-1.0 is a MINOR bump with migration notes). Single-node and auth-off deployments, where everything belongs to the `default` workspace and account, are unaffected by the workspace, tenant and dataset changes below.
 

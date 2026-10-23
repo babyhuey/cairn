@@ -51,8 +51,8 @@ The full list with comments is `values.yaml`. The ones that decide the shape:
 
 | Value | Default | What it decides |
 |---|---|---|
-| `image.repository` / `image.tag` | `ghcr.io/cairndev-sh/cairn-engine` / `""` | The engine image. **Pin the tag** — `--strict` fails on `latest`, and `engine-image.yml` publishes `:<sha>` for every commit on main. |
-| `imagePullSecrets` | `[]` | Required while the GHCR package is private. |
+| `image.repository` / `image.tag` | `ghcr.io/cairndev-sh/cairn-engine` / `""` | The engine image. **Pin the tag** — `--strict` fails on `latest`. `release.yml` publishes `:<version>` (and `:<sha>`) on every `v*` tag. |
+| `imagePullSecrets` | `[]` | Only for a private registry or mirror; the GHCR package is public. |
 | `runtime` | `dbos` | `dbos` (durable, one process — what prod runs), `temporal` (server submits, worker executes; its pipeline owner does not yet run `task:` legs, #1378), `inprocess` (dev). |
 | `checkpointer` | `postgres` | `memory` with a durable runtime is **refused**: recovery would replay the whole graph, charging every LLM call twice (#532/#1847). |
 | `postgres.enabled` | `true` | Bundled StatefulSet (pgvector, one PVC). |
@@ -61,8 +61,9 @@ The full list with comments is `values.yaml`. The ones that decide the shape:
 | `ingress.certManager.clusterIssuer` | `letsencrypt-prod` | The cert-manager issuer that mints the TLS secret. |
 | `secrets.*` / `secrets.existingSecret` | `""` | `CAIRN_JWT_SECRET` + `CAIRN_API_PASSWORD_HASH` (+ `POSTGRES_PASSWORD` with a bundled database) either rendered into a chart-managed Secret, or taken from one you already have. |
 | `server.persistence` | `enabled, 5Gi` | `~/.cairn` — the SQLite-backed config stores that do not yet honour `CAIRN_STORAGE`. ReadWriteOnce, so keep `server.replicaCount: 1`. |
-| `pullWorker.enabled` / `.command` | `false` / `[]` | The D2 (#565) dial-out worker. Shape only — see below. |
+| `pullWorker.enabled` / `.command` | `false` / `[]` | The `cairn worker --pull` dial-out worker (#565). No default command — see below. |
 | `env.extra` | `{}` | Any other variable, verbatim into the ConfigMap. Name cairn variables `CAIRN_*`. |
+| `env.extra.CAIRN_PUBLIC_URL` | unset | `https://<ingress.host>`. Set it behind the chart's TLS ingress: the console's `cairn_refresh` sign-in cookie is `Secure` only when it is https, and the OAuth callback is built from it. The example values files set it. |
 | `artifacts.s3.*` | disabled | `CAIRN_ARTIFACT_S3_*`, the dbos-postgres tier's artifact store. |
 | `observability.otlp.endpoint` | `""` | Where traces go. The chart runs no collector — see profiles. |
 
@@ -108,12 +109,23 @@ time** naming the chart to install instead — a loud refusal, never a silent
 no-op, because a silent no-op is how compose deploys got a running service the
 engine was never pointed at.
 
-### The pull worker is shape-only
+### The pull worker
 
 `pullWorker` renders a Deployment that runs `pullWorker.command`. It is **off by
-default and has no default command**: `cairn worker --pull` is being built in the
-D2 slice (#565) in parallel with this one, and a chart that guessed its flags
-would ship a guess. Enabling it without a command refuses to render.
+default and has no default command**; enabling it without one refuses to render.
+
+```yaml
+pullWorker:
+  enabled: true
+  command: ["cairn", "worker", "--pull", "--engine-url", "https://cairn.example.com"]
+```
+
+With auth on (the chart's default), claiming work needs a worker credential: a
+worker-pool token, minted where `CAIRN_JWT_SECRET` is set with
+`cairn remote worker-token --name <pool>`, read from `CAIRN_ENGINE_TOKEN` (or
+`--token`). A signed-in user's token gets `403` on `/jobs/claim`. The worker
+container reads the same ConfigMap and Secret as the server (`envFrom`); the
+chart has no separate Secret for the worker token.
 
 ### Postgres connection assumptions (in-process leg liveness)
 
@@ -151,6 +163,11 @@ the Postgres volume are annotated `helm.sh/resource-policy: keep`, so
 
 A rollback rolls back the *manifests*. It does not undo a database migration —
 the DSN is the same database before and after.
+
+**Upgrading from a 0.1.x image:** see *Upgrade from 0.1.x* in the
+[install docs](https://docs.cairndev.sh/install/#upgrade-from-01x) (pull-worker
+tokens, `CAIRN_PUBLIC_URL`, re-indexing some knowledge collections) and the
+0.2.0 Migration section of [CHANGELOG.md](../../../CHANGELOG.md).
 
 ## What this chart does not do
 

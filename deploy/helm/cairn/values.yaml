@@ -68,14 +68,18 @@ worker:
   tolerations: []
   affinity: {}
 
-# ── pull worker — D2 (#565), NOT implemented by this chart ───────────────
-# D2 builds `cairn worker --pull`: a machine that dials OUT to the control
-# plane, claims work and reports over the job channel. The chart ships the
-# DEPLOYMENT shape only; the command is yours to supply once D2 lands, so this
-# chart never has to guess a flag that does not exist yet.
+# ── pull worker (`cairn worker --pull`, #565) ─────────────────────────────
+# A machine that dials OUT to the control plane, claims jobs and reports over
+# the job channel. The chart has no default command; supply one:
 #   pullWorker:
 #     enabled: true
-#     command: ["cairn", "worker", "--pull", "--control-plane", "https://cairn.example.com"]
+#     command: ["cairn", "worker", "--pull", "--engine-url", "https://cairn.example.com"]
+# With auth on (the chart's default) claiming needs a worker credential: a
+# worker-pool token, minted where CAIRN_JWT_SECRET is set with
+#   cairn remote worker-token --name <pool>
+# and read from CAIRN_ENGINE_TOKEN (or `--token`). A signed-in user's token gets
+# 403 on /jobs/claim. The pull worker reads the same ConfigMap and Secret as the
+# server (envFrom); the chart has no separate Secret for the worker token.
 pullWorker:
   enabled: false
   command: []          # REQUIRED when enabled — rendering fails without it
@@ -156,7 +160,9 @@ env:
   apiUser: admin            # CAIRN_API_USER
   requireAuth: true         # CAIRN_REQUIRE_AUTH
   profile: ""               # CAIRN_PROFILE — REQUIRED (#2296): the deployment profile; the chart refuses to render without it
-  # Anything else, verbatim, into the ConfigMap.
+  # Anything else, verbatim, into the ConfigMap. Behind the chart's TLS ingress
+  # set CAIRN_PUBLIC_URL here to https://<ingress.host> (the sign-in cookie is
+  # Secure only then; the OAuth callback is built from it).
   extra: {}
 
 # ── artifacts (the dbos-postgres tier's MinIO/S3 fields) ─────────────────

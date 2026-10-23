@@ -86,8 +86,8 @@ the prod box with a real outcome). "Code exists" alone never earns SUPPORTED. Up
 | Output-format validity capability | PLANNED | #2195 |
 
 ## Surfaces
-CLI, HTTP API (`console/openapi.json`, oasdiff-gated), console, MCP, `cairn-client`,
-`cairn-sdk`: SUPPORTED on the platform only; not part of the public core (ADR-0135)
-(CI TESTED: `test`, `web`, `build`, `api-compat`). Remote deployment
+The CLI (`cairn`), the HTTP + SSE API (`cairn-server`) and `cairn-client` ship in the
+public core (the `cairndev` and `cairn-client` wheels): SUPPORTED (CI TESTED in `ci.yml`).
+The console, its MCP surface and `cairn-sdk` are part of cairn-platform (ADR-0135). Remote deployment
 (compose, EC2 script, Helm lint): SUPPORTED for compose (PRODUCTION PROVEN); Helm chart
 IN DEVELOPMENT (ADR-0104 D4).

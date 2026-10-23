@@ -27,8 +27,15 @@ profile binds `redact.text`) and records the call's cost against the run.
 
 A **connection** is a named, typed reference to an external system: a model
 API, a compute target, an SSH host, an MCP server. It never holds a secret
-value. A secret is an environment variable **name** the engine reads, or an
-entry in your secret store.
+value. For the deployment's own connections (the `default` account, which is
+every connection when sign-in is off), a secret is an environment variable
+**name** the engine reads, or an entry in your secret store.
+
+With sign-in on, a connection belongs to the account that created it. A
+connection of any other account resolves only the secrets stored for that
+account (`cairn://secrets#<account>/<conn>-<KEY>`); an environment-variable
+name, `${env:NAME}` and the deployment's secret store resolve to nothing for
+it.
 
 `cairn connect` manages connections in the engine's store, so run it with the
 same `CAIRN_STORAGE` as the engine:
@@ -41,6 +48,11 @@ cairn connect ls                   # names, kinds and secret keys, never values
 cairn connect test openai          # authenticate now and store the result
 cairn connect rm openai-eu         # removes the reference, never the secret
 ```
+
+`cairn connect` manages the deployment's own connections (the `default`
+account). A team account's connections are created by that account; the
+console's integrations page and its API, which do this, are part of
+cairn-platform.
 
 `cairn connect add` saves the connection, then runs its health check once.
 `cairn connect test` exits `0` when the provider answered and `1` when the
@@ -68,6 +80,24 @@ never enters the record. `remote/exec` needs the `ssh` extra.
 Pipelines and flows refer to a connection **by name**, and its credential is
 resolved only when the leg runs. The run record carries only the name.
 
+A run resolves connection names in its own account: the account that owns the
+run's workspace. A team account's run does not see the deployment's
+connections, so a pipeline that names `openai` needs an `openai` connection in
+that account. The same holds for an engine target bound in the deployment's
+profile (`ml_target`, `dataflow_target`): it names a deployment connection, and
+a team account's leg needs a connection of that name in its own account, or the
+leg fails. Connection names are unique across the whole deployment.
+
+With sign-in on, a lookup made outside any workspace (a script, a background
+job) raises `WorkspaceScopeRequired`. Enter a workspace first:
+
+```python
+from cairn.core.workspace import workspace_scope
+
+with workspace_scope("<workspace id>"):
+    ...
+```
+
 ## Secrets in a secret store
 
 Operators read secrets through the `secrets.store` capability, so where they
@@ -81,6 +111,12 @@ live is the environment's choice:
 The example ships both bindings: `profiles/hello.toml` uses `secrets/env`, and
 `profiles/hello-infisical.toml` uses Infisical with nothing else changed. The
 Docker Compose stack's `infisical` profile runs an Infisical server for you.
+
+The bound secret store serves the deployment's runs. For a team account's run,
+an operator's declared `secrets:` come from that account's own connections and
+arrive in `ctx.secrets` only: they are not written to the process environment,
+and the deployment's secret store is not read (ADR-0143). An operator that
+reads a credential from `os.environ` gets nothing for such a run.
 
 The console's integrations page, and the operators that train or serve on GPU
 providers, are part of cairn-platform.
