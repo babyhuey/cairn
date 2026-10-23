@@ -23,42 +23,61 @@ identical bytes from two workspaces one row.
 
 ## Decision
 
-**D1 — Ownership is a row per registering workspace.** `artifact_owners(artifact_id,
-workspace_id)`, keyed by both. Every `register` adds the registering workspace's row, including a
-registration of bytes that are already registered (by itself or by another workspace): the
-`artifacts` row stays one, and each registering workspace owns it. The first producer's
-provenance on the row is unchanged.
+**D1 — Each registering workspace keeps its own registration.** `artifact_owners(artifact_id,
+workspace_id, kind, uri, stats, data_schema, size_bytes, row_count, producer_run_id,
+producer_job, account_id, created_at, durable_uri)`, keyed by `(artifact_id, workspace_id)`.
+Every `register` writes the registering workspace's row, including a registration of bytes that
+are already registered (by itself or by another workspace). The `artifacts` row stays one per
+hash: it is the identity and the deployment's count, and no read returns it. A workspace keeps its
+first registration of the same bytes; a later one by the same workspace adds parents and fills a
+missing durable copy, as before.
 
-**D2 — Reads go through ownership.** `get`, `find_by_uri`, `list_artifacts` and `lineage` answer
-only with artifacts the workspace owns; another workspace's reads as not found. A parent the
-workspace does not own is left out of a record's `parents` and of the lineage tree; a parent that
-is not a registered artifact (an external URI) stays. The dataset registry reads a version's
-artifact in the version's workspace, and `register_dataset_version` refuses an artifact the
-workspace does not own. `count` stays the deployment's row count.
+**D2 — Parents are recorded per registering workspace.** `artifact_parents` is keyed by
+`(workspace_id, child_id, parent_id)`. A record's `parents` are the parents that the reader's
+workspace declared for it, whether or not another workspace has registered an artifact with a
+parent's id; another workspace's declared parents, external URIs included, are never returned.
 
-**D3 — The workspace comes from the caller or the scope.** Every method takes `workspace_id=`
-(keyword), else `scoped_workspace()`. With auth on and neither, it raises
-`WorkspaceScopeRequired` before relaying bytes or writing a row. Core callers pass the run's
-workspace: a leg's registration and URI-parent mapping (`register_leg_descriptors`), checkpoint
-relay (the leg's run record) and resume lookup, and `registry_health` (`cairn doctor` checks the
-process's workspace, `CAIRN_WORKSPACE` else `default`).
+**D3 — Reads answer from the reader's own registrations.** `get`, `find_by_uri`,
+`list_artifacts`, `resolve` and `lineage` build each record from the reader's own owner row:
+its URI, durable copy, stats, schema, producing run and job, account and time. Another workspace's
+artifact reads as not found. `find_by_uri` matches the reader's own URIs only. The lineage tree
+walks only into artifacts the reader owns. The dataset registry reads a version's artifact in the
+version's workspace, and `register_dataset_version` refuses an artifact the workspace does not
+own. `count` stays the deployment's row count.
 
-**D4 — Existing artifacts are backfilled once.** When `artifact_owners` is created on a database
-that already holds artifacts, in the same transaction: `default` owns every artifact; so does the
-workspace of the run that produced it, when that run is in the same database; so does every
-workspace that registered a dataset version of it. The backfill runs only when the table is
-created, so a later registration is never handed to `default`.
+**D4 — The workspace comes from the caller or the scope.** The artifact and tag methods
+(`register`, `get`, `find_by_uri`, `list_artifacts`, `lineage`, `resolve`, `promote`) take
+`workspace_id=` (keyword), else `scoped_workspace()`; with auth on and neither, they raise
+`WorkspaceScopeRequired` before relaying bytes or writing a row. The by-name dataset methods keep
+their existing fallback to `current_workspace()` when no `workspace_id=` is given; this ADR does
+not change it. Core callers pass the run's workspace: a leg's registration and URI-parent mapping
+(`register_leg_descriptors`), checkpoint relay (the leg's run record) and resume lookup, and
+`registry_health` (`cairn doctor` checks the process's workspace, `CAIRN_WORKSPACE` else
+`default`).
+
+**D5 — An existing database is migrated once.** In one transaction (SQLite `BEGIN IMMEDIATE`;
+Postgres under the fleet-wide schema lock), when `artifact_owners` is created on a database that
+already holds artifacts: `default` owns every artifact; so does the workspace of the run that
+produced it, when that run is in the same database; so does every workspace that registered a
+dataset version of it. Each owner row copies the registration from the existing `artifacts` row.
+`artifact_parents` is rebuilt onto its new key, each existing parent going to every owner of its
+child. The backfill runs only when the table is created, so a later registration is never handed
+to `default`.
 
 ## Consequences
 
 - A single-workspace deployment is unchanged: everything is registered and read in `default`.
 - Another workspace's artifact reads exactly like an id nobody registered.
-- Identical bytes registered by two workspaces are visible to both, each through its own
-  ownership; neither learns that the other registered them.
+- Identical bytes registered by two workspaces are visible to both, and each reads only its own
+  registration and parents. A dataset reference or a checkpoint resume in a workspace resolves to
+  that workspace's own location.
+- A parent id the reader declared stays in `parents` even when the reader cannot read that
+  artifact; the lineage tree has no node for it.
 - A process that registers artifacts must run this version: an older replica writing after the
   migration adds no owner row, and its artifacts are visible to no workspace. Upgrade every
   replica together.
 - A caller outside any workspace scope (a deployment-admin route, a seed script) must pass
   `workspace_id=`, or with auth on the call is refused.
 - An artifact registered before this change by a run in another database, with no dataset
-  version, is owned by `default` only.
+  version, is owned by `default` only. Existing rows registered by several workspaces before the
+  change carry the first registration, which every backfilled owner reads.
