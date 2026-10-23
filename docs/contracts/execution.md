@@ -103,6 +103,11 @@ The control plane never reaches into a box for rows; a box never reaches the dat
 Remote execution moves **the image and the spec** (ADR-0104): the GPU trainer image is built
 by CI and pinned by tag (`RUNBOOK-gpu-finetune-ssh.md`), secrets reach the flow as a scoped
 set (ADR-0089 D3), tracking credentials are forwarded by the `run-train-remote` binding.
+On the builtin SSH path the job's environment is the spec, the live channel, `MLFLOW_*` and
+the deployment's `remote_env` names (credential-looking names refused); a `dataset:` ref
+resolves to the version's durable copy when its workspace's registration has one, and a
+version whose only location is a control-plane path is refused before submit
+(`operator_dataflow/engines_ssh.py` `validate`).
 Doors that refuse before a record exists: job-channel, SkyPilot, pull-worker
 (`dispatcher.py:888-911`, `pipeline_launch.py:283`).
 

@@ -64,6 +64,13 @@ connection; provisioning engines (SkyPilot) sit behind a door and a cost gate th
 **before** any cloud spend (`src/cairn/core/dataflow/engine_door.py` (the flow-engine door, ADR-0134 D3c; SkyPilot answers through its `check_ready()`); ADR-0104 D5); compute
 acquisition/release is a governed pair with a lease sweep (ADR-0097). Budget is reserved
 per leg before submit (`leg_executor.py:303`) and settled after.
+On a `compute.ssh` box the job receives only the spec, the live channel, `MLFLOW_*` and the
+env NAMES the deployment lists in `remote_env`; a name that looks like a credential (`KEY`,
+`SECRET`, `TOKEN`, `PASSWORD`) refuses the leg, so cloud credentials stay box-side (an instance
+role). Forwarded values sit in the job's owner-only `runner.sh`, never on a command line.
+Cancel and checkpoint pull-back authenticate with the connection's own `PRIVATE_KEY` and log
+a warning, without secret material, when the box cannot be reached
+(`packages/cairn-operator-dataflow/DESIGN.md` §4).
 
 ## Approval and audit
 Every operator invocation passes `enforce_gate` (`approval/enforce.py:116`); flow legs pass
