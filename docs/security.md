@@ -70,7 +70,7 @@ env NAMES the deployment lists in `remote_env`; a name that looks like a credent
 role). Forwarded values sit in the job's owner-only `runner.sh`, never on a command line.
 Cancel and checkpoint pull-back authenticate with the connection's own `PRIVATE_KEY` and log
 a warning, without secret material, when the box cannot be reached
-(`packages/cairn-operator-dataflow/DESIGN.md` §4).
+(ADR-0149; `packages/cairn-operator-dataflow/DESIGN.md` §4).
 
 ## Approval and audit
 Every operator invocation passes `enforce_gate` (`approval/enforce.py:116`); flow legs pass

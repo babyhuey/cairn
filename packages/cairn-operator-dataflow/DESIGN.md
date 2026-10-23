@@ -199,9 +199,14 @@ control plane is elsewhere). What the deployment provides on each side:
   the box's own environment). Values reach the box in the job's `runner.sh`,
   which is made owner-only (0600) before anything is written to it, or as
   `docker run -e NAME` with no value in image mode; never on a command line.
-- **Dataset versions:** a `dataset:` ref resolves to the version's durable copy
-  (`durable_uri`, the object store) when the workspace's registration has one,
-  else to its registered location. A version whose only location is a
+  `MLFLOW_TRACKING_PASSWORD` is the one credential the engine forwards itself
+  (with the other `MLFLOW_*`, #1235), never through `remote_env`; it too lands
+  only in the 0600 runner file (ADR-0149 D2).
+- **Dataset versions:** the engine declares `needs_durable_inputs`, so the leg
+  executor resolves its `dataset:` refs to the version's durable copy
+  (`durable_uri`, the object store) when the workspace's registration has one
+  (ADR-0149 D3); a co-located leg keeps the registered location unless that file
+  is gone. A version whose only location is a
   control-plane path (`file://…#sha256=…` or `/…#sha256=…`) refuses the leg in
   `validate`, before submit, saying how to give it a durable copy
   (`CAIRN_ARTIFACT_STORE=s3` + `CAIRN_ARTIFACT_S3_BUCKET` on the control plane,
@@ -262,7 +267,7 @@ leg is judged by `dataflow_target` rather than `ml_target`.
 | `engine 'X' is selected but not installed` (#568) | environment names an engine no installed pack registers | `EngineError` at submit, listing what IS installed | yes — never falls back to builtin |
 | Remote leg exits 127 (#1075) | `cairn-dataflow-run` not on the box's non-interactive SSH PATH | engine failure with the exit code | yes — `CAIRN_DATAFLOW_REMOTE_CMD` is the fix |
 | Trainer on the box finds `CAIRN_CHECKPOINT_BUCKET` unset | the SSH engine forwarded only the spec, the live channel and `MLFLOW_*` | publish to S3 failed and checkpoint mirroring was a silent no-op | no — fixed: the deployment lists the names in `remote_env`; credential-looking names refuse the leg |
-| Box FileNotFounds on a pinned dataset version (`file:///tmp/…#sha256=…`) | the ref resolved to the registered control-plane location, ignoring the durable copy; pinned paths were not uploaded | failed on the box after the leg started | yes — resolution prefers the durable copy; a version with only a control-plane location is refused in `validate` with the remedy |
+| Box FileNotFounds on a pinned dataset version (`file:///tmp/…#sha256=…`) | the ref resolved to the registered control-plane location, ignoring the durable copy; pinned paths were not uploaded | failed on the box after the leg started | yes — a remote engine's refs resolve to the durable copy (ADR-0149); a version with only a control-plane location is refused in `validate` with the remedy |
 | Cancel left a job running on the box | cancel and checkpoint pull-back reconnected with `SSH_PRIVATE_KEY` from the control plane's env while submit used the connection's `PRIVATE_KEY`; the failure was swallowed | the run showed cancelled; the job kept running | yes — both use the connection's key and log a warning when the box cannot be reached |
 | Box FileNotFounds on a control-plane path (#1180 bug 10) | an upstream leg handed this leg a path that exists only on the control plane | was a hard failure; now local file inputs are uploaded and the config rewritten | yes |
 | Budget/`input_artifacts`/`parent_run` silently dropped on the Metaflow path (#1243) | the bridge passed a hand-picked subset of the spec | fields vanished with no error | no — fixed: the FULL contract is serialized |
@@ -330,4 +335,4 @@ manifest-sync and drift gates measure nothing until the pack is installed.
 | 2026-10-16 | The Prefect engine, its bridge, entry point and `[prefect]` extra removed (ADR-0134 D4) | #2678 |
 | 2026-10-16 | The Metaflow engine, its two bridges, entry point and `[metaflow]` extra leave for their own optional wheel, `cairn-operator-dataflow-metaflow` behind `cairndev[metaflow]` (ADR-0134 D2) | #2678 |
 | 2026-10-16 | The SkyPilot engine, its entry point and `[skypilot]` extra leave for their own optional wheel, `cairn-operator-dataflow-skypilot` behind `cairndev[skypilot]` (ADR-0134 D3a) | #2678 |
-| 2026-10-23 | SSH path for a remote training box: `remote_env` forwarding, refusal of control-plane-only dataset versions, cancel and checkpoint pull-back on the connection's key, owner-only `runner.sh` | — |
+| 2026-10-23 | SSH path for a remote training box (ADR-0149): `remote_env` forwarding, durable dataset copies and refusal of control-plane-only versions, cancel and checkpoint pull-back on the connection's key, owner-only `runner.sh` | #193 |

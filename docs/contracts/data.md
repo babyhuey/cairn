@@ -30,8 +30,10 @@ A leg input may be a path, an `s3://` URI, an HF id or a **registered ref**
 (flow legs `src/cairn/core/dispatch/leg_executor.py:229-246`, task legs
 `src/cairn/core/dispatch/pipeline_bridge.py:2029-2031`): `resolve_dataset_refs_in_config`
 rewrites each ref to `<uri>#sha256=<content_hash>` (`artifacts.py:1287-1325`), where
-`<uri>` is the version's durable copy (`durable_uri`, the object store) when the workspace's
-own registration has one, else the location it was registered at; an unknown
+`<uri>` is the location the workspace registered the version at, or its own durable copy
+(`durable_uri`, the object store) when there is one and either the leg's engine declares
+`needs_durable_inputs` (a job on another machine: the SSH engine, ADR-0149 D3) or that
+location is a local path that no longer exists; an unknown
 ref fails the leg at launch (`KeyError`). On the builtin SSH engine a version whose only
 location is a control-plane path is refused before submit (`engines_ssh.py` `validate`). The consuming kernel strips the fragment and
 **verifies the bytes** it read against it, refusing on mismatch (`ingest.normalize`,
