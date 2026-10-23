@@ -505,7 +505,7 @@ async def launch_pipeline_def(
     from cairn.core.admission_door import decide_admission  # noqa: PLC0415 — off the hot import path
     from cairn.core.engine.pipeline import dataset_expectations  # noqa: PLC0415
 
-    # ADR-0142 — and each input's declared role / verdict requirement, checked on its version.
+    # ADR-0146 — and each input's declared role / verdict requirement, checked on its version.
     admission = await decide_admission(merged, workspace_id=workspace_id, environment=environment or "",
                                        expectations=dataset_expectations(d))
     if admission.refused:

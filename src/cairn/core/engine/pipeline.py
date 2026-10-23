@@ -261,12 +261,12 @@ class PipelineDef(BaseModel):
         return out
 
 
-#: ADR-0142 — what an input spec may require of the dataset version it is given.
+#: ADR-0146 — what an input spec may require of the dataset version it is given.
 DATASET_VERDICT_REQUIRED = "required"
 
 
 def dataset_expectations(d: "PipelineDef") -> dict[str, dict[str, str]]:
-    """ADR-0142 D1 — ``{input name: {"role": …, "verdict": "required"}}`` for every input spec
+    """ADR-0146 D1 — ``{input name: {"role": …, "verdict": "required"}}`` for every input spec
     that declares ``role:`` or ``verdict:``; the launch door checks the version each one is given
     (``admission_door.decide_admission``). Raises ``ValueError`` on an unknown role or a
     ``verdict`` other than ``required``, so a typo fails when the pipeline loads, never by

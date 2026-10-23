@@ -23,7 +23,7 @@ Four things, four responsibilities. None of them is a new execution abstraction:
    stamped `bundle_ref = pipeline:<pack>/<name>`. Before the bridge, the admission door
    (`admission_door.decide_admission`, #2190) decides once over the inputs: the holdout,
    intake and licence doors and the policies' required checks. **Input expectations
-   (ADR-0142):** an input spec may declare `role:` (`training` · `validation` · `test` ·
+   (ADR-0146):** an input spec may declare `role:` (`training` · `validation` · `test` ·
    `golden`) and `verdict: required`; the door then refuses a value that is not a `dataset:`
    ref, a ref the registry does not hold, a version with another role, or one with no intake
    verdict when it is required, and records every check under `admission.expectations`. An

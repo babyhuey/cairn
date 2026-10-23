@@ -1,4 +1,4 @@
-# ADR-0142 — A pipeline input declares the role of the dataset version it takes
+# ADR-0146 — A pipeline input declares the role of the dataset version it takes
 
 - **Status:** ACCEPTED 2026-10-22 by the owner (option 1: roles and a required verdict declared
   on pipeline inputs and checked at the launch door; the manifest check leaves

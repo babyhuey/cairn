@@ -1,4 +1,4 @@
-"""ADR-0142 — a pipeline input may declare the role (and require the intake verdict) of the
+"""ADR-0146 — a pipeline input may declare the role (and require the intake verdict) of the
 dataset version it takes; the launch door refuses a version that does not match, and records
 every check. Hermetic: sqlite, no policies."""
 from __future__ import annotations
@@ -127,7 +127,8 @@ async def test_another_workspaces_version_is_never_read_and_reads_as_absent(stor
                          producer_run_id="prep")
     await store.register_dataset_version("their-train", "h-theirs", actor="prep", role="training",
                                          workspace_id="other-tenant")
-    await store.set_dataset_version_verdict("their-train", 1, verdict="admitted", reasons=[], report={})
+    await store.set_dataset_version_verdict("their-train", 1, verdict="admitted", reasons=[], report={},
+                                            workspace_id="other-tenant")
     theirs = await _decide(store, train_version="dataset:their-train@1")
     nobody = await _decide(store, train_version="dataset:nobody-train@1")
     (t,) = [e for e in theirs.expectations if e["input"] == "train_version"]
@@ -144,7 +145,7 @@ class _Meta:
     def __init__(self, rows=None, error=None):
         self.rows, self.error = rows or {}, error
 
-    async def get_dataset_version_meta(self, name, version=None):
+    async def get_dataset_version_meta(self, name, version=None, *, workspace_id=None):
         if self.error:
             raise self.error
         return self.rows.get(name)

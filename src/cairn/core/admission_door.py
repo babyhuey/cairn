@@ -47,7 +47,7 @@ class AdmissionDecision:
     #: whether the intake door could check anything, and what it warned about —
     #: "admitted, not checked" must be readable on the record, not silent
     intake: dict[str, Any] = field(default_factory=dict)
-    #: ADR-0142 — what each input's declaration required of its version, and what it found
+    #: ADR-0146 — what each input's declaration required of its version, and what it found
     expectations: list[dict[str, Any]] = field(default_factory=list)
     policy: dict[str, Any] = field(default_factory=dict)
     environment: str = ""
@@ -116,7 +116,7 @@ def _runtime_policies() -> list[Any]:
 
 async def _check_expectations(inputs: dict[str, Any], expectations: dict[str, dict[str, str]],
                               store: Any, decision: AdmissionDecision, *, workspace_id: str) -> None:
-    """ADR-0142 D2 — each input that declares ``role:`` / ``verdict: required`` is checked against
+    """ADR-0146 D2 — each input that declares ``role:`` / ``verdict: required`` is checked against
     the version it was given: a value that is not a ``dataset:`` ref, a ref the registry does not
     hold, a different role, or no verdict when one is required refuses the launch. Every check
     is recorded, passed or not.
@@ -143,7 +143,7 @@ async def _check_expectations(inputs: dict[str, Any], expectations: dict[str, di
         meta = None
         if parsed is not None:
             try:
-                meta = await store.get_dataset_version_meta(parsed[0], parsed[1])
+                meta = await store.get_dataset_version_meta(parsed[0], parsed[1], workspace_id=workspace_id)
             except Exception as exc:  # noqa: BLE001 — a registry that cannot answer refuses, never admits unchecked
                 problem = f"the registry could not be read ({type(exc).__name__})"
             else:
@@ -174,7 +174,7 @@ async def decide_admission(
     expectations: Optional[dict[str, dict[str, str]]] = None,
 ) -> AdmissionDecision:
     """Decide once, for this launch, from facts + required checks + policy + context.
-    ``expectations`` (ADR-0142) are the pipeline's declared per-input role and verdict
+    ``expectations`` (ADR-0146) are the pipeline's declared per-input role and verdict
     requirements (``engine.pipeline.dataset_expectations``)."""
     from cairn.core.holdout import check_holdout_for_inputs  # noqa: PLC0415 — off the hot import path
     from cairn.core.intake import check_intake_for_inputs  # noqa: PLC0415
