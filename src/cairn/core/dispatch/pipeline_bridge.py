@@ -352,6 +352,8 @@ _NO_WORKSPACE_REASON = "record names no workspace"
 _NO_WORKSPACE_VERDICT = "workspace_unresolved"
 #: What a refused ``_submit_step`` returns (it otherwise returns ``None``): the
 #: pipeline is already failed and persisted, so the caller stops right there.
+#: Both refusals return it: a record that names no workspace, and a wire that
+#: cannot resolve.
 _REFUSED = False
 
 
@@ -1471,6 +1473,10 @@ class PipelineBridge:
             # keep submitting downstream legs while the teardown was in flight.)
             if rec.terminal_intent:
                 break
+            # A pass a passed gate leg ran from inside `_submit_step` may have
+            # failed and persisted the record already: start nothing more on it.
+            if rec.status in PIPELINE_TERMINAL:
+                return
             # A finalizer is never dependency-driven — `_run_finalizers` owns it.
             if getattr(s, "finalizer", False):
                 continue
@@ -1577,7 +1583,7 @@ class PipelineBridge:
 
     @_in_record_workspace
     async def _submit_step(self, rec: PipelineRecord, s: Any, outputs: dict, *,
-                           after_restart: bool = False) -> None:
+                           after_restart: bool = False) -> Optional[bool]:
         """Resolve a ready step's inputs from persisted output + submit it as its OWN
         governed run (stamped with the pipeline lineage). The data contract never reads
         an in-graph channel.
@@ -1589,13 +1595,14 @@ class PipelineBridge:
         A non-optional wire that resolves to NOTHING (#1540 — the producer ran
         but has no such field) fails the PIPELINE with the two-sided message as
         the cited reason; letting it propagate would skip the record `put` in
-        `_advance` and wedge the run mid-transition."""
+        `_advance` and wedge the run mid-transition. It returns ``_REFUSED``, so
+        the caller stops: no further leg starts on the failed record."""
         try:
             resolved = resolve_step_inputs(s, bundle_input=rec.inputs, steps=outputs)
         except WireResolutionError as e:
             await self._audit(rec, s.id, "wire_unresolved", {"error": str(e)})
             await self._fail_pipeline(rec, str(e))
-            return
+            return _REFUSED
         # #1180 — a GATE leg has no executable: the approval that routed us here
         # IS the step. Mark done and advance dependents; dispatching its name
         # through run_template was the fourth bug the first full E2E found.
@@ -2872,8 +2879,9 @@ class PipelineBridge:
                 await self._audit(rec, step_id, "fire_recorded", {"fired_key": fire_key})
             self._cleanup_step_triggers(pipeline_id, step_id)  # a schedule/event step is now firing
             if await self._submit_step(rec, step, outputs) is _REFUSED:
-                await self._decide_review(pipeline_id, step_id, "rejected", reviewer=approver or "",
-                                          rationale=_NO_WORKSPACE_REASON)
+                await self._decide_review(
+                    pipeline_id, step_id, "rejected", reviewer=approver or "",
+                    rationale=(rec.trigger or {}).get("failure_reason") or _NO_WORKSPACE_REASON)
                 return await self.store.get(pipeline_id)  # type: ignore[return-value]
             await self._audit(rec, step_id, "approved" if approver else "advanced",
                               {"approver": approver})
