@@ -1515,7 +1515,13 @@ async def resolve_dataset_ref(store: ArtifactStore, ref: str, *,
     scope (the run's, scoped from its record). The name, a pinned version and
     ``@latest`` see only that workspace's versions; another workspace's is "not
     found". With auth on and no workspace in scope it raises
-    :class:`~cairn.core.workspace.WorkspaceScopeRequired`."""
+    :class:`~cairn.core.workspace.WorkspaceScopeRequired`.
+
+    ``uri`` is where the bytes can be READ: the workspace's own durable copy
+    (``durable_uri``, #1395) when its registration has one, else the location
+    they were registered at. A control-plane path may be gone (a cleaned
+    ``/tmp``) or unreachable (a remote box); the durable copy is neither. The
+    registration itself is unchanged: ``rec.uri`` stays the provenance."""
     parsed = parse_dataset_ref(ref)
     if parsed is None:
         return None
@@ -1525,7 +1531,7 @@ async def resolve_dataset_ref(store: ArtifactStore, ref: str, *,
     if got is None:
         raise KeyError(f"dataset ref {ref!r} not found in the registry")
     v, rec = got
-    return {"name": name, "version": v, "uri": rec.uri,
+    return {"name": name, "version": v, "uri": rec.durable_uri or rec.uri,
             "content_hash": rec.id, "size_bytes": rec.size_bytes}
 
 
