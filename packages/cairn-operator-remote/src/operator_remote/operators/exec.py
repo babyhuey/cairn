@@ -121,11 +121,14 @@ def _reset_conn_cache() -> None:
     _conn_cache.clear()
 
 
-def _owner_only():
-    """SFTP attrs that create a file 0600 (asyncssh is loaded: a connection exists)."""
+def _create_owner_only() -> tuple:
+    """``(pflags, attrs)`` for an SFTP open that CREATES a new file with mode 0600
+    and fails if the file already exists (``FXF_EXCL``): an existing file is never
+    truncated and left with its old mode. asyncssh is loaded: a connection exists."""
     import asyncssh  # noqa: PLC0415 - optional dep (see _require_ssh)
 
-    return asyncssh.SFTPAttrs(permissions=0o600)
+    return (asyncssh.FXF_WRITE | asyncssh.FXF_CREAT | asyncssh.FXF_EXCL,
+            asyncssh.SFTPAttrs(permissions=0o600))
 
 
 def _runner(command: str, env: dict) -> str:
@@ -216,9 +219,18 @@ async def _submit(inp: RemoteExecInput, ctx: OperationContext) -> JobHandle:
         for local in inp.upload:
             await sftp.put(local, f"{workdir}/")
         # runner.sh carries the job's env (the spec, the job-channel token, forwarded
-        # settings): it is CREATED owner-only (0600, removed above so the mode always
-        # applies), so another account on the box never reads it (ADR-0149 D2).
-        async with sftp.open(f"{workdir}/runner.sh", "w", attrs=_owner_only()) as f:
+        # settings): it is CREATED, exclusively, owner-only (0600), so another account
+        # on the box never reads it (ADR-0149 D2). The copy a previous submit left was
+        # removed above; if it is still there, refuse rather than reuse its mode.
+        pflags, attrs = _create_owner_only()
+        try:
+            f = await sftp.open(f"{workdir}/runner.sh", pflags, attrs)
+        except Exception as e:  # noqa: BLE001 — re-raised with the reason
+            raise RuntimeError(
+                f"remote/exec: could not create a fresh runner.sh in {workdir} "
+                f"({type(e).__name__}); an earlier copy may not have been removed — not launching"
+            ) from e
+        async with f:
             await f.write(_runner(inp.command, env))
     # launch detached; record the pid for poll/cancel.
     # #601: the launch MUST be backgrounded INSIDE a group, not with a trailing

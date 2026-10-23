@@ -291,15 +291,20 @@ def test_checkpoint_pull_back_authenticates_with_the_connections_key(monkeypatch
 
 
 def test_a_checkpoint_pull_back_that_cannot_reach_the_box_says_so(monkeypatch, tmp_path, caplog):
-    _bind_connection(monkeypatch, key="CONN-KEY")
+    seen = _bind_connection(monkeypatch, key="CONN-KEY")
 
     async def fake_get_conn(params):
         raise PermissionError("Permission denied")
     monkeypatch.setattr(remote_exec, "_get_conn", fake_get_conn)
 
+    h = _handle()
+    h.meta["job_handle"]["meta"]["connection"] = "gpu-at-submit"
     with caplog.at_level(logging.WARNING):
-        assert asyncio.run(BuiltinSshEngine("gpu").fetch_checkpoints(_handle(), tmp_path)) is False
+        assert asyncio.run(BuiltinSshEngine("gpu-now").fetch_checkpoints(h, tmp_path)) is False
     assert "PermissionError" in caplog.text and "CONN-KEY" not in caplog.text
+    # the warning names the connection actually used: the handle's, not the target
+    assert seen == ["gpu-at-submit"]
+    assert "'gpu-at-submit'" in caplog.text and "gpu-now" not in caplog.text
 
 
 
@@ -367,9 +372,12 @@ def test_a_failed_cancel_is_not_reported_as_sent(monkeypatch):
 # ── a malformed remote_env entry never echoes what follows the name ──────────
 
 
-@pytest.mark.parametrize("entry", ["HF_TOKEN=hf_abcSECRETVALUE", "MY_VAR:hf_abcSECRETVALUE",
-                                   "=hf_abcSECRETVALUE"])
-def test_a_malformed_entry_does_not_echo_its_value(monkeypatch, entry):
+@pytest.mark.parametrize("entry,lead", [
+    ("HF_TOKEN=hf_abcSECRETVALUE", "HF_TOKEN"),
+    ("MY_VAR:hf_abcSECRETVALUE", "MY_VAR"),
+    ("=hf_abcSECRETVALUE", None),
+])
+def test_a_malformed_entry_does_not_echo_its_value(monkeypatch, entry, lead):
     _bind_connection(monkeypatch)
     _capture_submit(monkeypatch)
     monkeypatch.setenv("CAIRN_REMOTE_ENV", f"AWS_DEFAULT_REGION {entry}")
@@ -377,6 +385,24 @@ def test_a_malformed_entry_does_not_echo_its_value(monkeypatch, entry):
         _submit(_spec())
     assert "hf_abcSECRETVALUE" not in str(e.value)
     assert "entry 2" in str(e.value)
+    if lead:
+        assert f"starting {lead!r}" in str(e.value)
+
+
+@pytest.mark.parametrize("pasted", ["wJalrXUtn/K7MDENG+bPxRfi", "wJalrXUtnFEMIK7MDENG=",
+                                    "wJalrXUtn:K7MDENGbPxRfi"])
+def test_a_pasted_value_is_reported_by_position_only(monkeypatch, pasted):
+    """A secret pasted where a name belongs: no part of it is echoed, not even
+    the name-like run of characters it starts with."""
+    _bind_connection(monkeypatch)
+    _capture_submit(monkeypatch)
+    monkeypatch.setenv("CAIRN_REMOTE_ENV", f"AWS_DEFAULT_REGION,{pasted}")
+    with pytest.raises(EngineError) as e:
+        _submit(_spec())
+    msg = str(e.value)
+    assert "entry 2 is not an environment variable name" in msg
+    for part in ("wJalrXUtn", "K7MDENG", "bPxRfi", "FEMI"):
+        assert part not in msg
 
 
 # ── control-plane-only versions anywhere in the config ───────────────────────

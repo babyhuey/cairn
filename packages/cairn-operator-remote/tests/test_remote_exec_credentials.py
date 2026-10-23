@@ -50,21 +50,24 @@ class _Run:
 
 
 class _Conn:
-    def __init__(self, events: list):
+    def __init__(self, events: list, existing: frozenset = frozenset()):
         self.events = events
+        self.existing = existing
 
     async def run(self, cmd, check=False):
         self.events.append(("run", cmd))
         return _Run("")
 
     def start_sftp_client(self):
-        events = self.events
+        events, existing = self.events, self.existing
 
         class _SFTP:
             async def __aenter__(s): return s
             async def __aexit__(s, *a): return False
             async def put(s, local, remote): events.append(("put", local))
-            def open(s, path, mode, attrs=None):
+            async def open(s, path, mode, attrs=None):
+                if path in existing:
+                    raise OSError("file exists")   # what FXF_EXCL does on a real server
                 events.append(("open", path, mode, getattr(attrs, "permissions", None)))
 
                 class _F:
@@ -75,13 +78,13 @@ class _Conn:
         return _SFTP()
 
 
-def _wire(monkeypatch) -> tuple[list, list]:
+def _wire(monkeypatch, existing: frozenset = frozenset()) -> tuple[list, list]:
     events: list = []
     params_seen: list = []
 
     async def fake_connect(params):
         params_seen.append(params)
-        return _Conn(events)
+        return _Conn(events, existing)
     monkeypatch.setattr(remote_exec, "_connect", fake_connect)
     return events, params_seen
 
@@ -108,6 +111,9 @@ async def test_runner_is_created_owner_only(monkeypatch):
     runner = [e for e in events if e[0] != "run" and str(e[1]).endswith("runner.sh")]
     assert [e[0] for e in runner] == ["open", "write"], runner
     assert runner[0][3] == 0o600                      # the mode is set when it is created
+    import asyncssh
+
+    assert runner[0][2] & asyncssh.FXF_EXCL           # created exclusively: never truncated
     # a stale runner.sh is removed first, so the create mode always applies
     rm = next(e[1] for e in events if e[0] == "run" and e[1].startswith("rm -f"))
     assert "runner.sh" in rm
@@ -269,3 +275,14 @@ async def test_a_run_cancel_counts_only_jobs_it_reached(monkeypatch, tmp_path):
                                         job_meta={**meta, "workdir": "/w2"}, workspace_id="ws-a"))
     assert await cancel_remote_jobs_for_run("r-2", registry=_Registry()) == 0
     assert (await jobs.get("r-2:n1")).status == "cancelled"
+
+
+async def test_an_existing_runner_is_never_reused(monkeypatch):
+    """If the earlier runner.sh survived the pre-launch rm (e.g. it is not ours to
+    remove), the exclusive create fails and nothing is written or launched: an
+    existing file is never truncated and left with its old mode."""
+    events, _ = _wire(monkeypatch, existing=frozenset({".cairn-jobs/t-exec/runner.sh"}))
+    with pytest.raises(RuntimeError, match="fresh runner.sh"):
+        await RemoteExecOp().submit(RemoteExecInput(command="run", env={"K": "v"}), _ctx())
+    assert not any(e[0] == "write" for e in events)
+    assert not any(e[0] == "run" and "exec sh runner.sh" in e[1] for e in events)

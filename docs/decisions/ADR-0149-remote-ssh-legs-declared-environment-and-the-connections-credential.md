@@ -41,14 +41,17 @@ its value, for:
 - a name containing `KEY`, `SECRET`, `TOKEN` or `PASSWORD` (this covers `AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`): credentials stay on the box, as an instance
   role or the box's own environment;
-- an entry that is not an environment variable name, reported by its position and its leading
-  name characters only (whatever follows, as in `HF_TOKEN=hf_…`, may be a pasted value);
+- an entry that is not an environment variable name, reported by its position, plus its leading
+  name only when the entry reads as `NAME=…` or `NAME:…` with an upper-case `NAME`; nothing else
+  of the entry is echoed, since it may be a pasted value;
 - a name the engine sets itself for each submission (the spec, lineage and live-channel names).
 
 **D2 — Values reach only the job's runner file.** In venv mode they are exported from the
-job's `runner.sh`, which `remote/exec` creates with mode 0600 (a stale copy is removed first, and
-the SFTP open sets the mode, so the file is never readable by another account on the box when
-the server honours the create mode, as OpenSSH does). In image mode `runner.sh` runs
+job's `runner.sh`, which `remote/exec` creates exclusively with mode 0600: a stale copy is
+removed first, and the SFTP open uses `FXF_EXCL` with the mode, so an existing file is never
+truncated and reused with its old mode (the submit fails instead), and the new file is never
+readable by another account on the box when the server honours the create mode, as OpenSSH
+does. In image mode `runner.sh` runs
 `docker run -e NAME` with no value, so docker takes it from that file's environment. No value is
 on a command line.
 
@@ -107,8 +110,8 @@ same warning and returns `False`.
 - The SkyPilot engine, and the Metaflow engine on remote compute, also run jobs elsewhere. They
   should declare `needs_durable_inputs` and refuse control-plane-only dataset versions in the
   same way.
-- The remote-job record of the `remote/exec` OPERATOR path (`RemoteJobRecord.input`) stores the
-  resolved operator input, including any `env` a workflow binding passes. This ADR does not
-  change it.
+- On the `remote/exec` OPERATOR path, `RemoteJobRecord.input` keeps the resolved operator input,
+  including the binding's own `env`, and it is served to worker-pool claims. Check whether a
+  binding can interpolate secret values into that `env`; this ADR does not change it.
 - `cairn-extensions`: the `finetune-ssh` profile comment names `remote_env`,
   `CAIRN_DATAFLOW_REMOTE_CMD` and the wheel matching.

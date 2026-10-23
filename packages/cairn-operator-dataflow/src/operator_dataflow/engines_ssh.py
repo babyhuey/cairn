@@ -99,10 +99,11 @@ def remote_env_names() -> tuple[list[str], list[str]]:
         if name in names:
             continue
         if not _ENV_NAME.match(name):
-            # Only the entry's position and its leading name characters: whatever
-            # follows (`HF_TOKEN=hf_…`) may be a value pasted in by mistake.
-            lead = re.match(r"[A-Za-z0-9_]*", name).group()
-            problems.append(f"entry {pos}{f' (starting {lead!r})' if lead else ''} "
+            # The entry's position, plus its leading name only when it reads as
+            # `NAME=…` / `NAME:…` with an upper-case NAME: anything else (a pasted
+            # value, base64 with `=` padding) may be a secret, so none of it is echoed.
+            m = re.match(r"([A-Z_][A-Z0-9_]*)[=:]", name)
+            problems.append(f"entry {pos}{f' (starting {m.group(1)!r})' if m else ''} "
                             "is not an environment variable name")
         elif any(m in name.upper() for m in _CREDENTIAL_MARKERS):
             problems.append(f"{name} looks like a credential; credentials stay on the box "
@@ -519,8 +520,10 @@ class BuiltinSshEngine:
         except Exception as e:  # noqa: BLE001 — best-effort; the next beat retries
             # loud, not silent: an unreachable box means no checkpoints come back.
             # The error's TYPE only — SSH and key errors may quote their input.
+            # the connection actually used: the handle's, else the target (ADR-0149 D4)
+            used = str(jh.meta.get("connection") or "") or self._target
             _log.warning("checkpoint pull-back from %s:%s via %r failed (%s)",
-                         jh.meta.get("host"), workdir, self._target, type(e).__name__)
+                         jh.meta.get("host"), workdir, used, type(e).__name__)
             return False
 
     # ── result: read the FETCHED result.json; point stats at local copies ──

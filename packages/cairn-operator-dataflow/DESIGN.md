@@ -195,10 +195,12 @@ control plane is elsewhere). What the deployment provides on each side:
   tenant cannot extend the list. A name containing `KEY`, `SECRET`, `TOKEN` or
   `PASSWORD`, a malformed entry, or a name the engine sets itself (the spec,
   lineage and live-channel names) refuses the leg before submit, naming the
-  variable (a malformed entry only by position and leading name characters)
+  variable (a malformed entry only by position, plus its name when it reads
+  as `NAME=…`/`NAME:…`)
   and never its value: credentials stay on the box (an instance role,
   the box's own environment). Values reach the box only in the job's
-  `runner.sh`, which is created with mode 0600 (a stale copy is removed first),
+  `runner.sh`, which is created exclusively with mode 0600 (a stale copy is
+  removed first; one that survives fails the submit),
   or as `docker run -e NAME` with no value in image mode; never on a command
   line. The job handle, which is persisted on the pipeline step and returned by
   `GET /pipelines/{id}`, records the exec input without its environment and the
