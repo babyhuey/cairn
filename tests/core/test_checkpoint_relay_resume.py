@@ -238,7 +238,8 @@ async def test_a_leg_resumes_only_from_its_own_workspaces_checkpoint(tmp_path, s
     of another workspace relayed; in its own workspace it does."""
     wd = tmp_path / "wd"
     run_dataflow(_spec(), wd)
-    await relay_local_checkpoints(wd, run_id="run-a", store=store, dest_root=tmp_path / "durable")
+    await relay_local_checkpoints(wd, run_id="run-a", store=store, dest_root=tmp_path / "durable",
+                                  workspace_id="ws-a")
     runs = _Runs({"run-a": "ws-a", "leg-a": "ws-a", "leg-b": "ws-b"})
     key = spec_key(_spec())
     assert await _hooks(store, runs, "leg-b").resume_provider()(key) is None
@@ -248,13 +249,17 @@ async def test_a_leg_resumes_only_from_its_own_workspaces_checkpoint(tmp_path, s
 
 async def test_identical_checkpoint_bytes_from_another_workspace_are_not_resumed(tmp_path, store):
     """Identical bytes register once (content-addressed): the second workspace's
-    relay is a no-op and the record names the first producer. The second
-    workspace then starts fresh rather than reading the first one's copy."""
-    for run_id in ("run-a", "run-b"):
+    relay adds only its ownership (ADR-0148) and the record names the first
+    producer. The second workspace then starts fresh rather than reading the
+    first one's copy."""
+    for run_id, ws in (("run-a", "ws-a"), ("run-b", "ws-b")):
         wd = tmp_path / run_id
         run_dataflow(_spec(), wd)
-        await relay_local_checkpoints(wd, run_id=run_id, store=store, dest_root=tmp_path / "durable")
-    assert len(await store.list_artifacts(kind="dataset")) == 1
+        await relay_local_checkpoints(wd, run_id=run_id, store=store, dest_root=tmp_path / "durable",
+                                      workspace_id=ws)
+    for ws in ("ws-a", "ws-b"):
+        assert len(await store.list_artifacts(kind="dataset", workspace_id=ws)) == 1
+    assert await store.list_artifacts(kind="dataset", workspace_id="ws-c") == []
     runs = _Runs({"run-a": "ws-a", "run-b": "ws-b"})
     key = spec_key(_spec())
     assert await find_resume_checkpoint(store, key, workspace_id="ws-b",

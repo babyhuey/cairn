@@ -124,7 +124,7 @@ async def test_another_workspaces_version_is_never_read_and_reads_as_absent(stor
     """A version registered in another workspace is "not registered" here: the same text as a
     name nobody holds, so the refusal tells this tenant nothing about the other's data."""
     await store.register(ArtifactDescriptor(uri="file:///d/theirs.jsonl", kind="dataset", content_hash="h-theirs"),
-                         producer_run_id="prep")
+                         producer_run_id="prep", workspace_id="other-tenant")
     await store.register_dataset_version("their-train", "h-theirs", actor="prep", role="training",
                                          workspace_id="other-tenant")
     await store.set_dataset_version_verdict("their-train", 1, verdict="admitted", reasons=[], report={},

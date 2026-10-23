@@ -18,6 +18,17 @@
 Immutability: rows are written once (`ArtifactRecord` docstring). Retention: no registry
 retention policy exists (TARGET, #2196); `retention.py` covers run/event retention only.
 
+### Workspace scope — who sees a record, and whose tag moves (ADR-0147, ADR-0148)
+| Rule | Where |
+|---|---|
+| Every `ArtifactStore` read and write takes `workspace_id=` (keyword), else the workspace in scope (`scoped_workspace()`); with auth on and neither it raises `WorkspaceScopeRequired` before anything is read, relayed or written | `_artifact_workspace` in `src/cairn/core/storage/artifacts.py` |
+| `register` records the registering workspace in `artifact_owners(artifact_id, workspace_id)`, also for bytes already registered; identical bytes stay one `artifacts` row (first producer's provenance kept) with one owner row per registering workspace | `register` (both backends) |
+| `get`, `find_by_uri`, `list_artifacts`, `lineage` answer only with artifacts the workspace owns; another workspace's reads as not found. `parents` and the lineage tree leave out a parent the workspace does not own; an external parent (not a registered id) stays | `_owned`, `_parents_sql`, `_walk_lineage` |
+| `register_dataset_version` refuses an artifact the workspace does not own; version reads resolve their artifact in the version's workspace | dataset registry methods |
+| Tags are keyed by `(workspace_id, name)`; `resolve` reads and `promote` moves that workspace's tag; `promote` refuses (`KeyError`) an artifact the workspace does not own | `artifact_tags`, `resolve`, `promote` |
+| `count` is the deployment's row count | `count` |
+| Migration of an existing database (once): tags → `default`; owners backfilled with `default`, the producing run's workspace (runs in the same database) and every workspace with a dataset version of the artifact | `_migrate_sqlite_workspace_scope`, `PostgresArtifactStore._ensure_owners` |
+
 ### `ArtifactDescriptor` — what an engine may say
 The only artifact-shaped thing that crosses the engine boundary
 (`src/cairn/core/dataflow/contract.py:226-250`): `uri, kind, content_hash, rows, size_bytes,

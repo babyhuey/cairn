@@ -16,6 +16,13 @@ Backends mirror :mod:`cairn.core.storage.fingerprints` exactly: stdlib-sqlite
 (hermetic tests + local single-file), asyncpg Postgres (the existing
 ``CAIRN_STORAGE`` database), and a ``_Null`` fallback when storage is
 unconfigured (registration becomes advisory; nothing breaks).
+
+Workspace scope (ADR-0147, ADR-0148): a tag is keyed by ``(workspace_id, name)``,
+and an artifact is visible only to the workspaces that registered it
+(``artifact_owners``, one row per registering workspace; identical bytes stay one
+``artifacts`` row). Every read and write here takes the workspace from
+``workspace_id=``, else the one in scope (:func:`~cairn.core.workspace.scoped_workspace`:
+with auth on and nothing in scope it raises ``WorkspaceScopeRequired``).
 """
 from __future__ import annotations
 from cairn.core.settings import getenv
@@ -45,7 +52,13 @@ from cairn.core.dataset_roles import (
 from cairn.core.intake import VERDICTS, normalize_verdict
 from cairn.core.pg_schema_init import schema_init_lock
 from cairn.core.storage.artifact_bytes import relay as _relay_bytes
-from cairn.core.storage.migrations import add_missing_columns
+from cairn.core.storage.migrations import (
+    add_missing_columns,
+    columns,
+    pk_columns,
+    rebuild_table,
+    table_exists,
+)
 from cairn.core.workspace import DEFAULT_WORKSPACE, current_workspace, scoped_workspace
 
 
@@ -72,19 +85,35 @@ class ArtifactRecord:
 
 
 class ArtifactStore(Protocol):
+    #: Workspace scope (ADR-0147, ADR-0148). ``workspace_id`` on every method
+    #: below defaults to the workspace in scope
+    #: (:func:`~cairn.core.workspace.scoped_workspace`); with auth on and nothing
+    #: in scope the call raises ``WorkspaceScopeRequired`` before reading or
+    #: writing anything. ``register`` records the workspace as an OWNER of the
+    #: artifact (identical bytes: one row, one owner per registering workspace);
+    #: ``get``/``find_by_uri``/``list_artifacts``/``lineage`` answer only with
+    #: artifacts that workspace owns (another workspace's reads as not found;
+    #: a parent it does not own is left out of ``parents`` and the lineage
+    #: tree). Tags are per workspace: ``resolve`` reads that workspace's tag and
+    #: ``promote`` moves it, refusing (``KeyError``) an artifact the workspace
+    #: does not own. ``count`` is the deployment's row count.
     async def ensure_schema(self) -> None: ...
     async def register(
         self, descriptor: ArtifactDescriptor, *,
         producer_run_id: str = "", producer_job: str = "", account_id: str = "",
+        workspace_id: Optional[str] = None,
     ) -> str: ...
-    async def get(self, artifact_id: str) -> Optional[ArtifactRecord]: ...
-    async def find_by_uri(self, uri: str) -> Optional[str]: ...
+    async def get(self, artifact_id: str, *, workspace_id: Optional[str] = None) -> Optional[ArtifactRecord]: ...
+    async def find_by_uri(self, uri: str, *, workspace_id: Optional[str] = None) -> Optional[str]: ...
     async def list_artifacts(
         self, *, kind: Optional[str] = None, limit: int = 50, offset: int = 0,
+        workspace_id: Optional[str] = None,
     ) -> list[ArtifactRecord]: ...
-    async def resolve(self, tag: str) -> Optional[ArtifactRecord]: ...
-    async def promote(self, tag: str, artifact_id: str, *, actor: str = "") -> ArtifactRecord: ...
-    async def lineage(self, artifact_id: str, *, depth: int = 5) -> Optional[dict]: ...
+    async def resolve(self, tag: str, *, workspace_id: Optional[str] = None) -> Optional[ArtifactRecord]: ...
+    async def promote(self, tag: str, artifact_id: str, *, actor: str = "",
+                      workspace_id: Optional[str] = None) -> ArtifactRecord: ...
+    async def lineage(self, artifact_id: str, *, depth: int = 5,
+                      workspace_id: Optional[str] = None) -> Optional[dict]: ...
     async def count(self) -> int: ...
     async def close(self) -> None: ...
     # ─ dataset registry (#1466): named, append-only VERSIONS over registered
@@ -165,25 +194,26 @@ class _NullArtifactStore:
     async def ensure_schema(self) -> None:
         return None
 
-    async def register(self, descriptor, *, producer_run_id="", producer_job="", account_id="") -> str:
+    async def register(self, descriptor, *, producer_run_id="", producer_job="", account_id="",
+                       workspace_id=None) -> str:
         return descriptor.content_hash
 
-    async def get(self, artifact_id) -> Optional[ArtifactRecord]:
+    async def get(self, artifact_id, *, workspace_id=None) -> Optional[ArtifactRecord]:
         return None
 
-    async def find_by_uri(self, uri) -> Optional[str]:
+    async def find_by_uri(self, uri, *, workspace_id=None) -> Optional[str]:
         return None
 
-    async def list_artifacts(self, *, kind=None, limit=50, offset=0) -> list[ArtifactRecord]:
+    async def list_artifacts(self, *, kind=None, limit=50, offset=0, workspace_id=None) -> list[ArtifactRecord]:
         return []
 
-    async def resolve(self, tag) -> Optional[ArtifactRecord]:
+    async def resolve(self, tag, *, workspace_id=None) -> Optional[ArtifactRecord]:
         return None
 
-    async def promote(self, tag, artifact_id, *, actor="") -> ArtifactRecord:
+    async def promote(self, tag, artifact_id, *, actor="", workspace_id=None) -> ArtifactRecord:
         raise RuntimeError("artifact registry not configured (CAIRN_STORAGE unset) — cannot promote")
 
-    async def lineage(self, artifact_id, *, depth=5) -> Optional[dict]:
+    async def lineage(self, artifact_id, *, depth=5, workspace_id=None) -> Optional[dict]:
         return None
 
     async def count(self) -> int:
@@ -258,6 +288,57 @@ _COLS = (
 #: durable copy, which is the truth about it.
 _ARTIFACT_COLUMNS = {"durable_uri": "TEXT"}
 
+#: ADR-0147 — a tag is keyed by ``(workspace_id, name)``: each workspace has its
+#: own ``prod``. A database written before keeps its tags in ``default``.
+_TAGS_SCHEMA = (
+    f"workspace_id TEXT NOT NULL DEFAULT '{DEFAULT_WORKSPACE}', name TEXT NOT NULL, "
+    "artifact_id TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT, "
+    "PRIMARY KEY (workspace_id, name)"
+)
+
+#: ADR-0148 — who may see an artifact: one row per workspace that registered it.
+#: Content-addressing keeps ONE ``artifacts`` row for identical bytes; each
+#: registering workspace adds its own owner row and sees the artifact through it.
+_OWNERS_SCHEMA = (
+    "artifact_id TEXT NOT NULL, workspace_id TEXT NOT NULL, "
+    "PRIMARY KEY (artifact_id, workspace_id)"
+)
+_OWNERS_INDEX = "CREATE INDEX IF NOT EXISTS idx_art_owner_ws ON artifact_owners(workspace_id, artifact_id)"
+
+
+def _owner_backfill(*, with_runs: bool) -> list[str]:
+    """The one-time ownership backfill, run only when ``artifact_owners`` is
+    created on a database that already holds artifacts (ADR-0148 D4): ``default``
+    owns every existing artifact; so does the workspace of the run that produced
+    it (when that run is in this database) and every workspace that named it as
+    a dataset version. Written as plain ``INSERT … SELECT``; the caller adds the
+    dialect's ignore-duplicates clause."""
+    stmts = [f"SELECT id, '{DEFAULT_WORKSPACE}' FROM artifacts"]
+    if with_runs:
+        stmts.append(
+            "SELECT a.id, r.workspace_id FROM artifacts a JOIN runs r ON r.id = a.producer_run_id "
+            "WHERE COALESCE(a.producer_run_id, '') <> '' AND COALESCE(r.workspace_id, '') <> ''")
+    stmts.append(
+        "SELECT DISTINCT v.artifact_id, v.workspace_id FROM dataset_versions v "
+        "JOIN artifacts a ON a.id = v.artifact_id WHERE COALESCE(v.workspace_id, '') <> ''")
+    return stmts
+
+
+def _owned(ph: str, alias: str = "artifacts") -> str:
+    """``WHERE`` clause: the artifact row ``alias`` is owned by workspace ``ph``."""
+    return (f"EXISTS (SELECT 1 FROM artifact_owners o WHERE o.artifact_id = {alias}.id "
+            f"AND o.workspace_id = {ph})")
+
+
+def _parents_sql(child_ph: str, ws_ph: str) -> str:
+    """A child's parents as one workspace sees them: an external reference (no
+    registered artifact by that id, e.g. a URI) and a parent the workspace owns
+    are kept; another workspace's artifact is left out."""
+    return ("SELECT p.parent_id FROM artifact_parents p WHERE p.child_id = " + child_ph + " AND ("
+            "NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.id = p.parent_id) OR "
+            "EXISTS (SELECT 1 FROM artifact_owners o WHERE o.artifact_id = p.parent_id "
+            "AND o.workspace_id = " + ws_ph + ")) ORDER BY p.parent_id")
+
 
 def _record_from_row(row: Sequence, parents: list[str]) -> ArtifactRecord:
     return ArtifactRecord(
@@ -271,11 +352,20 @@ def _record_from_row(row: Sequence, parents: list[str]) -> ArtifactRecord:
     )
 
 
-async def _walk_lineage(store: ArtifactStore, artifact_id: str, depth: int, seen: set[str]) -> Optional[dict]:
+def _artifact_workspace(workspace_id: Optional[str]) -> str:
+    """The workspace an artifact read or write answers in (ADR-0147, ADR-0148):
+    the one named, else the one in scope. With auth on and nothing in scope this
+    raises :class:`~cairn.core.workspace.WorkspaceScopeRequired`."""
+    return (workspace_id or "").strip() or scoped_workspace()
+
+
+async def _walk_lineage(store: ArtifactStore, artifact_id: str, depth: int, seen: set[str],
+                        workspace_id: str) -> Optional[dict]:
     """Recursive parent walk shared by both backends — depth-capped and
     cycle-guarded (a content-addressed DAG shouldn't cycle, but a bad publish
-    must not hang the API)."""
-    rec = await store.get(artifact_id)
+    must not hang the API). Every node is read in ``workspace_id``: a parent
+    the workspace does not own is not in the tree."""
+    rec = await store.get(artifact_id, workspace_id=workspace_id)
     if rec is None:
         return None
     node: dict[str, Any] = {"id": rec.id, "kind": rec.kind, "uri": rec.uri, "parents": []}
@@ -285,7 +375,7 @@ async def _walk_lineage(store: ArtifactStore, artifact_id: str, depth: int, seen
         if pid in seen:
             continue
         seen.add(pid)
-        parent = await _walk_lineage(store, pid, depth - 1, seen)
+        parent = await _walk_lineage(store, pid, depth - 1, seen, workspace_id)
         if parent is not None:
             node["parents"].append(parent)
     return node
@@ -309,12 +399,7 @@ _CREATE_SQLITE = [
         PRIMARY KEY (child_id, parent_id)
     )
     """,
-    """
-    CREATE TABLE IF NOT EXISTS artifact_tags (
-        name TEXT PRIMARY KEY, artifact_id TEXT NOT NULL,
-        updated_at TEXT NOT NULL, updated_by TEXT
-    )
-    """,
+    f"CREATE TABLE IF NOT EXISTS artifact_tags ({_TAGS_SCHEMA})",
     """
     CREATE TABLE IF NOT EXISTS dataset_versions (
         name TEXT NOT NULL, version INTEGER NOT NULL, artifact_id TEXT NOT NULL,
@@ -330,6 +415,33 @@ _CREATE_SQLITE = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_art_kind ON artifacts(kind, created_at)",
 ]
+
+
+def _migrate_sqlite_workspace_scope(conn: sqlite3.Connection) -> None:
+    """ADR-0147/0148 on an existing SQLite database, in one ``IMMEDIATE``
+    transaction (a second process opening the same file waits, then finds it
+    done): rebuild ``artifact_tags`` onto ``(workspace_id, name)`` with every
+    existing tag in ``default``; create ``artifact_owners`` and, only when it is
+    created, backfill it (:func:`_owner_backfill`). A no-op once current."""
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if pk_columns(conn, "artifact_tags") != ["workspace_id", "name"]:
+            rebuild_table(
+                conn, "artifact_tags", new_schema=_TAGS_SCHEMA,
+                select_columns="workspace_id, name, artifact_id, updated_at, updated_by",
+                from_select=(f"SELECT '{DEFAULT_WORKSPACE}', name, artifact_id, updated_at, "
+                             "updated_by FROM artifact_tags"))
+        if not table_exists(conn, "artifact_owners"):
+            conn.execute(f"CREATE TABLE artifact_owners ({_OWNERS_SCHEMA})")
+            with_runs = "workspace_id" in columns(conn, "runs")
+            for select in _owner_backfill(with_runs=with_runs):
+                conn.execute(f"INSERT OR IGNORE INTO artifact_owners (artifact_id, workspace_id) {select}")
+        conn.execute(_OWNERS_INDEX)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 #: #2020 (ADR-0102 D1) — role / schema / column_mapping and the frozen-split
 #: lineage, added to an EXISTING ``dataset_versions`` in place. Every column has
@@ -505,12 +617,17 @@ class SqliteArtifactStore:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_dsv_role ON dataset_versions(workspace_id, role)")
         self._conn.commit()
+        # ADR-0147/0148 — workspace-keyed tags and artifact ownership. After the
+        # dataset_versions columns above: the ownership backfill reads its workspace_id.
+        _migrate_sqlite_workspace_scope(self._conn)
         self._lock = asyncio.Lock()
 
     async def ensure_schema(self) -> None:
         return None  # done in __init__
 
-    async def register(self, descriptor, *, producer_run_id="", producer_job="", account_id="") -> str:
+    async def register(self, descriptor, *, producer_run_id="", producer_job="", account_id="",
+                       workspace_id=None) -> str:
+        ws = _artifact_workspace(workspace_id)  # refuses before anything is relayed or written
         durable = await _relay_bytes(descriptor.uri, descriptor.content_hash)  # #1395 — outside the lock
         async with self._lock:
             # idempotent on content hash: a re-register of identical bytes is a
@@ -525,6 +642,11 @@ class SqliteArtifactStore:
                     producer_run_id, producer_job, account_id, utc_now_iso(), durable or None,
                 ),
             )
+            # ADR-0148 — the registering workspace owns it, whether or not the
+            # bytes were already registered (by it or by another workspace).
+            self._conn.execute(
+                "INSERT OR IGNORE INTO artifact_owners (artifact_id, workspace_id) VALUES (?,?)",
+                (descriptor.content_hash, ws))
             if durable:
                 # Fill a HOLE, never overwrite a fact: an existing row that has
                 # no durable copy yet gains one (the relay may have been off, or
@@ -540,62 +662,69 @@ class SqliteArtifactStore:
             self._conn.commit()
         return descriptor.content_hash
 
-    async def get(self, artifact_id) -> Optional[ArtifactRecord]:
+    async def get(self, artifact_id, *, workspace_id=None) -> Optional[ArtifactRecord]:
+        ws = _artifact_workspace(workspace_id)
         async with self._lock:
             row = self._conn.execute(
-                f"SELECT {_COLS} FROM artifacts WHERE id=?", (artifact_id,)
+                f"SELECT {_COLS} FROM artifacts WHERE id=? AND {_owned('?')}", (artifact_id, ws)
             ).fetchone()
             if row is None:
                 return None
             parents = [r[0] for r in self._conn.execute(
-                "SELECT parent_id FROM artifact_parents WHERE child_id=? ORDER BY parent_id",
-                (artifact_id,),
-            ).fetchall()]
+                _parents_sql("?", "?"), (artifact_id, ws)).fetchall()]
         return _record_from_row(row, parents)
 
-    async def find_by_uri(self, uri) -> Optional[str]:
+    async def find_by_uri(self, uri, *, workspace_id=None) -> Optional[str]:
         """The registry ID of the (most recent) artifact stored at ``uri`` —
-        how a downstream leg's INPUT URI becomes a lineage parent (#1432)."""
+        how a downstream leg's INPUT URI becomes a lineage parent (#1432) —
+        among the artifacts the workspace owns."""
+        ws = _artifact_workspace(workspace_id)
         async with self._lock:
             row = self._conn.execute(
-                "SELECT id FROM artifacts WHERE uri=? ORDER BY created_at DESC LIMIT 1", (uri,)
+                f"SELECT id FROM artifacts WHERE uri=? AND {_owned('?')} "
+                "ORDER BY created_at DESC LIMIT 1", (uri, ws)
             ).fetchone()
         return row[0] if row else None
 
-    async def list_artifacts(self, *, kind=None, limit=50, offset=0) -> list[ArtifactRecord]:
+    async def list_artifacts(self, *, kind=None, limit=50, offset=0, workspace_id=None) -> list[ArtifactRecord]:
+        ws = _artifact_workspace(workspace_id)
         async with self._lock:
-            where, params = ("WHERE kind=?", [kind]) if kind else ("", [])
+            where, params = ("AND kind=?", [kind]) if kind else ("", [])
             rows = self._conn.execute(
-                f"SELECT {_COLS} FROM artifacts {where} "
+                f"SELECT {_COLS} FROM artifacts WHERE {_owned('?')} {where} "
                 "ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                (*params, limit, offset),
+                (ws, *params, limit, offset),
             ).fetchall()
         return [_record_from_row(r, []) for r in rows]  # parents omitted in lists (cheap view)
 
-    async def resolve(self, tag) -> Optional[ArtifactRecord]:
+    async def resolve(self, tag, *, workspace_id=None) -> Optional[ArtifactRecord]:
+        ws = _artifact_workspace(workspace_id)
         async with self._lock:
             row = self._conn.execute(
-                "SELECT artifact_id FROM artifact_tags WHERE name=?", (tag,)
+                "SELECT artifact_id FROM artifact_tags WHERE workspace_id=? AND name=?", (ws, tag)
             ).fetchone()
-        return await self.get(row[0]) if row else None
+        return await self.get(row[0], workspace_id=ws) if row else None
 
-    async def promote(self, tag, artifact_id, *, actor="") -> ArtifactRecord:
-        rec = await self.get(artifact_id)
+    async def promote(self, tag, artifact_id, *, actor="", workspace_id=None) -> ArtifactRecord:
+        ws = _artifact_workspace(workspace_id)
+        rec = await self.get(artifact_id, workspace_id=ws)
         if rec is None:
-            raise KeyError(f"artifact {artifact_id!r} not registered — cannot promote to {tag!r}")
+            raise KeyError(f"artifact {artifact_id!r} not registered in workspace {ws!r} — "
+                           f"cannot promote to {tag!r}")
         async with self._lock:
             self._conn.execute(
-                "INSERT INTO artifact_tags (name, artifact_id, updated_at, updated_by) "
-                "VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                "INSERT INTO artifact_tags (workspace_id, name, artifact_id, updated_at, updated_by) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(workspace_id, name) DO UPDATE SET "
                 "artifact_id=excluded.artifact_id, updated_at=excluded.updated_at, "
                 "updated_by=excluded.updated_by",
-                (tag, artifact_id, utc_now_iso(), actor),
+                (ws, tag, artifact_id, utc_now_iso(), actor),
             )
             self._conn.commit()
         return rec
 
-    async def lineage(self, artifact_id, *, depth=5) -> Optional[dict]:
-        return await _walk_lineage(self, artifact_id, depth, {artifact_id})
+    async def lineage(self, artifact_id, *, depth=5, workspace_id=None) -> Optional[dict]:
+        ws = _artifact_workspace(workspace_id)
+        return await _walk_lineage(self, artifact_id, depth, {artifact_id}, ws)
 
     async def count(self) -> int:
         async with self._lock:
@@ -610,10 +739,12 @@ class SqliteArtifactStore:
                                        schema=None, column_mapping=None, parent_version="",
                                        split_policy=None, workspace_id=None, dated_at=None,
                                        origin=None, origin_detail=None) -> int:
-        rec = await self.get(artifact_id)
-        if rec is None:
-            raise KeyError(f"artifact {artifact_id!r} not registered — cannot version as {name!r}")
         ws = _dataset_workspace(workspace_id)
+        # ADR-0148 — a workspace versions only an artifact it registered.
+        rec = await self.get(artifact_id, workspace_id=ws)
+        if rec is None:
+            raise KeyError(f"artifact {artifact_id!r} not registered in workspace {ws!r} — "
+                           f"cannot version as {name!r}")
         role, schema, column_mapping = await _declare(self, name, role, schema, column_mapping)
         origin = normalize_origin(origin)
         # #2033 — the never-trainable rule, at the WRITE. Before the golden
@@ -689,7 +820,7 @@ class SqliteArtifactStore:
                     (name, int(version), ws)).fetchone()
         if row is None:
             return None
-        rec = await self.get(row[1])
+        rec = await self.get(row[1], workspace_id=ws)
         return (int(row[0]), rec) if rec else None
 
     async def list_dataset_versions(self, name, *, workspace_id=None) -> list[dict]:
@@ -715,7 +846,7 @@ class SqliteArtifactStore:
         if row is None:
             return None
         out = _version_row(row)
-        rec = await self.get(out["artifact_id"])
+        rec = await self.get(out["artifact_id"], workspace_id=ws)
         out["uri"] = rec.uri if rec else ""
         out["row_count"] = rec.row_count if rec else None
         return out
@@ -733,7 +864,7 @@ class SqliteArtifactStore:
                 (*wanted, ws)).fetchall()
         out = [_version_row(r) for r in rows]
         for item in out:
-            rec = await self.get(item["artifact_id"])
+            rec = await self.get(item["artifact_id"], workspace_id=ws)
             item["uri"] = rec.uri if rec else ""
         return out
 
@@ -751,7 +882,7 @@ class SqliteArtifactStore:
         # leave the obvious hole: register synthetic rows as `test`, then patch
         # the role to `training`. Same function, both doors.
         assert_role_allowed_for_origin(new_role, cur.get("origin"))
-        rec = await self.get(cur["artifact_id"])
+        rec = await self.get(cur["artifact_id"], workspace_id=cur["workspace_id"])
         if rec is not None:
             await _guard_golden(new_role, name, rec, cur["workspace_id"])
         async with self._lock:
@@ -854,11 +985,30 @@ _CREATE_PG = [
         PRIMARY KEY (child_id, parent_id)
     )
     """,
+    f"CREATE TABLE IF NOT EXISTS artifact_tags ({_TAGS_SCHEMA})",
+    # ADR-0147 — an artifact_tags created before keyed by name alone: its tags
+    # move to `default` (the column default) and the key becomes (workspace_id,
+    # name). A no-op once the key is current.
+    f"ALTER TABLE artifact_tags ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL "
+    f"DEFAULT '{DEFAULT_WORKSPACE}'",
     """
-    CREATE TABLE IF NOT EXISTS artifact_tags (
-        name TEXT PRIMARY KEY, artifact_id TEXT NOT NULL,
-        updated_at TEXT NOT NULL, updated_by TEXT
-    )
+    DO $$
+    DECLARE pk_name text; pk_cols text;
+    BEGIN
+        SELECT c.conname,
+               string_agg(a.attname, ',' ORDER BY array_position(c.conkey, a.attnum))
+          INTO pk_name, pk_cols
+          FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+         WHERE c.conrelid = 'artifact_tags'::regclass AND c.contype = 'p'
+         GROUP BY c.conname;
+        IF pk_cols IS DISTINCT FROM 'workspace_id,name' THEN
+            IF pk_name IS NOT NULL THEN
+                EXECUTE format('ALTER TABLE artifact_tags DROP CONSTRAINT %I', pk_name);
+            END IF;
+            ALTER TABLE artifact_tags ADD PRIMARY KEY (workspace_id, name);
+        END IF;
+    END $$
     """,
     """
     CREATE TABLE IF NOT EXISTS dataset_versions (
@@ -912,13 +1062,34 @@ class PostgresArtifactStore:
         async with pool.acquire() as conn, schema_init_lock(conn):  # #2551 — replicas serialise DDL
             for stmt in _CREATE_PG:
                 await conn.execute(stmt)
+            await self._ensure_owners(conn)
         self._schema_ready = True
 
-    async def register(self, descriptor, *, producer_run_id="", producer_job="", account_id="") -> str:
+    @staticmethod
+    async def _ensure_owners(conn) -> None:
+        """ADR-0148 — create ``artifact_owners`` and, only when this call creates
+        it, backfill it (:func:`_owner_backfill`), in one transaction. Runs under
+        the fleet-wide schema lock, so one replica creates and backfills and
+        every other finds the table there."""
+        if await conn.fetchval("SELECT to_regclass('artifact_owners')") is None:
+            async with conn.transaction():
+                await conn.execute(f"CREATE TABLE artifact_owners ({_OWNERS_SCHEMA})")
+                with_runs = bool(await conn.fetchval(
+                    "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() "
+                    "AND table_name = 'runs' AND column_name = 'workspace_id'"))
+                for select in _owner_backfill(with_runs=with_runs):
+                    await conn.execute(
+                        f"INSERT INTO artifact_owners (artifact_id, workspace_id) {select} "
+                        "ON CONFLICT DO NOTHING")
+        await conn.execute(_OWNERS_INDEX)
+
+    async def register(self, descriptor, *, producer_run_id="", producer_job="", account_id="",
+                       workspace_id=None) -> str:
+        ws = _artifact_workspace(workspace_id)  # refuses before anything is relayed or written
         await self.ensure_schema()
         durable = await _relay_bytes(descriptor.uri, descriptor.content_hash)  # #1395
         pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire() as conn, conn.transaction():
             await conn.execute(
                 f"INSERT INTO artifacts ({_COLS}) "
                 "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING",
@@ -928,6 +1099,10 @@ class PostgresArtifactStore:
                 descriptor.size_bytes, descriptor.rows,
                 producer_run_id, producer_job, account_id, utc_now_iso(), durable or None,
             )
+            # ADR-0148 — the registering workspace owns it (see the sqlite twin).
+            await conn.execute(
+                "INSERT INTO artifact_owners (artifact_id, workspace_id) VALUES ($1,$2) "
+                "ON CONFLICT DO NOTHING", descriptor.content_hash, ws)
             if durable:
                 # Fill a HOLE, never overwrite a fact (see the sqlite twin).
                 await conn.execute(
@@ -942,67 +1117,75 @@ class PostgresArtifactStore:
                 )
         return descriptor.content_hash
 
-    async def get(self, artifact_id) -> Optional[ArtifactRecord]:
-        await self.ensure_schema()
-        pool = await self._pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(f"SELECT {_COLS} FROM artifacts WHERE id=$1", artifact_id)
-            if row is None:
-                return None
-            parents = [r["parent_id"] for r in await conn.fetch(
-                "SELECT parent_id FROM artifact_parents WHERE child_id=$1 ORDER BY parent_id",
-                artifact_id,
-            )]
-        return _record_from_row(tuple(row), parents)
-
-    async def find_by_uri(self, uri) -> Optional[str]:
+    async def get(self, artifact_id, *, workspace_id=None) -> Optional[ArtifactRecord]:
+        ws = _artifact_workspace(workspace_id)
         await self.ensure_schema()
         pool = await self._pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id FROM artifacts WHERE uri=$1 ORDER BY created_at DESC LIMIT 1", uri)
+                f"SELECT {_COLS} FROM artifacts WHERE id=$1 AND {_owned('$2')}", artifact_id, ws)
+            if row is None:
+                return None
+            parents = [r["parent_id"] for r in await conn.fetch(
+                _parents_sql("$1", "$2"), artifact_id, ws)]
+        return _record_from_row(tuple(row), parents)
+
+    async def find_by_uri(self, uri, *, workspace_id=None) -> Optional[str]:
+        ws = _artifact_workspace(workspace_id)
+        await self.ensure_schema()
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT id FROM artifacts WHERE uri=$1 AND {_owned('$2')} "
+                "ORDER BY created_at DESC LIMIT 1", uri, ws)
         return row["id"] if row else None
 
-    async def list_artifacts(self, *, kind=None, limit=50, offset=0) -> list[ArtifactRecord]:
+    async def list_artifacts(self, *, kind=None, limit=50, offset=0, workspace_id=None) -> list[ArtifactRecord]:
+        ws = _artifact_workspace(workspace_id)
         await self.ensure_schema()
         pool = await self._pool()
         async with pool.acquire() as conn:
             if kind:
                 rows = await conn.fetch(
-                    f"SELECT {_COLS} FROM artifacts WHERE kind=$1 "
-                    "ORDER BY created_at DESC LIMIT $2 OFFSET $3", kind, limit, offset,
+                    f"SELECT {_COLS} FROM artifacts WHERE {_owned('$1')} AND kind=$2 "
+                    "ORDER BY created_at DESC LIMIT $3 OFFSET $4", ws, kind, limit, offset,
                 )
             else:
                 rows = await conn.fetch(
-                    f"SELECT {_COLS} FROM artifacts "
-                    "ORDER BY created_at DESC LIMIT $1 OFFSET $2", limit, offset,
+                    f"SELECT {_COLS} FROM artifacts WHERE {_owned('$1')} "
+                    "ORDER BY created_at DESC LIMIT $2 OFFSET $3", ws, limit, offset,
                 )
         return [_record_from_row(tuple(r), []) for r in rows]
 
-    async def resolve(self, tag) -> Optional[ArtifactRecord]:
+    async def resolve(self, tag, *, workspace_id=None) -> Optional[ArtifactRecord]:
+        ws = _artifact_workspace(workspace_id)
         await self.ensure_schema()
         pool = await self._pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT artifact_id FROM artifact_tags WHERE name=$1", tag)
-        return await self.get(row["artifact_id"]) if row else None
+            row = await conn.fetchrow(
+                "SELECT artifact_id FROM artifact_tags WHERE workspace_id=$1 AND name=$2", ws, tag)
+        return await self.get(row["artifact_id"], workspace_id=ws) if row else None
 
-    async def promote(self, tag, artifact_id, *, actor="") -> ArtifactRecord:
-        rec = await self.get(artifact_id)
+    async def promote(self, tag, artifact_id, *, actor="", workspace_id=None) -> ArtifactRecord:
+        ws = _artifact_workspace(workspace_id)
+        rec = await self.get(artifact_id, workspace_id=ws)
         if rec is None:
-            raise KeyError(f"artifact {artifact_id!r} not registered — cannot promote to {tag!r}")
+            raise KeyError(f"artifact {artifact_id!r} not registered in workspace {ws!r} — "
+                           f"cannot promote to {tag!r}")
         pool = await self._pool()
         async with pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO artifact_tags (name, artifact_id, updated_at, updated_by) "
-                "VALUES ($1,$2,$3,$4) ON CONFLICT (name) DO UPDATE SET "
+                "INSERT INTO artifact_tags (workspace_id, name, artifact_id, updated_at, updated_by) "
+                "VALUES ($1,$2,$3,$4,$5) ON CONFLICT (workspace_id, name) DO UPDATE SET "
                 "artifact_id=EXCLUDED.artifact_id, updated_at=EXCLUDED.updated_at, "
                 "updated_by=EXCLUDED.updated_by",
-                tag, artifact_id, utc_now_iso(), actor,
+                ws, tag, artifact_id, utc_now_iso(), actor,
             )
         return rec
 
-    async def lineage(self, artifact_id, *, depth=5) -> Optional[dict]:
-        return await _walk_lineage(self, artifact_id, depth, {artifact_id})
+    async def lineage(self, artifact_id, *, depth=5, workspace_id=None) -> Optional[dict]:
+        ws = _artifact_workspace(workspace_id)
+        return await _walk_lineage(self, artifact_id, depth, {artifact_id}, ws)
 
     async def count(self) -> int:
         await self.ensure_schema()
@@ -1018,10 +1201,12 @@ class PostgresArtifactStore:
                                        schema=None, column_mapping=None, parent_version="",
                                        split_policy=None, workspace_id=None, dated_at=None,
                                        origin=None, origin_detail=None) -> int:
-        rec = await self.get(artifact_id)
-        if rec is None:
-            raise KeyError(f"artifact {artifact_id!r} not registered — cannot version as {name!r}")
         ws = _dataset_workspace(workspace_id)
+        # ADR-0148 — a workspace versions only an artifact it registered.
+        rec = await self.get(artifact_id, workspace_id=ws)
+        if rec is None:
+            raise KeyError(f"artifact {artifact_id!r} not registered in workspace {ws!r} — "
+                           f"cannot version as {name!r}")
         role, schema, column_mapping = await _declare(self, name, role, schema, column_mapping)
         origin = normalize_origin(origin)
         assert_role_allowed_for_origin(role, origin)  # #2033 — see the sqlite twin
@@ -1086,7 +1271,7 @@ class PostgresArtifactStore:
                     name, int(version), ws)
         if row is None:
             return None
-        rec = await self.get(row["artifact_id"])
+        rec = await self.get(row["artifact_id"], workspace_id=ws)
         return (int(row["version"]), rec) if rec else None
 
     async def list_dataset_versions(self, name, *, workspace_id=None) -> list[dict]:
@@ -1116,7 +1301,7 @@ class PostgresArtifactStore:
         if row is None:
             return None
         out = _version_row(tuple(row))
-        rec = await self.get(out["artifact_id"])
+        rec = await self.get(out["artifact_id"], workspace_id=ws)
         out["uri"] = rec.uri if rec else ""
         out["row_count"] = rec.row_count if rec else None
         return out
@@ -1135,7 +1320,7 @@ class PostgresArtifactStore:
                 wanted, ws)
         out = [_version_row(tuple(r)) for r in rows]
         for item in out:
-            rec = await self.get(item["artifact_id"])
+            rec = await self.get(item["artifact_id"], workspace_id=ws)
             item["uri"] = rec.uri if rec else ""
         return out
 
@@ -1150,7 +1335,7 @@ class PostgresArtifactStore:
         new_map = cur["column_mapping"] if column_mapping is None else normalize_column_mapping(column_mapping)
         new_dated = cur.get("dated_at") if dated_at is None else normalize_dated_at(dated_at)
         assert_role_allowed_for_origin(new_role, cur.get("origin"))  # #2033 — see the sqlite twin
-        rec = await self.get(cur["artifact_id"])
+        rec = await self.get(cur["artifact_id"], workspace_id=cur["workspace_id"])
         if rec is not None:
             await _guard_golden(new_role, name, rec, cur["workspace_id"])
         pool = await self._pool()
