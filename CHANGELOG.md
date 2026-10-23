@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Changed
+- Sign-up, a Google or GitHub sign-in that would create an account, and invite redemption refuse a username or email equal to the deployment admin's name (`CAIRN_API_USER`, `admin` when unset), compared trimmed and case-insensitively. The name reads as taken (`already_registered` / `username_taken`); nothing is created and the invite stays usable.
+- With auth on, a durable remote job started from an operation node (`CAIRN_REMOTE_JOB_DURABLE`, pushed or on a `worker:<pool>` target) is recorded under the workspace in scope; with no workspace in scope the node is refused before anything is registered or dispatched, instead of recording the process default.
+- A flow leg resumes only from a checkpoint a run of its own workspace relayed. A checkpoint whose producing run cannot be read is not used, and the leg starts from the beginning.
+
+### Fixed
+- A pipeline step whose required wire resolves to nothing fails the pipeline and stops there: no later step starts on the failed record, `advance_step` records no approval and rejects the step's review with the cited reason, and the failure is announced once (including after a passed gate step).
+- With auth on, a re-adopted leg refused because its record names no workspace (a flow leg re-attached after a restart, the Temporal flow-leg activity, the remote-job control worker's poll and relaunch) cancels the engine job recorded for it, best-effort, instead of leaving it running unwatched.
+
 ## [0.2.1] - 2026-10-23
 
 A patch release: two additive core features for the training and dataset-preparation packs of cairn-extensions (cairndev-sh/cairn#187). Nothing that worked on 0.2.0 changes; a result or pipeline that uses neither feature reads and runs as before.
