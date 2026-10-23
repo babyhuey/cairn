@@ -127,11 +127,16 @@ async def pipeline_submit_step(
     return run.id
 
 
-async def _leg_pipeline_record(pstore: Any, pipeline_id: str, step_id: str) -> Any:
+async def _leg_pipeline_record(pstore: Any, pipeline_id: str, step_id: str, *,
+                               flow_ref: str = "") -> Any:
     """The pipeline record a leg runs under (governance, workspace). #2223 — an
     UNREADABLE store is not an ABSENT record: a read failure retries (Temporal's
     backoff) with nothing created or submitted, and a missing or undecodable record
-    refuses. Neither ever runs the leg ungoverned or outside its workspace."""
+    refuses. Neither ever runs the leg ungoverned or outside its workspace.
+
+    A flow leg (``flow_ref``) refused because its record names no workspace also
+    cancels the engine job an earlier attempt recorded on the step, if any: the
+    refusal ends the leg, so nothing would watch that job any more."""
     from pydantic import ValidationError  # noqa: PLC0415
     from temporalio.exceptions import ApplicationError  # noqa: PLC0415 — engine code stays out of workflow imports
 
@@ -151,9 +156,28 @@ async def _leg_pipeline_record(pstore: Any, pipeline_id: str, step_id: str) -> A
     if not str(getattr(rec, "workspace_id", "") or "").strip() and auth_enabled():
         # bridge parity: with auth on a record that names no workspace runs nothing —
         # refused before any run record exists, and retrying cannot fix it
+        if flow_ref:
+            await _cancel_recorded_flow_job(rec, step_id, flow_ref)
         raise ApplicationError(f"pipeline {pipeline_id}: record names no workspace; refusing to run "
                                f"leg {step_id}", type=RECORD_CORRUPT, non_retryable=True)
     return rec
+
+
+async def _cancel_recorded_flow_job(rec: Any, step_id: str, flow_ref: str) -> None:
+    """Best-effort cancel of the engine job recorded on ``step_id`` (bridge parity)."""
+    from cairn.core.dataflow.engine_registry import resolve_engine  # noqa: PLC0415 — cycle
+    from cairn.core.dispatch.leg_executor import cancel_recorded_job, flow_kind_of  # noqa: PLC0415 — cycle
+
+    st = (getattr(rec, "step_state", None) or {}).get(step_id)
+    handle = dict(st.handle) if st is not None and st.handle else None
+    if not handle:
+        return
+    try:
+        engine = resolve_engine(None, kind=flow_kind_of(flow_ref))
+    except Exception:  # noqa: BLE001 — no engine to reach: the refusal still lands
+        logger.exception("leg %s: no engine to cancel recorded job %s on", step_id, handle.get("job_id"))
+        return
+    await cancel_recorded_job(engine, handle)
 
 
 async def _gate_flow_leg(
@@ -270,7 +294,7 @@ async def _run_flow_leg(
     prior_run_id = ""
     prior_handle: dict | None = None
     approver: str | None = None
-    rec = await _leg_pipeline_record(pstore, pipeline_id, step_id)
+    rec = await _leg_pipeline_record(pstore, pipeline_id, step_id, flow_ref=ref)
     gov = dict(getattr(rec, "governance", None) or {})
     workspace_id = getattr(rec, "workspace_id", "") or ""
     # #1441 S4 — parity with the bridge: the reservation is checked against what

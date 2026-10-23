@@ -243,6 +243,23 @@ async def _record_compute(rec: RemoteJobRecord) -> Any:
     return await resolve_connection(rec.compute_target, account_id=account)
 
 
+async def _record_scope(rec: RemoteJobRecord, op: Any) -> Any:
+    """``workspace_scope(rec.workspace_id)`` for a job driven outside any request.
+    A record that names no workspace is refused with auth on; the job it names is
+    then cancelled (``op.cancel``, best-effort) before the refusal propagates, as
+    nothing will poll or resume it any more and it would keep running."""
+    from cairn.core.workspace import WorkspaceScopeRequired, workspace_scope  # noqa: PLC0415 — lazy: off the import path
+
+    try:
+        return workspace_scope(rec.workspace_id)
+    except WorkspaceScopeRequired:
+        try:
+            await op.cancel(rec.handle())
+        except Exception:  # noqa: BLE001 — best-effort: the refusal itself must still land
+            logger.exception("could not cancel refused job %s (run %s)", rec.id, rec.run_id)
+        raise
+
+
 def build_default_poll(registry: Any = None) -> PollFn:
     """A ``poll`` that resolves the operator by ``record.provider`` (operator
     name) from the registry, reconstructs its input, rebuilds a context (with
@@ -268,9 +285,7 @@ def build_default_poll(registry: Any = None) -> PollFn:
         # ADR-0118 D4 — the flow door's admitted stage contracts, persisted in its handle meta
         ctx = OperationContext(pipeline_id=rec.run_id, node_name=rec.node_name,
                                dataflow_contracts=(rec.job_meta or {}).get("dataflow_contracts"))
-        from cairn.core.workspace import workspace_scope  # noqa: PLC0415 — lazy: off the import path
-
-        with workspace_scope(rec.workspace_id):  # the job's own workspace, not the worker's
+        with await _record_scope(rec, op):  # the job's own workspace, not the worker's
             if rec.compute_target:
                 ctx.compute = await _record_compute(rec)
             return await op.poll(rec.handle(), inp, ctx)
@@ -295,9 +310,7 @@ def build_default_relaunch(registry: Any = None) -> RelaunchFn:
         # ADR-0118 D4 — the flow door's admitted stage contracts, persisted in its handle meta
         ctx = OperationContext(pipeline_id=rec.run_id, node_name=rec.node_name,
                                dataflow_contracts=(rec.job_meta or {}).get("dataflow_contracts"))
-        from cairn.core.workspace import workspace_scope  # noqa: PLC0415 — lazy: off the import path
-
-        with workspace_scope(rec.workspace_id):  # the job's own workspace, not the worker's
+        with await _record_scope(rec, op):  # the job's own workspace, not the worker's
             if rec.compute_target:
                 ctx.compute = await _record_compute(rec)
             return await op.submit(inp, ctx)

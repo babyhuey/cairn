@@ -516,6 +516,22 @@ def _adopt_handle(persisted: Optional[dict]) -> Any:
     )
 
 
+async def cancel_recorded_job(engine: Any, persisted: Optional[dict]) -> bool:
+    """Best-effort cancel of the engine job a previous owner recorded
+    (``StepState.handle``), for a re-adopted leg that is refused before it is
+    watched: nothing would watch the job any more, and it would keep running
+    and billing. ``True`` when a cancel was sent; never raises."""
+    handle = _adopt_handle(persisted)
+    if handle is None or engine is None:
+        return False
+    try:
+        await engine.cancel(handle)
+    except Exception:  # noqa: BLE001 — best-effort: the refusal itself must still land
+        logger.exception("could not cancel recorded engine job %s", handle.job_id)
+        return False
+    return True
+
+
 #: Minimum seconds between heartbeat stamps — the poll loop can tick
 #: sub-second on quick legs, and a store write per tick is churn for a
 #: liveness signal whose reconciler TTL is minutes.
@@ -711,5 +727,5 @@ async def _poll_until_terminal(
         interval = min(interval * 1.5, _POLL_MAX_S)
 
 
-__all__ = ["FLOW_PREFIX", "TASK_PREFIX", "LegKindError", "LegOutcome", "execute_leg",
+__all__ = ["FLOW_PREFIX", "TASK_PREFIX", "LegKindError", "LegOutcome", "cancel_recorded_job", "execute_leg",
            "leg_kind_of", "parse_flow_ref", "recorded_stage_contracts"]

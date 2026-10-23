@@ -47,7 +47,13 @@ from cairn.core.engine.bundle import (
 from cairn.core.engine.expr import step_field as _step_field  # ONE lookup (#1118)
 from cairn.core.dataflow.engine_registry import resolve_engine
 from cairn.core.dispatch.coordination import CriticalSections
-from cairn.core.dispatch.leg_executor import LegOutcome, execute_leg, leg_kind_of, recorded_stage_contracts
+from cairn.core.dispatch.leg_executor import (
+    LegOutcome,
+    cancel_recorded_job,
+    execute_leg,
+    leg_kind_of,
+    recorded_stage_contracts,
+)
 from cairn.core.dispatch.leg_hooks import FlowLegHooks, flow_leg_record, pipeline_spent_usd
 from cairn.core.dispatch.pipeline_resume import plan_resume
 from cairn.core.dispatch.target_concurrency import in_flight_on_target, target_cap
@@ -340,7 +346,7 @@ def _in_record_workspace(method):
             # auth on and the record names no workspace: fail closed AND visibly —
             # the leg or the pipeline ends failed with the reason, nothing runs.
             # `_REFUSED` tells a `_submit_step` caller to stop, as a blocked gate does.
-            await self._refuse_unscoped(method.__name__, rec, *args)
+            await self._refuse_unscoped(method.__name__, rec, *args, **kwargs)
             return _REFUSED
         with scope:
             return await method(self, rec, *args, **kwargs)
@@ -1553,11 +1559,14 @@ class PipelineBridge:
                 return  # failed and persisted, like a blocked gate
         await self._settle(rec)
 
-    async def _refuse_unscoped(self, method: str, rec: PipelineRecord, s: Any, *rest: Any) -> None:
+    async def _refuse_unscoped(self, method: str, rec: PipelineRecord, s: Any, *rest: Any,
+                               adopt: Optional[dict] = None, **_kw: Any) -> None:
         """The visible half of :func:`_in_record_workspace`'s refusal. A step about
         to be submitted fails its pipeline (audited, as a wire that cannot resolve
         does); a leg already created marks its run failed and emits the terminal
-        event its pipeline advances on."""
+        event its pipeline advances on. A re-adopted flow leg (``adopt``, the
+        engine handle a previous owner recorded) also cancels that engine job:
+        nothing watches it once the leg is refused."""
         if method == "_submit_step":
             st = rec.step_state.get(s.id) or StepState()
             st.status = "failed"
@@ -1572,6 +1581,13 @@ class PipelineBridge:
                 await self._fail_pipeline(rec, _NO_WORKSPACE_REASON)
             return
         run = rest[0]
+        if adopt:
+            try:
+                engine = self._leg_engine(s)
+            except Exception:  # noqa: BLE001 — no engine to reach: the run still fails below
+                logger.exception("leg %s (%s): no engine to cancel the recorded job on", s.ref, run.id)
+                engine = None
+            await cancel_recorded_job(engine, adopt)
         try:
             await self.dispatcher.store.update(run.id, status="failed", ended_at=_now(),
                                                error=_NO_WORKSPACE_REASON)
