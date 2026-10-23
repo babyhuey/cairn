@@ -252,6 +252,9 @@ class BuiltinSshEngine:
     """Run ``cairn-dataflow-run`` on a ``compute.ssh``-connected box."""
 
     name = "builtin-ssh"
+    #: ADR-0149 — the job runs on the box, which cannot read a control-plane path:
+    #: the leg executor resolves `dataset:` refs to their durable copy for it.
+    needs_durable_inputs = True
     #: ADR-0118 D7 — kernels run through `run_dataflow`, which checks stage contracts.
     carries_stage_contracts = True
 

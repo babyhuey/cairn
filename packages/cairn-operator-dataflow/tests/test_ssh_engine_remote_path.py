@@ -153,7 +153,29 @@ def test_a_name_the_engine_sets_is_refused(monkeypatch, name):
         _submit(_spec())
 
 
+@pytest.mark.parametrize("mode", [{}, {"mode": "image", "image": "ghcr.io/x/train:1"}])
+def test_the_mlflow_password_rides_the_runner_file_only(monkeypatch, mode):
+    """The one credential the engine forwards itself (never through remote_env):
+    it is in the job's env (written to the 0600 runner.sh), never on the
+    command line — image mode names it with `-e` and no value."""
+    _bind_connection(monkeypatch, **mode)
+    captured = _capture_submit(monkeypatch)
+    monkeypatch.setenv("MLFLOW_TRACKING_PASSWORD", "mlflow-pw-value")
+    _submit(_spec())
+    assert captured["inp"].env["MLFLOW_TRACKING_PASSWORD"] == "mlflow-pw-value"
+    assert "mlflow-pw-value" not in captured["inp"].command
+
+
 # ── dataset versions the box cannot read ─────────────────────────────────────
+
+
+def test_the_ssh_engine_asks_for_durable_dataset_copies():
+    """ADR-0149: the leg executor resolves `dataset:` refs to the durable copy
+    for an engine that declares it; the local engine does not."""
+    from operator_dataflow.engines import BuiltinLocalEngine
+
+    assert BuiltinSshEngine.needs_durable_inputs is True
+    assert getattr(BuiltinLocalEngine(), "needs_durable_inputs", False) is False
 
 
 @pytest.mark.parametrize("value", [
