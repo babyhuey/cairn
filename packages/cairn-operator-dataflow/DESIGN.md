@@ -149,7 +149,7 @@ of inventing a second approval mechanism.
 | `metaflow_*` | backend fields | deployment | see schema | read by the Metaflow engine's own wheel, `cairn-operator-dataflow-metaflow` (its DESIGN.md; ADR-0134 D2) |
 | `skypilot_*`, `CAIRN_SKYPILOT_*` | backend fields / env | deployment | see schema | read by the SkyPilot engine's own wheel, `cairn-operator-dataflow-skypilot` (its DESIGN.md; ADR-0134 D3a) |
 | `CAIRN_DATAFLOW_REMOTE_CMD` | env | deployment | `cairn-dataflow-run` | on-box entrypoint for boxes whose venv bin is not on the non-interactive SSH PATH (#1075) |
-| `remote_env` / `CAIRN_REMOTE_ENV` | backend field | deployment | `` | comma- or space-separated NAMES of control-plane env variables the SSH engine passes to the job on the box (see "Running on a compute.ssh box") |
+| `remote_env` / `CAIRN_REMOTE_ENV` | backend field | deployment | empty (nothing extra) | comma- or space-separated NAMES of control-plane env variables the SSH engine passes to the job on the box (see "Running on a compute.ssh box") |
 | `stages`, `dataflow_ref`/`flow_ref`, `input_artifacts`, `config` | `input_schema` | run | — | per-run bounds: what to run over what |
 | `budget.max_cost_usd`, `budget.max_rows`, `budget.max_seconds` | `input_schema` | run | — | per-run ceilings the ENGINE self-enforces; `max_cost_usd` is what the SkyPilot cost door compares its estimate against |
 
@@ -193,12 +193,16 @@ control plane is elsewhere). What the deployment provides on each side:
   AWS_DEFAULT_REGION` for a trainer that mirrors checkpoints and publishes to
   S3. Nothing else of the control plane's environment crosses. A flow or a
   tenant cannot extend the list. A name containing `KEY`, `SECRET`, `TOKEN` or
-  `PASSWORD`, a malformed name, or a name the engine sets itself (the spec,
+  `PASSWORD`, a malformed entry, or a name the engine sets itself (the spec,
   lineage and live-channel names) refuses the leg before submit, naming the
-  variable and never its value: credentials stay on the box (an instance role,
-  the box's own environment). Values reach the box in the job's `runner.sh`,
-  which is made owner-only (0600) before anything is written to it, or as
-  `docker run -e NAME` with no value in image mode; never on a command line.
+  variable (a malformed entry only by position and leading name characters)
+  and never its value: credentials stay on the box (an instance role,
+  the box's own environment). Values reach the box only in the job's
+  `runner.sh`, which is created with mode 0600 (a stale copy is removed first),
+  or as `docker run -e NAME` with no value in image mode; never on a command
+  line. The job handle, which is persisted on the pipeline step and returned by
+  `GET /pipelines/{id}`, records the exec input without its environment and the
+  forwarded NAMES (`env_names`) only.
   `MLFLOW_TRACKING_PASSWORD` is the one credential the engine forwards itself
   (with the other `MLFLOW_*`, #1235), never through `remote_env`; it too lands
   only in the 0600 runner file (ADR-0149 D2).
@@ -207,16 +211,20 @@ control plane is elsewhere). What the deployment provides on each side:
   (`durable_uri`, the object store) when the workspace's registration has one
   (ADR-0149 D3); a co-located leg keeps the registered location unless that file
   is gone. A version whose only location is a
-  control-plane path (`file://…#sha256=…` or `/…#sha256=…`) refuses the leg in
+  control-plane path (an absolute path or any `file:` URI, then `#sha256=…`),
+  anywhere in the spec's or a stage's config, refuses the leg in
   `validate`, before submit, saying how to give it a durable copy
   (`CAIRN_ARTIFACT_STORE=s3` + `CAIRN_ARTIFACT_S3_BUCKET` on the control plane,
   then register the bytes again or re-run the step that produced them). A plain
   local path with no pin, an upstream leg's hand-off, is still uploaded (#1180).
-- **Cancel and checkpoint pull-back** reconnect with the target connection's
-  `PRIVATE_KEY`, the credential submit used (`remote/exec` records the
-  connection's name in the job handle). When the box cannot be reached they log
-  a warning naming the host, workdir, connection and error type (no secret
-  material): a cancel that did not land may leave the job running.
+- **Cancel and checkpoint pull-back** reconnect with the `PRIVATE_KEY` of the
+  connection the job was submitted with: `remote/exec` records its name, its
+  account and the workspace in the job handle, and resolves it with that
+  account, so no workspace needs to be in scope (ADR-0149 D4). The engine's
+  current target is used only for a handle saved before that. When the box
+  cannot be reached they log a warning naming the host, workdir, connection and
+  error type (no secret material); cancel then raises `EngineError`, so the
+  caller reports it as not cancelled.
 
 ## 5. Governance
 

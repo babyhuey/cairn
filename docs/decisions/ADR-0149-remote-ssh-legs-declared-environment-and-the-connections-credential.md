@@ -41,34 +41,53 @@ its value, for:
 - a name containing `KEY`, `SECRET`, `TOKEN` or `PASSWORD` (this covers `AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`): credentials stay on the box, as an instance
   role or the box's own environment;
-- a name that is not an environment variable name;
+- an entry that is not an environment variable name, reported by its position and its leading
+  name characters only (whatever follows, as in `HF_TOKEN=hf_…`, may be a pasted value);
 - a name the engine sets itself for each submission (the spec, lineage and live-channel names).
 
-**D2 — Values never appear on a command line.** In venv mode they are exported from the job's
-`runner.sh`, which `remote/exec` makes owner-only (0600) before writing anything to it. In image
-mode `runner.sh` runs `docker run -e NAME` with no value, so docker takes it from that file's
-environment.
+**D2 — Values reach only the job's runner file.** In venv mode they are exported from the
+job's `runner.sh`, which `remote/exec` creates with mode 0600 (a stale copy is removed first, and
+the SFTP open sets the mode, so the file is never readable by another account on the box when
+the server honours the create mode, as OpenSSH does). In image mode `runner.sh` runs
+`docker run -e NAME` with no value, so docker takes it from that file's environment. No value is
+on a command line.
+
+The job handle the engine returns is persisted on the pipeline step (`StepState.handle`) and
+returned by `GET /pipelines/{id}`. It records the exec input WITHOUT its environment, plus the
+forwarded NAMES (`env_names`); poll, cancel, adopt and result need nothing more. Before this ADR
+the handle recorded the whole environment, including the job-channel token and
+`MLFLOW_TRACKING_PASSWORD`.
 
 `MLFLOW_TRACKING_PASSWORD` is the one credential the engine forwards itself, with the other
-`MLFLOW_*` names (#1235), never through `remote_env`. It is unchanged by this ADR, and it lands
-only in the 0600 runner file.
+`MLFLOW_*` names (#1235), never through `remote_env`. Its forwarding is unchanged by this ADR; it
+lands only in the 0600 runner file.
 
 **D3 — A remote leg reads dataset versions from their durable copy.** An engine whose job runs
-on another machine declares `needs_durable_inputs = True` (the SSH engine does). For such an
-engine, the leg executor resolves `dataset:` refs with `prefer_durable`, and each ref resolves to
+on another machine declares `needs_durable_inputs = True` (the SSH engine does), read through
+`cairn.core.dataflow.engine.needs_durable_inputs` (`is True`, like `carries_stage_contracts`).
+For such an engine, the leg executor resolves `dataset:` refs with `prefer_durable`, and each ref resolves to
 the workspace's own `durable_uri` when there is one. Any other leg keeps the registered
 location, except that a local path that no longer exists falls back to the durable copy. The SSH
-engine refuses, in `validate`, a pinned version whose only location is a control-plane path
-(`file://…#sha256=…` or `/…#sha256=…`), with how to give it a durable copy. A plain upstream
+engine refuses, in `validate`, a pinned version whose only location is a control-plane path (an
+absolute path or any `file:` URI, followed by `#sha256=…`) anywhere in the spec's or a stage's
+config, nested dicts and lists included, with how to give it a durable copy. A plain upstream
 path with no pin is still uploaded (#1180).
 
-**D4 — Cancel and checkpoint pull-back use the job's connection credential.** `remote/exec`
-records the connection's NAME in the job handle at submit. Cancel and the pull-back resolve that
-connection's `PRIVATE_KEY` through the same `as_ssh_params` mapping submit uses; the SSH engine
-passes its own target. A named connection that does not resolve is reported, never replaced by
-another key. A handle saved before this change names no connection and keeps the ambient
-`SSH_PRIVATE_KEY`. A cancel or pull-back that cannot reach the box logs a warning with the host,
-workdir, connection and error type, and no secret material; cancel stays best-effort.
+**D4 — Cancel and checkpoint pull-back use the job's connection credential.** At submit,
+`remote/exec` records in the job handle the connection's NAME, the ACCOUNT it resolved in
+(`ResolvedConnection.account_id`) and the workspace. Cancel and the pull-back resolve that
+connection with `account_id=` (as the remote-job control worker resolves a job's compute), so no
+workspace needs to be in scope (a learning-gate abort, a run cancel), and take its `PRIVATE_KEY`
+through the same `as_ssh_params` mapping submit uses. The connection the handle names wins over
+the SSH engine's current target; the target is used only for a handle saved before names were
+recorded. A named connection that does not resolve is reported, never replaced by another key. A
+handle that names no connection and has no target keeps the ambient `SSH_PRIVATE_KEY`.
+
+A cancel that does not reach the box logs a warning with the host, workdir, connection and error
+type (no secret material) and fails: the engine raises `EngineError` and the `remote/exec`
+operator raises, so `cancel_recorded_job` reports `False` and `cancel_remote_jobs_for_run` does
+not count the job (its record is still closed). A pull-back that does not reach the box logs the
+same warning and returns `False`.
 
 ## Consequences
 
@@ -78,11 +97,18 @@ workdir, connection and error type, and no secret material; cancel stays best-ef
 - A co-located leg's dataset locations are unchanged.
 - `needs_durable_inputs` is an optional engine attribute read with `getattr`. An engine that
   does not declare it is treated as co-located.
-- Job handles from `remote/exec` gain a `connection` key, a name only.
+- Job handles from `remote/exec` gain `connection`, `account_id` and `workspace_id` (names only).
+  The SSH engine's handle drops `exec_input.env` and gains `env_names`.
+- The resolved location is part of the checkpoint `spec_key`, so the first run of a leg whose
+  ref switches to the durable copy starts that stage fresh once, instead of resuming.
 
 ## Follow-ups
 
-- The SkyPilot engine also runs jobs elsewhere. It should declare `needs_durable_inputs` and
-  refuse control-plane-only dataset versions in the same way.
+- The SkyPilot engine, and the Metaflow engine on remote compute, also run jobs elsewhere. They
+  should declare `needs_durable_inputs` and refuse control-plane-only dataset versions in the
+  same way.
+- The remote-job record of the `remote/exec` OPERATOR path (`RemoteJobRecord.input`) stores the
+  resolved operator input, including any `env` a workflow binding passes. This ADR does not
+  change it.
 - `cairn-extensions`: the `finetune-ssh` profile comment names `remote_env`,
   `CAIRN_DATAFLOW_REMOTE_CMD` and the wheel matching.

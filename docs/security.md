@@ -67,9 +67,11 @@ per leg before submit (`leg_executor.py:303`) and settled after.
 On a `compute.ssh` box the job receives only the spec, the live channel, `MLFLOW_*` and the
 env NAMES the deployment lists in `remote_env`; a name that looks like a credential (`KEY`,
 `SECRET`, `TOKEN`, `PASSWORD`) refuses the leg, so cloud credentials stay box-side (an instance
-role). Forwarded values sit in the job's owner-only `runner.sh`, never on a command line.
-Cancel and checkpoint pull-back authenticate with the connection's own `PRIVATE_KEY` and log
-a warning, without secret material, when the box cannot be reached
+role). Forwarded values sit only in the job's `runner.sh`, created with mode 0600, never on a
+command line; the persisted job handle (served by `GET /pipelines/{id}`) records their names
+only. Cancel and checkpoint pull-back authenticate with the `PRIVATE_KEY` of the connection the
+job was submitted with, resolved in the account recorded at submit, and log a warning, without
+secret material, when the box cannot be reached (a failed cancel is reported as failed)
 (ADR-0149; `packages/cairn-operator-dataflow/DESIGN.md` §4).
 
 ## Approval and audit
