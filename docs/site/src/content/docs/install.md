@@ -52,34 +52,54 @@ Re-run the installer, or `uv tool upgrade cairndev`. For a server:
 `git pull && docker compose up -d --build` in `deploy/light`, or
 `helm upgrade … --version 0.2.1` for the chart.
 
-0.2.0 changed behaviour that matters only with sign-in on, or with more than
-one account or workspace. Single-node and sign-in-off deployments, where
-everything belongs to the `default` workspace and account, are unaffected.
-Before upgrading such a deployment:
+Single-node and sign-in-off deployments, where everything belongs to the
+`default` workspace and account, are unaffected by 0.2.0's workspace, tenant
+and dataset changes. Some steps apply to every deployment; the others only with
+sign-in on, or with more than one account or workspace.
 
-1. **Pull workers.** Mint a token per pool with
+**Every deployment:**
+
+1. **Run-hook providers.** Return early on events you don't handle, and raise
+   only `AdmissionRefused` on `pipeline.launching`: any other exception there
+   refuses every launch.
+2. **Knowledge.** Re-index pgvector collections whose name exceeds 63 bytes.
+3. **Library callers** of `mcp_server_spec`, `resolve_corpus_source` and
+   `index_workspace_corpus`: pass `allow_stdio=True`,
+   `allow_private_network=True` or `allow_local=True` for specs and sources the
+   deployment itself owns.
+4. **Corpus clones behind a proxy or a private CA:** set `HTTPS_PROXY`,
+   `SSL_CERT_FILE` or `GIT_SSL_CAINFO` in the environment instead of
+   `http.proxy` / `http.sslCAInfo` in the gitconfig.
+5. **Behind a TLS-terminating proxy**, set `CAIRN_PUBLIC_URL` (see
+   [Sign-in and sign-up](#sign-in-and-sign-up)).
+
+**With sign-in on, or more than one account or workspace:**
+
+6. **Pull workers.** Mint a token per pool with
    `cairn remote worker-token --name <pool>` (where `CAIRN_JWT_SECRET` is set)
    and restart each worker with `cairn worker --pull --token <that token>`. A
    signed-in user's token now gets `403` on `/jobs/claim`.
-2. **Team accounts' connections.** Create, in each account, the connections its
-   runs use that only the deployment held, and enter again the credentials of
-   connections created before account namespacing. See
-   [Connect a provider](/guides/connect-a-provider/).
-3. **Operators** that read credentials from `os.environ` must read
-   `ctx.secrets`.
-4. **Scripts** that resolve connections, secrets or datasets outside a request
+7. **Team accounts' connections.** Each team account creates, under its own
+   names, the connections its runs used from the deployment, and its pipelines
+   and flows reference those names. Enter again the credentials of connections
+   created before account namespacing. A connection bound in the deployment's
+   profile (`ml_target`, `dataflow_target`) belongs to the deployment; a team
+   account's flow legs need a target connection of their own, named in the
+   pipeline or flow. See [Connect a provider](/guides/connect-a-provider/).
+8. **Operators** that need credentials read them from `ctx.secrets`: a team
+   account's run does not receive its account's credentials in the process
+   environment.
+9. **Scripts** that resolve connections, secrets or datasets outside a request
    or a run must enter a workspace first:
    `with workspace_scope("<id>"):` from `cairn.core.workspace`.
-5. **Datasets** shared between workspaces: register them in each workspace;
-   `dataset:<name>@latest` is per workspace.
-6. **Knowledge.** Re-index the corpora of a workspace whose id is not a
-   lowercase slug, or is longer than 40 characters, and pgvector collections
-   whose name exceeds 63 bytes.
-7. **Run-hook providers.** Return early on events you don't handle, and raise
-   only `AdmissionRefused` on `pipeline.launching`: any other exception there
-   refuses every launch.
-8. **Behind a TLS-terminating proxy**, set `CAIRN_PUBLIC_URL` (see
-   [Sign-in and sign-up](#sign-in-and-sign-up)).
+10. **Datasets** shared between workspaces: register them in each workspace;
+    `dataset:<name>@latest` is per workspace.
+11. **Knowledge.** Re-index the corpora of a workspace whose id is not a
+    lowercase slug, or is longer than 40 characters.
+12. **Saga approvals.** Deciding a paused saga through
+    `POST /triggers/approve/{workflow_id}` needs the saga's workspace: its
+    action handler implements `workspace_of`. Without it, only the deployment
+    admin can decide it.
 
 The 0.2.0 Migration section of
 [CHANGELOG.md](https://github.com/cairndev-sh/cairn/blob/main/CHANGELOG.md)

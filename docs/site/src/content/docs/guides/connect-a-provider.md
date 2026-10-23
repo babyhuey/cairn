@@ -81,12 +81,14 @@ Pipelines and flows refer to a connection **by name**, and its credential is
 resolved only when the leg runs. The run record carries only the name.
 
 A run resolves connection names in its own account: the account that owns the
-run's workspace. A team account's run does not see the deployment's
-connections, so a pipeline that names `openai` needs an `openai` connection in
-that account. The same holds for an engine target bound in the deployment's
-profile (`ml_target`, `dataflow_target`): it names a deployment connection, and
-a team account's leg needs a connection of that name in its own account, or the
-leg fails. Connection names are unique across the whole deployment.
+run's workspace. Connection names are unique across the whole deployment, so a
+team account creates its own connection under its own name (the console
+suggests `<account>-<provider>`), and its pipelines and flows reference that
+name. A team account's run does not see the deployment's connections. A
+connection bound in the deployment's profile (`ml_target`, `dataflow_target`,
+the backends) belongs to the deployment, and a team account's flow legs cannot
+use it: they need a target connection of the account's own, named in the
+pipeline or flow.
 
 With sign-in on, a lookup made outside any workspace (a script, a background
 job) raises `WorkspaceScopeRequired`. Enter a workspace first:
@@ -114,9 +116,9 @@ Docker Compose stack's `infisical` profile runs an Infisical server for you.
 
 The bound secret store serves the deployment's runs. For a team account's run,
 an operator's declared `secrets:` come from that account's own connections and
-arrive in `ctx.secrets` only: they are not written to the process environment,
-and the deployment's secret store is not read (ADR-0143). An operator that
-reads a credential from `os.environ` gets nothing for such a run.
+arrive in `ctx.secrets`, and the deployment's secret store is not read
+(ADR-0143). A team account's run does not receive its account's credentials in
+the process environment; read them from `ctx.secrets`.
 
 The console's integrations page, and the operators that train or serve on GPU
 providers, are part of cairn-platform.

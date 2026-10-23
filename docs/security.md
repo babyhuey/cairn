@@ -39,9 +39,11 @@ added; with auth off, or on a single-node deployment where everything belongs to
   secrets stored under `cairn://secrets#<account>/…`; an environment-variable name,
   `${env:NAME}` and the deployment's stored secrets resolve to nothing for it
   (`src/cairn/core/connections.py`, `src/cairn/core/secrets_store.py`). Its declared
-  secrets reach `ctx.secrets`, never `os.environ`, and the bound `secrets.store` provider is
-  not read for it. A profile-bound engine target (`ml_target`, `dataflow_target`) names a
-  deployment connection and is not used for a team account's flow legs.
+  secrets reach `ctx.secrets` (a team account's run does not receive them in the process
+  environment), and the bound `secrets.store` provider is not read for it. A connection bound
+  in the deployment's profile (`ml_target`, `dataflow_target`) belongs to the deployment and
+  is not used for a team account's flow legs; they use a target connection of the account's
+  own, named in the pipeline or flow.
 - **No workspace in scope is refused.** With auth on, resolving a connection, a secret or a
   dataset reference outside any workspace raises `WorkspaceScopeRequired`
   (`src/cairn/core/workspace.py`) instead of resolving as the deployment.
@@ -58,10 +60,9 @@ added; with auth off, or on a single-node deployment where everything belongs to
 - **MCP servers and corpus sources** default to closed: `mcp_server_spec`,
   `resolve_corpus_source` and `index_workspace_corpus` take a stdio server, a private or
   local address, or a local path only with `allow_stdio`, `allow_private_network` or
-  `allow_local`, which are for the deployment's own callers. The address check resolves
-  the host once, when the spec is built, so it does not cover DNS rebinding, and a host that
-  does not resolve then passes it; `CAIRN_PROBE_ALLOW_PRIVATE` widens it
-  (`src/cairn/core/clients/mcp_client.py`).
+  `allow_local`, which are for the deployment's own callers. The address check runs when
+  the spec is built and resolves the host at that time; `CAIRN_PROBE_ALLOW_PRIVATE` allows
+  private addresses for deployments that need them (`src/cairn/core/clients/mcp_client.py`).
 - **Run hooks on `pipeline.launching` fail closed:** a provider that raises anything other
   than `AdmissionRefused` refuses the launch. Every other event still fails open.
 
