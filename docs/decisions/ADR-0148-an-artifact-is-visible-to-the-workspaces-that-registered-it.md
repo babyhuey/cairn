@@ -73,9 +73,11 @@ to `default`.
   that workspace's own location.
 - A parent id the reader declared stays in `parents` even when the reader cannot read that
   artifact; the lineage tree has no node for it.
-- A process that registers artifacts must run this version: an older replica writing after the
-  migration adds no owner row, and its artifacts are visible to no workspace. Upgrade every
-  replica together.
+- Every process that uses the registry must run this version. An older replica on a migrated
+  database writes no owner row, so what it registers is visible to no workspace; its parent rows
+  are dropped (SQLite) or its registration fails after the artifact row is written (Postgres); its
+  `promote` fails, because its conflict clause no longer matches the tag key; and its reads still
+  answer across workspaces. Upgrade every replica together.
 - A caller outside any workspace scope (a deployment-admin route, a seed script) must pass
   `workspace_id=`, or with auth on the call is refused.
 - An artifact registered before this change by a run in another database, with no dataset

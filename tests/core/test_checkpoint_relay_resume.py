@@ -271,7 +271,10 @@ async def test_identical_checkpoint_bytes_resume_from_each_workspaces_own_copy(t
 async def test_a_leg_whose_producer_or_own_run_is_unreadable_starts_fresh(tmp_path, store):
     wd = tmp_path / "wd"
     run_dataflow(_spec(), wd)
-    await relay_local_checkpoints(wd, run_id="run-gone", store=store, dest_root=tmp_path / "durable")
+    # relayed in the leg's own workspace, so only the unreadable-producer rule can refuse it
+    await relay_local_checkpoints(wd, run_id="run-gone", store=store, dest_root=tmp_path / "durable",
+                                  workspace_id="ws-a")
+    assert len(await store.list_artifacts(kind="dataset", workspace_id="ws-a")) == 1
     key = spec_key(_spec())
     assert await _hooks(store, _Runs({"leg-a": "ws-a"}), "leg-a").resume_provider()(key) is None
     assert await _hooks(store, _Runs({"run-gone": "ws-a"}), "leg-x").resume_provider()(key) is None

@@ -196,6 +196,86 @@ async def test_parent_visibility_does_not_depend_on_another_workspace(store):
         assert await store.get(child) is None
 
 
+async def test_a_workspace_keeps_its_first_registration_of_the_same_bytes(store):
+    """Re-registering bytes in the same workspace never rewrites that workspace's
+    registration; it only adds the parents it declares."""
+    with workspace_scope("ws-a"):
+        h = await store.register(_desc("same", "s3://a/first.jsonl", parents=("s3://a/p1",), n=1),
+                                 producer_run_id="run-1", producer_job="job-1", account_id="acct-1")
+        assert await store.register(_desc("same", "s3://a/second.jsonl", parents=("s3://a/p2",), n=2),
+                                    producer_run_id="run-2", producer_job="job-2",
+                                    account_id="acct-2") == h
+        rec = await store.get(h)
+        assert (rec.uri, rec.producer_run_id, rec.producer_job, rec.account_id, rec.stats) == (
+            "s3://a/first.jsonl", "run-1", "job-1", "acct-1", {"n": 1})
+        assert rec.parents == ["s3://a/p1", "s3://a/p2"]
+        assert await store.find_by_uri("s3://a/first.jsonl") == h
+        assert await store.find_by_uri("s3://a/second.jsonl") is None
+        assert len(await store.list_artifacts()) == 1
+
+
+async def _identity_durable(store, h: str):
+    """The ``artifacts`` (identity) row's durable copy, read directly."""
+    if isinstance(store, SqliteArtifactStore):
+        return store._conn.execute("SELECT durable_uri FROM artifacts WHERE id=?", (h,)).fetchone()[0]
+    import asyncpg  # noqa: PLC0415
+
+    conn = await asyncpg.connect(store._dsn)
+    try:
+        return await conn.fetchval("SELECT durable_uri FROM artifacts WHERE id=$1", h)
+    finally:
+        await conn.close()
+
+
+async def test_a_durable_copy_fills_only_the_registering_workspaces_row(store, monkeypatch):
+    """A relay that succeeds on a later registration fills the hole in the identity
+    row and in the registering workspace's own row: never another workspace's row,
+    never another artifact, never a copy already recorded."""
+    import cairn.core.storage.artifacts as A
+
+    relayed = {"to": ""}
+
+    async def _relay(uri, content_hash):
+        return relayed["to"]
+
+    monkeypatch.setattr(A, "_relay_bytes", _relay)
+    h = await store.register(_desc("same", "s3://a/x.jsonl"), workspace_id="ws-a")
+    await store.register(_desc("same", "s3://b/x.jsonl"), workspace_id="ws-b")
+    other = await store.register(_desc("other", "s3://a/y.jsonl"), workspace_id="ws-a")
+    assert await _identity_durable(store, h) is None
+
+    relayed["to"] = "s3://durable/from-a"
+    await store.register(_desc("same", "s3://a/x.jsonl"), workspace_id="ws-a")
+    assert (await store.get(h, workspace_id="ws-a")).durable_uri == "s3://durable/from-a"
+    assert (await store.get(h, workspace_id="ws-b")).durable_uri == ""
+    assert (await store.get(other, workspace_id="ws-a")).durable_uri == ""
+    assert await _identity_durable(store, h) == "s3://durable/from-a"
+
+    relayed["to"] = "s3://durable/from-b"
+    await store.register(_desc("same", "s3://b/x.jsonl"), workspace_id="ws-b")
+    assert (await store.get(h, workspace_id="ws-b")).durable_uri == "s3://durable/from-b"
+    assert (await store.get(h, workspace_id="ws-a")).durable_uri == "s3://durable/from-a"
+    assert await _identity_durable(store, h) == "s3://durable/from-a"   # a hole is filled once
+
+
+async def test_auth_on_unscoped_register_is_refused_before_the_bytes_are_relayed(store, monkeypatch):
+    import cairn.core.storage.artifacts as A
+
+    calls: list = []
+
+    async def _relay(uri, content_hash):
+        calls.append(uri)
+        return ""
+
+    monkeypatch.setattr(A, "_relay_bytes", _relay)
+    monkeypatch.setenv("CAIRN_JWT_SECRET", "s" * 40)
+    with pytest.raises(WorkspaceScopeRequired):
+        await store.register(_desc("r1", "s3://r/1.jsonl"))
+    assert calls == []
+    await store.register(_desc("r1", "s3://r/1.jsonl"), workspace_id="ws-r")
+    assert calls == ["s3://r/1.jsonl"]
+
+
 async def test_a_dataset_version_names_only_an_artifact_its_workspace_registered(store):
     with workspace_scope("ws-a"):
         aid = await store.register(_desc("a-data"), producer_run_id="run-a")

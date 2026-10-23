@@ -91,8 +91,10 @@ class ArtifactStore(Protocol):
     #: Workspace scope (ADR-0147, ADR-0148). ``workspace_id`` on the artifact
     #: and tag methods below (``register`` through ``lineage``) defaults to the
     #: workspace in scope (:func:`~cairn.core.workspace.scoped_workspace`); with
-    #: auth on and nothing in scope the call raises ``WorkspaceScopeRequired``
-    #: before reading or writing anything. ``register`` records the workspace's
+    #: auth on and nothing in scope the SQLite and Postgres stores raise
+    #: ``WorkspaceScopeRequired`` before reading or writing anything (the
+    #: unconfigured null store reads nothing and does not check the scope).
+    #: ``register`` records the workspace's
     #: OWN registration (location, provenance, stats, parents; identical bytes:
     #: one identity row, one registration per workspace). ``get``/``find_by_uri``/
     #: ``list_artifacts``/``lineage`` answer only from the reader's own
