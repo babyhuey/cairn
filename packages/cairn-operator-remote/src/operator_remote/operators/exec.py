@@ -32,6 +32,9 @@ from cairn.core.operator.jobs import JobHandle, JobStatus
 from operator_remote.schemas.exec import RemoteExecInput, RemoteExecOutput
 
 _JOBROOT = ".cairn-jobs"
+#: ADR-0151 D9 — the file `_cancel` writes in the job's workdir before it kills the
+#: job; `_poll` reads it first and reports `cancelled`. `_submit` clears it.
+_CANCELLED = "cancelled"
 
 logger = logging.getLogger("operator_remote.exec")
 
@@ -207,7 +210,8 @@ async def _submit(inp: RemoteExecInput, ctx: OperationContext) -> JobHandle:
     # new job "succeeded" (or failed) before it has even started. Clear all
     # per-run state files up front so poll can never observe stale state.
     await conn.run(
-        f"rm -f {q}/exit_code {q}/pid {q}/stdout.log {q}/metrics.json {q}/runner.sh", check=False,
+        f"rm -f {q}/exit_code {q}/pid {q}/stdout.log {q}/metrics.json {q}/runner.sh {q}/{_CANCELLED}",
+        check=False,
     )
     # #552: expose the run_id on the box so per-run artifacts (e.g. S3 checkpoint
     # keys, used by cairn-train-local) are stable across relaunches and never
@@ -294,6 +298,12 @@ async def _poll(handle: JobHandle, inp: RemoteExecInput, ctx: OperationContext) 
     workdir = handle.meta.get("workdir")
     q = shlex.quote(workdir)
     conn = await _get_conn(_conn_params(ctx))  # #337: reused connection
+    # ADR-0151 D9: a job `_cancel` killed reads CANCELLED, first and whatever else the
+    # box shows — its kill ends runner.sh before it writes exit_code, which below would
+    # read as a recoverable death and be relaunched on a box that is being released.
+    if (await conn.run(f"cat {q}/{_CANCELLED} 2>/dev/null", check=False)).stdout.strip():
+        return JobStatus(state="cancelled", retriable=False, error="remote job cancelled",
+                         metrics=await _read_metrics(conn, q))
     code_out = (await conn.run(f"cat {q}/exit_code 2>/dev/null", check=False)).stdout.strip()
     if not code_out:
         pid = (await conn.run(f"cat {q}/pid 2>/dev/null", check=False)).stdout.strip()
@@ -428,6 +438,15 @@ async def _cancel(handle: JobHandle, *, connection: str = "") -> bool:
         # signals the group (shell + trainer); SIGKILL after a grace beat in case
         # the trainer ignores SIGTERM.
         q2 = shlex.quote(workdir)
+        # ADR-0151 D9: mark the job cancelled BEFORE killing it, so the next poll
+        # reads `cancelled` (not retriable) instead of the #552 recoverable death a
+        # kill otherwise looks like. Best-effort: a marker that cannot be written
+        # never stops the kill.
+        try:
+            await conn.run(f"echo cancelled > {q2}/{_CANCELLED}", check=False)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("remote/exec: could not mark %s:%s cancelled (%s); killing anyway",
+                           handle.meta.get("host"), workdir, type(e).__name__)
         await conn.run(
             f'p=$(cat {q2}/pid 2>/dev/null); [ -n "$p" ] && '
             f'{{ kill -TERM -"$p" 2>/dev/null; sleep 1; kill -KILL -"$p" 2>/dev/null; }}',

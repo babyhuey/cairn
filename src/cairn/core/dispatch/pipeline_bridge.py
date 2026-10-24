@@ -2987,17 +2987,24 @@ class PipelineBridge:
     _RELEASE_CAPABILITY = "compute.release"
 
     def _is_release_step(self, s: Any) -> bool:
-        """A task step whose operator provides ``compute.release`` (from its manifest)."""
+        """A task step whose operator provides ``compute.release``: from its manifest,
+        else from the class's declared capabilities, so a registry without the
+        manifest metadata does not fail open (the box would stop under its job)."""
         ref = str(getattr(s, "ref", "") or "")
         if leg_kind_of(ref) != "task":
             return False
+        name = ref[len("task:"):]
         try:
             from cairn.core.operator.registry import default_registry  # noqa: PLC0415 — cycle, as _task_op_risk
 
-            md = default_registry.get_metadata(ref[len("task:"):])
+            md = default_registry.get_metadata(name)
+            if md is not None:
+                caps = getattr(md, "provides_capabilities", None) or []
+            else:
+                caps = getattr(default_registry.get(name), "capabilities", None) or []
         except Exception:  # noqa: BLE001 — unknown operator: not a release
             return False
-        return self._RELEASE_CAPABILITY in (getattr(md, "provides_capabilities", None) or [])
+        return self._RELEASE_CAPABILITY in list(caps)
 
     async def _released_boxes(self, rec: PipelineRecord) -> set[str]:
         """The connections this pipeline's ``finalizer:`` release steps will stop,

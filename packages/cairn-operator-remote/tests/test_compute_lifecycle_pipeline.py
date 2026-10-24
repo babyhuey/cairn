@@ -232,7 +232,8 @@ class _Engine:
             raise RuntimeError("ssh: the box did not answer the cancel")
 
 
-async def _cancel_with_running_legs(ec2, monkeypatch, legs: dict[str, str], *, fail: bool = False):
+async def _cancel_with_running_legs(ec2, monkeypatch, legs: dict[str, str], *, fail: bool = False,
+                                    audits: list | None = None, selected_target: str = ""):
     """A pipeline whose flow legs `legs` (step id → recorded compute target) are
     running on an engine job, with a finalizer `compute/release` of the box
     `$input.compute_connection` = "gpu". Cancel it; return the settled record."""
@@ -250,6 +251,15 @@ async def _cancel_with_running_legs(ec2, monkeypatch, legs: dict[str, str], *, f
     b = PipelineBridge(d, store=InMemoryPipelineStore())
     engine = _Engine(ec2.calls, fail=fail)
     monkeypatch.setattr(b, "_leg_engine", lambda s: engine)
+    # the environment's selection, read only when a run recorded no compute target
+    monkeypatch.setattr(b, "_leg_target", lambda s: selected_target)
+    if audits is not None:
+        real_audit = b._audit
+
+        async def _spy(rec, step_id, event, detail):
+            audits.append((step_id, event, dict(detail)))
+            return await real_audit(rec, step_id, event, detail)
+        monkeypatch.setattr(b, "_audit", _spy)
     await b.start()
     try:
         rec = await b.store.put(PipelineRecord(
@@ -279,11 +289,32 @@ async def test_cancel_stops_the_job_on_the_box_before_the_box(ec2, monkeypatch):
 
 
 async def test_a_failed_job_cancel_still_stops_the_box(ec2, monkeypatch):
-    rec = await _cancel_with_running_legs(ec2, monkeypatch, {"train": "gpu"}, fail=True)
+    audits: list = []
+    rec = await _cancel_with_running_legs(ec2, monkeypatch, {"train": "gpu"}, fail=True, audits=audits)
 
     assert ec2.calls.index("cancel:j-train") < ec2.calls.index("stop"), ec2.calls
     assert rec.status == "cancelled" and rec.step_state["release"].status == "done"
     assert ec2.state == "stopped", "a cancel that failed must never keep the box billing"
+    (cancel,) = [a for a in audits if a[1] == "leg_job_cancel"]
+    assert cancel[0] == "train"
+    assert cancel[2] == {"run_id": "r-train", "job_id": "j-train", "target": "gpu",
+                         "sent": False, "before": "release"}
+
+
+async def test_a_run_with_no_recorded_target_falls_back_to_the_selection(ec2, monkeypatch):
+    """A run written before compute targets were recorded: the environment's
+    selection (`_leg_target`) names its box."""
+    await _cancel_with_running_legs(ec2, monkeypatch, {"train": ""}, selected_target="gpu")
+    assert ec2.calls.index("cancel:j-train") < ec2.calls.index("stop"), ec2.calls
+
+
+async def test_the_release_is_found_without_manifest_metadata(ec2, monkeypatch):
+    """With no manifest metadata for compute/release, the class's declared
+    capability still identifies it: D9 does not fail open."""
+    monkeypatch.delitem(default_registry._metadata, "compute/release")
+    assert default_registry.get_metadata("compute/release") is None
+    await _cancel_with_running_legs(ec2, monkeypatch, {"train": "gpu"})
+    assert ec2.calls.index("cancel:j-train") < ec2.calls.index("stop"), ec2.calls
 
 
 async def test_a_running_leg_on_another_target_is_left_alone(ec2, monkeypatch):
