@@ -280,6 +280,14 @@ helm upgrade --install cairn oci://ghcr.io/cairndev-sh/charts/cairn --version 0.
 Then `kubectl -n cairn rollout status deploy/cairn-server` and
 `curl -fsS https://<your host>/healthz`.
 
+The chart can also run a pull worker (`cairn worker --pull`), off by default.
+With `pullWorker.enabled: true`, set `pullWorker.command`, and set either
+`pullWorker.token` (a worker-pool token from
+`cairn remote worker-token --name <pool>`) or `pullWorker.existingSecret` (a
+Secret holding `CAIRN_ENGINE_TOKEN`); otherwise rendering refuses. See the
+[chart README](https://github.com/cairndev-sh/cairn/blob/main/deploy/helm/cairn/README.md#the-pull-worker)
+for the values and the upgrade notes.
+
 ## Sign-in and sign-up
 
 The API is open while no JWT secret is set: fine on a laptop, never on a box
