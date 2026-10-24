@@ -34,6 +34,7 @@ from cairn.core.engine.pipeline_resolve import (
     resolve_pipeline_ref,
 )
 from cairn.core.dispatch.pipeline_doors import ServiceDoorError  # re-export: the routers' one import site
+from cairn.core.policy.pipeline_gates import PolicyDeniedError
 from cairn.core.admission_door import AdmissionRefusedError  # noqa: F401 — re-export (#2190), same reason
 from cairn.core.dispatch.pipeline_preview import (
     GovernanceInputError,
@@ -60,6 +61,12 @@ class MissingInputsError(ValueError):
 
 class InputCoercionError(ValueError):
     """#1802 — a supplied input cannot be parsed into its declared type."""
+
+
+class RuntimeOwnerRefusedError(PolicyDeniedError):
+    """#199 (ADR-0151 D10) — the runtime that would own this pipeline cannot run one of
+    its steps. A :class:`PolicyDeniedError`, so every surface already answers it as a
+    refused launch (HTTP 403, CLI exit 3), before any record exists."""
 
 
 class PipelineDriftError(ValueError):
@@ -94,6 +101,20 @@ _BOOL_WORDS = {"true": True, "1": True, "yes": True, "on": True,
                "false": False, "0": False, "no": False, "off": False}
 
 
+def _comma_list(val: str) -> Optional[list[str]]:
+    """#197 — ``"a, b,,c"`` → ``["a", "b", "c"]``; ``None`` when the string is JSON
+    (or is meant to be: it opens with ``[``), so the JSON rule decides it. A string
+    with no items (``""``, ``" , "``) is also ``None``: it stays refused as before, so
+    ``-i k=`` cannot satisfy a required list input; an empty list is ``[]``."""
+    if val.strip().startswith("["):
+        return None
+    try:
+        json.loads(val)
+    except ValueError:
+        return [item.strip() for item in val.split(",") if item.strip()] or None
+    return None
+
+
 def coerce_declared_inputs(d: PipelineDef, inputs: dict) -> dict:
     """#1802 — parse string values into their DECLARED input types, at the door.
 
@@ -110,6 +131,14 @@ def coerce_declared_inputs(d: PipelineDef, inputs: dict) -> dict:
     non-string; well-typed values (console JSON bodies, YAML preset files,
     declared defaults) pass through identically. An unparseable value raises
     :class:`InputCoercionError` naming the key and the declared type.
+
+    #197 — a ``list`` input also takes a comma-separated string
+    (``-i report_to=mlflow,wandb`` → ``["mlflow", "wandb"]``; items trimmed,
+    empty items dropped), because shell-quoting JSON is the first thing a new
+    user gets wrong. A value that parses as JSON keeps the JSON rule, one that
+    opens with ``[`` but does not parse is refused as broken JSON rather than
+    split, and one with no items at all (``""``) is refused as before; a list of
+    non-string items, or an empty list, still needs JSON.
     """
     out = dict(inputs)
     for key, spec in (d.inputs or {}).items():
@@ -118,7 +147,9 @@ def coerce_declared_inputs(d: PipelineDef, inputs: dict) -> dict:
         if not isinstance(val, str) or declared in (None, "str", "string"):
             continue
         try:
-            if declared in ("dict", "list"):
+            if declared == "list" and (split := _comma_list(val)) is not None:
+                out[key] = split
+            elif declared in ("dict", "list"):
                 parsed = json.loads(val)
                 expect = dict if declared == "dict" else list
                 if not isinstance(parsed, expect):
@@ -336,6 +367,44 @@ def _refuse_task_legs_off_their_executors(plan: PipelinePlan) -> None:
             raise PipelinePlanError(f"leg {step.id!r}: {problem}")
 
 
+def runtime_owner_problems(plan: PipelinePlan) -> list[str]:
+    """#199, ADR-0151 D10 — the steps of ``plan`` the runtime's pipeline owner cannot run.
+
+    Under ``CAIRN_RUNTIME=temporal`` the durable ``PipelineWorkflow`` owns the pipeline
+    (``PipelineBridge.start_pipeline`` hands it over), and that owner declares what it
+    runs (:data:`cairn.core.runtime.temporal.PIPELINE_OWNER_LEG_KINDS`,
+    :data:`~cairn.core.runtime.temporal.PIPELINE_OWNER_RUNS_FINALIZERS`). Read from
+    there, not listed here, so the refusal lifts when the owner learns a step (#59).
+    The in-process bridge (``inprocess``, ``dbos``) runs every step: no problems."""
+    from cairn.core import settings  # noqa: PLC0415 — cycle: settings → storage → dispatch
+
+    if settings.runtime() != "temporal":
+        return []
+    from cairn.core.dispatch.leg_executor import leg_kind_of  # noqa: PLC0415 — the kind the owner's SUBMIT routes on
+    from cairn.core.refs import bare_ref  # noqa: PLC0415
+    from cairn.core.runtime import temporal as owner  # noqa: PLC0415 — the owner's declaration; imports no SDK
+
+    problems = []
+    for step in plan.steps:
+        kind = leg_kind_of(step.ref)
+        if kind not in owner.PIPELINE_OWNER_LEG_KINDS:
+            problems.append(f"leg {step.id!r} is a {kind}: leg ({bare_ref(step.ref)}), and the Temporal "
+                            f"pipeline owner does not run {kind}: legs (#59)")
+        if step.finalizer and not owner.PIPELINE_OWNER_RUNS_FINALIZERS:
+            problems.append(f"step {step.id!r} is a finalizer:, and the Temporal pipeline owner does not "
+                            "run finalizers (ADR-0151 D10)")
+    return problems
+
+
+def _refuse_steps_the_runtime_owner_cannot_run(plan: PipelinePlan, *, pipeline_ref: str) -> None:
+    """The launch door's refusal for :func:`runtime_owner_problems`, naming every step."""
+    if (problems := runtime_owner_problems(plan)):
+        raise RuntimeOwnerRefusedError(
+            f"pipeline {pipeline_ref} cannot run under CAIRN_RUNTIME=temporal: "
+            + "; ".join(problems)
+            + ". Run it under CAIRN_RUNTIME=inprocess or CAIRN_RUNTIME=dbos.")
+
+
 def _with_invocations(plan: PipelinePlan, resolution: ContractResolution) -> ContractResolution:
     """#2241 B (D4) — one ``InvocationEntry`` per opted-in task-leg operator, recorded
     here before gates, admission and any record; the leg reads it from the record and
@@ -466,6 +535,9 @@ async def launch_pipeline_def(
     merged = apply_input_defaults(d, supplied)
 
     plan = plan_pipeline(d)
+    # #199 — a step the runtime's pipeline owner cannot run is refused before any
+    # record, instead of failing mid-run after the earlier legs have spent.
+    _refuse_steps_the_runtime_owner_cannot_run(plan, pipeline_ref=f"{d.pack}/{d.name}")
     _refuse_task_legs_off_their_executors(plan)
 
     # #2240 (slice C, ADR-0111 acceptance §4) — the static contract closure is
@@ -553,7 +625,7 @@ async def launch_pipeline_def(
 
 __all__ = [
     "GovernanceInputError", "InputCoercionError", "MissingInputsError",
-    "PipelineDriftError", "PipelineNotFoundError", "ServiceDoorError",
+    "PipelineDriftError", "PipelineNotFoundError", "RuntimeOwnerRefusedError", "ServiceDoorError",
     "coerce_declared_inputs", "launch_pipeline", "launch_pipeline_def",
-    "missing_inputs", "resolve_or_raise",
+    "missing_inputs", "resolve_or_raise", "runtime_owner_problems",
 ]
