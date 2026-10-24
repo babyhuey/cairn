@@ -78,10 +78,11 @@ worker:
 # worker-pool token, minted where CAIRN_JWT_SECRET is set with
 #   cairn remote worker-token --name <pool>
 # and read from CAIRN_ENGINE_TOKEN (or `--token`). A signed-in user's token gets
-# 403 on /jobs/claim. The worker reads the token from a Secret of its OWN and no
-# longer reads the control plane's Secret. It still reads the shared ConfigMap,
-# which carries the database DSN (with its password, for the bundled Postgres),
-# the OTEL headers and env.extra, and it runs under the release's ServiceAccount.
+# 403 on /jobs/claim. The worker reads the token from a Secret of its OWN and
+# its settings from a ConfigMap of its own (an allowlist plus extraEnv), and runs
+# under a ServiceAccount of its own with no API token mounted. It receives no
+# database settings, no OTEL headers, no env.extra and nothing from the control
+# plane's Secret or ServiceAccount.
 pullWorker:
   enabled: false
   command: []          # REQUIRED when enabled — rendering fails without it
@@ -95,6 +96,18 @@ pullWorker:
   # already have named <release>-pull-worker collides with the rendered one.
   token: ""            # a worker-pool token (`cairn remote worker-token --name <pool>`)
   existingSecret: ""
+  # CAIRN_ENGINE_URL in the worker's ConfigMap (empty → env.extra.CAIRN_ENGINE_URL,
+  # else none; the command's --engine-url works either way).
+  engineUrl: ""
+  # The ONLY way to give the worker other settings (it does not read env.extra).
+  # Rendered into its ConfigMap, so a name that looks like a secret or a database
+  # setting (KEY, SECRET, TOKEN, PASSWORD, DSN, *_STORAGE,
+  # OTEL_EXPORTER_OTLP_HEADERS) refuses to render: put those in existingSecret.
+  extraEnv: {}
+  serviceAccount:
+    # e.g. eks.amazonaws.com/role-arn or iam.gke.io/gcp-service-account for the
+    # worker's own cloud identity. The control plane's are never copied here.
+    annotations: {}
   replicaCount: 1
   resources:
     requests:

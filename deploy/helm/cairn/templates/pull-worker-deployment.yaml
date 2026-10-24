@@ -8,11 +8,35 @@ access.
 empty one), e.g. ["cairn", "worker", "--pull", "--engine-url", "https://<host>"].
 With auth on, claiming needs a worker-pool token (`cairn remote worker-token
 --name <pool>`) in CAIRN_ENGINE_TOKEN. The worker reads it from a Secret of its
-OWN (pullWorker.token, rendered below, or pullWorker.existingSecret) and no longer
-reads the control plane's Secret. It still reads the shared ConfigMap, which
-carries the database DSN (with its password, for the bundled Postgres), the OTEL
-headers and env.extra, and it runs under the release's ServiceAccount.
+OWN (pullWorker.token, rendered below, or pullWorker.existingSecret). Its other
+settings come from a ConfigMap of its own (an allowlist, plus pullWorker.extraEnv),
+and it runs under a ServiceAccount of its own with no API token mounted. It reads
+neither the shared ConfigMap (no database settings, OTEL headers or env.extra) nor
+the control plane's Secret, and never gets the control plane's ServiceAccount.
 */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cairn.pullWorkerName" . }}
+  labels:
+    {{- include "cairn.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pull-worker
+data:
+  {{- include "cairn.pullWorkerConfig" . | nindent 2 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "cairn.pullWorkerName" . }}
+  labels:
+    {{- include "cairn.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pull-worker
+  {{- with .Values.pullWorker.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: false
+---
 {{- if not (trim (toString (default "" .Values.pullWorker.existingSecret))) }}
 apiVersion: v1
 kind: Secret
@@ -46,13 +70,14 @@ spec:
         {{- include "cairn.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: pull-worker
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/config: {{ include "cairn.pullWorkerConfig" . | sha256sum }}
         {{- if not (trim (toString (default "" .Values.pullWorker.existingSecret))) }}
         # a rotated pullWorker.token restarts the worker (an existingSecret's does not)
         checksum/token: {{ include "cairn.pullWorkerToken" . | sha256sum }}
         {{- end }}
     spec:
-      serviceAccountName: {{ include "cairn.serviceAccountName" . }}
+      serviceAccountName: {{ include "cairn.pullWorkerName" . }}
+      automountServiceAccountToken: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

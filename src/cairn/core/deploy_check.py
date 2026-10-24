@@ -576,6 +576,36 @@ def env_from_values(values: dict) -> dict[str, str]:
     return env
 
 
+#: A pullWorker.extraEnv name the chart refuses (_helpers.tpl cairn.pullWorkerUnsafeName):
+#: extraEnv is rendered into a ConfigMap, so credentials and database settings go in the
+#: worker's own Secret instead.
+_PULL_WORKER_UNSAFE_MARKERS = ("KEY", "SECRET", "TOKEN", "PASSWORD", "DSN")
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _pull_worker_extra_env_checks(values: dict) -> list[CheckResult]:
+    """The chart's pullWorker.extraEnv refusals, before a render."""
+    extra = _get(values, "pullWorker", "extraEnv", default={}) or {}
+    if not isinstance(extra, dict):
+        return [CheckResult("pull_worker_extra_env", "fail",
+                            "pullWorker.extraEnv must be a map of NAME: value.", category="secrets")]
+    out: list[CheckResult] = []
+    for name in extra:
+        u = str(name).upper()
+        if not _ENV_NAME_RE.match(str(name)):
+            out.append(CheckResult("pull_worker_extra_env", "fail",
+                                   f"pullWorker.extraEnv key {name!r} is not an environment "
+                                   "variable name.", category="secrets"))
+        elif (any(m in u for m in _PULL_WORKER_UNSAFE_MARKERS) or u.endswith("STORAGE")
+              or u == "OTEL_EXPORTER_OTLP_HEADERS"):
+            out.append(CheckResult("pull_worker_extra_env", "fail",
+                                   f"pullWorker.extraEnv.{name} looks like a secret or a database "
+                                   "setting — extraEnv is rendered into a ConfigMap; put it in the "
+                                   "worker's own Secret (pullWorker.existingSecret).",
+                                   category="secrets"))
+    return out
+
+
 def _pull_worker_token_checks(values: dict) -> list[CheckResult]:
     """The chart's four pull-worker token refusals (_helpers.tpl), before a render.
 
@@ -680,6 +710,7 @@ def check_values(values: dict, strict: bool = False) -> list[CheckResult]:
             category="runtime"))
     if _get(values, "pullWorker", "enabled"):
         out.extend(_pull_worker_token_checks(values))
+        out.extend(_pull_worker_extra_env_checks(values))
 
     # ── ingress ──────────────────────────────────────────────────────────
     if _get(values, "ingress", "enabled", default=True):

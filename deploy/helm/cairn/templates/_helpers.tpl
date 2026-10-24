@@ -87,12 +87,56 @@ pullWorker.token=123`) refuses to render: a token must arrive as text.
 {{- trim (toString (default "" $tok)) -}}
 {{- end -}}
 
-{{/* The pull worker's envFrom: the shared ConfigMap, then its own Secret (it wins). */}}
+{{/*
+The pull worker's envFrom: its OWN ConfigMap, then its own Secret (it wins). Never
+the shared ConfigMap (the DSN family, the OTEL headers, env.extra) nor the control
+plane's Secret.
+*/}}
 {{- define "cairn.pullWorkerEnvFrom" -}}
 - configMapRef:
-    name: {{ include "cairn.configMapName" . }}
+    name: {{ include "cairn.pullWorkerName" . }}
 - secretRef:
     name: {{ include "cairn.pullWorkerSecretName" . }}
+{{- end -}}
+
+{{/* The worker's ConfigMap and ServiceAccount share one name: <release>-pull-worker. */}}
+{{- define "cairn.pullWorkerName" -}}
+{{- printf "%s-pull-worker" (include "cairn.fullname" .) -}}
+{{- end -}}
+
+{{/*
+The worker's ConfigMap data: an ALLOWLIST. What the claim loop reads
+(CAIRN_ENGINE_URL) and the non-secret settings an in-process (--exec-local)
+operator may read, then pullWorker.extraEnv (checked in cairn.validate).
+*/}}
+{{- define "cairn.pullWorkerConfig" -}}
+{{- $url := .Values.pullWorker.engineUrl | default (index .Values.env.extra "CAIRN_ENGINE_URL") | default "" -}}
+CAIRN_BACKEND: {{ .Values.env.backend | quote }}
+{{- if $url }}
+CAIRN_ENGINE_URL: {{ $url | quote }}
+{{- end }}
+CAIRN_PROFILE: {{ .Values.env.profile | quote }}
+MLFLOW_TRACKING_URI: {{ include "cairn.mlflowUri" . | quote }}
+OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.observability.otlp.endpoint | quote }}
+{{- if .Values.artifacts.s3.enabled }}
+CAIRN_ARTIFACT_S3_ENDPOINT: {{ .Values.artifacts.s3.endpoint | quote }}
+CAIRN_ARTIFACT_S3_BUCKET: {{ .Values.artifacts.s3.bucket | quote }}
+CAIRN_ARTIFACT_S3_REGION: {{ .Values.artifacts.s3.region | quote }}
+{{- end }}
+{{- range $k, $v := .Values.pullWorker.extraEnv }}
+{{ $k }}: {{ $v | toString | quote }}
+{{- end }}
+{{- end -}}
+
+{{/*
+A pullWorker.extraEnv name that must not go in a ConfigMap: anything that looks
+like a credential, the DSN family, or the OTEL headers. Empty when the name is fine.
+*/}}
+{{- define "cairn.pullWorkerUnsafeName" -}}
+{{- $u := upper . -}}
+{{- if or (contains "KEY" $u) (contains "SECRET" $u) (contains "TOKEN" $u) (contains "PASSWORD" $u) (contains "DSN" $u) (hasSuffix "STORAGE" $u) (eq $u "OTEL_EXPORTER_OTLP_HEADERS") -}}
+unsafe
+{{- end -}}
 {{- end -}}
 
 {{- define "cairn.configMapName" -}}
@@ -234,6 +278,14 @@ deployment that has actually gone wrong somewhere, on compose or on a box.
 {{- $_ := required "pullWorker.enabled=true needs the worker's own token: set pullWorker.token to a worker-pool token (`cairn remote worker-token --name <pool>`), or pullWorker.existingSecret to a Secret with the key CAIRN_ENGINE_TOKEN. A token that is empty or only whitespace counts as unset. The pull worker never reads the control plane's Secret." ($tok | default $existing) -}}
 {{- if and $tok (eq $tok (trim (toString (default "" .Values.secrets.obsJwtSecret)))) -}}
 {{- fail "pullWorker.token equals secrets.obsJwtSecret — the worker must never hold the control plane's JWT secret. Mint a worker-pool token with `cairn remote worker-token --name <pool>`." -}}
+{{- end -}}
+{{- range $k, $_ := .Values.pullWorker.extraEnv -}}
+{{- if not (regexMatch "^[A-Za-z_][A-Za-z0-9_]*$" $k) -}}
+{{- fail (printf "pullWorker.extraEnv key %q is not an environment variable name." $k) -}}
+{{- end -}}
+{{- if include "cairn.pullWorkerUnsafeName" $k -}}
+{{- fail (printf "pullWorker.extraEnv.%s looks like a secret or a database setting (KEY, SECRET, TOKEN, PASSWORD, DSN, *_STORAGE, OTEL_EXPORTER_OTLP_HEADERS) — extraEnv is rendered into a ConfigMap. Put it in the worker's own Secret (pullWorker.existingSecret) instead." $k) -}}
+{{- end -}}
 {{- end -}}
 {{- if and $existing (eq $existing (include "cairn.secretName" .)) -}}
 {{- fail (printf "pullWorker.existingSecret is %q, the control plane's Secret — the pull worker must not receive the JWT secret or the admin password hash. Give it a Secret of its own holding only CAIRN_ENGINE_TOKEN." $existing) -}}

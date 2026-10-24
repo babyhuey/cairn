@@ -134,11 +134,23 @@ worker's jobs need). The worker no longer reads the control plane's Secret
 (`CAIRN_JWT_SECRET`, `CAIRN_API_PASSWORD_HASH`, `POSTGRES_PASSWORD`, the model
 key, the SSH key).
 
-It still reads the **shared ConfigMap**, which carries the database DSN family
-(`CAIRN_STORAGE` / `CAIRN_CHECKPOINTER_DSN` / `CAIRN_DBOS_DSN` and their `OBS_`
-twins; with the bundled Postgres the DSN includes `postgres.password`),
-`OTEL_EXPORTER_OTLP_HEADERS` and `env.extra`, and it runs under the release's
-ServiceAccount. Treat the pull worker's pod as able to read those.
+Its other settings come from a **ConfigMap of its own** (`<release>-pull-worker`),
+an allowlist: `CAIRN_ENGINE_URL` (`pullWorker.engineUrl`, else
+`env.extra.CAIRN_ENGINE_URL`, else none — the command's `--engine-url` works
+either way), `CAIRN_BACKEND`, `CAIRN_PROFILE`, `MLFLOW_TRACKING_URI`,
+`OTEL_EXPORTER_OTLP_ENDPOINT` and, with `artifacts.s3.enabled`, the
+`CAIRN_ARTIFACT_S3_*` endpoint, bucket and region. Anything else is opt-in through
+`pullWorker.extraEnv` (a map rendered into that ConfigMap); a name that looks like a
+secret or a database setting (`KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `DSN`,
+`*_STORAGE`, `OTEL_EXPORTER_OTLP_HEADERS`) refuses to render — put those in the
+worker's own Secret. The worker does not read the shared ConfigMap, so it receives
+no database settings, no `OTEL_EXPORTER_OTLP_HEADERS` and no `env.extra`.
+
+It runs under a **ServiceAccount of its own** (`<release>-pull-worker`) with
+`automountServiceAccountToken: false`; `pullWorker.serviceAccount.annotations` is
+where its own cloud identity goes (IRSA, Workload Identity). The control plane's
+ServiceAccount and its annotations are not used. `imagePullSecrets` still applies
+to the worker's pod.
 
 The token is trimmed. Rendering refuses an enabled worker with no token (empty
 or whitespace only) and no `existingSecret`, with both, with `existingSecret`
@@ -196,7 +208,11 @@ the control plane's Secret. Before upgrading, mint a worker-pool token
 the render fails until one is set. If the token was in the control plane's
 Secret (or `env.extra`), move it. Anything else the worker's jobs read from the
 control plane's Secret (a model key, an SSH key) must now be put in the worker's
-own Secret, deliberately.
+own Secret, deliberately. The worker no longer reads the shared ConfigMap: an
+`env.extra` key an out-of-tree trainer relied on (an MLflow experiment, a
+checkpoint bucket, a region) moves to `pullWorker.extraEnv`, or to the worker's
+Secret if it is a credential. A cloud identity the worker used through the
+release's ServiceAccount goes in `pullWorker.serviceAccount.annotations`.
 
 **Upgrading from a 0.1.x image:** see *Upgrade from 0.1.x* in the
 [install docs](https://docs.cairndev.sh/install/#upgrade-from-01x) (pull-worker

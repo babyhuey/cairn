@@ -402,9 +402,8 @@ def test_pull_worker_without_a_command_is_refused():
 
 @needs_helm
 def test_pull_worker_reads_its_token_from_its_own_secret():
-    """The worker gets CAIRN_ENGINE_TOKEN from a Secret of its own and no longer reads
-    the control plane's Secret. (It still reads the shared ConfigMap, which carries
-    the database DSN and the OTEL headers; this test checks the Secret keys only.)"""
+    """The worker gets CAIRN_ENGINE_TOKEN from a Secret of its own and none of the
+    control plane's Secret keys (values: test_no_worker_env_value_carries_a_control_plane_secret)."""
     docs = render("values-postgres.example.yaml", sets={**_PULL, "pullWorker.token": "wp-token"})
     dep = _by_name(docs, "Deployment", "-pull-worker")
     secret = _by_name(docs, "Secret", "-pull-worker")
@@ -524,6 +523,119 @@ def _doctor(pull: dict, **top) -> dict[str, str]:
     for k, v in top.items():
         values[k] = v
     return {r.name: r.status for r in check_values(values) if r.name == "pull_worker_token"}
+
+
+# ── the pull worker sees no control-plane secret (option A, 2026-10-24) ──
+
+_OTEL_HEADERS = "x-honeycomb-team=hc-otel-header-value"
+
+
+def _value_env(docs: list[dict], workload: dict) -> dict[str, str]:
+    """Like :func:`effective_env`, but with VALUES: ConfigMap data, Secret stringData
+    and inline env, resolved against the manifests rendered in the same pass."""
+    container = _main_container(workload)
+    out: dict[str, str] = {}
+    for ref in container.get("envFrom", []) or []:
+        if "configMapRef" in ref:
+            cm = {d["metadata"]["name"]: d for d in _kinds(docs, "ConfigMap")}[ref["configMapRef"]["name"]]
+            out.update({k: str(v) for k, v in (cm.get("data") or {}).items()})
+        if "secretRef" in ref:
+            sec = {d["metadata"]["name"]: d for d in _kinds(docs, "Secret")}.get(ref["secretRef"]["name"])
+            if sec is not None:
+                out.update({k: str(v) for k, v in (sec.get("stringData") or {}).items()})
+    for item in container.get("env", []) or []:
+        out[item["name"]] = str(item.get("value"))
+    return out
+
+
+@needs_helm
+@pytest.mark.parametrize("extra", [
+    {},                                                   # bundled Postgres, chart-managed Secret
+    {"secrets.existingSecret": "my-control-plane"},       # the control plane's own Secret
+])
+def test_no_worker_env_value_carries_a_control_plane_secret(extra):
+    vals = yaml.safe_load(_values("values-postgres.example.yaml").read_text())
+    secrets = [vals["postgres"]["password"], vals["secrets"]["obsJwtSecret"], _OTEL_HEADERS]
+    docs = render("values-postgres.example.yaml", sets={
+        **_PULL, "pullWorker.token": "wp-token", "observability.otlp.headers": _OTEL_HEADERS,
+        "env.extra.SOME_VENDOR_KEY": "vendor-extra-value", **extra})
+    env = _value_env(docs, _by_name(docs, "Deployment", "-pull-worker"))
+    leaks = sorted(k for k, v in env.items() if any(s in v for s in secrets))
+    assert not leaks, leaks
+    assert "vendor-extra-value" not in env.values()       # env.extra is not the worker's
+    assert env["CAIRN_ENGINE_TOKEN"] == "wp-token"
+
+
+@needs_helm
+def test_the_worker_configmap_is_an_allowlist():
+    docs = render("values-postgres.example.yaml", sets={
+        **_PULL, "pullWorker.token": "wp-token", "pullWorker.engineUrl": "https://cp.example",
+        "artifacts.s3.enabled": "true", "observability.otlp.endpoint": "https://otel.example",
+        "observability.otlp.headers": _OTEL_HEADERS, "env.extra.SOME_SETTING": "x",
+        "pullWorker.extraEnv.HF_HUB_OFFLINE": "1"})
+    dep = _by_name(docs, "Deployment", "-pull-worker")
+    refs = [r.get("configMapRef", {}).get("name") for r in _main_container(dep)["envFrom"]]
+    cm = _by_name(docs, "ConfigMap", "-pull-worker")
+    assert refs[0] == cm["metadata"]["name"] and "cairn-config" not in refs
+    assert set(cm["data"]) == {
+        "CAIRN_ENGINE_URL", "CAIRN_BACKEND", "CAIRN_PROFILE", "MLFLOW_TRACKING_URI",
+        "OTEL_EXPORTER_OTLP_ENDPOINT", "CAIRN_ARTIFACT_S3_ENDPOINT", "CAIRN_ARTIFACT_S3_BUCKET",
+        "CAIRN_ARTIFACT_S3_REGION", "HF_HUB_OFFLINE"}
+    assert cm["data"]["CAIRN_ENGINE_URL"] == "https://cp.example"
+    assert cm["data"]["HF_HUB_OFFLINE"] == "1"
+
+
+@needs_helm
+def test_extra_env_changes_roll_the_worker():
+    def checksum(v: str) -> str:
+        docs = render("values-postgres.example.yaml", sets={
+            **_PULL, "pullWorker.token": "wp-token", "pullWorker.extraEnv.HF_HUB_OFFLINE": v})
+        dep = _by_name(docs, "Deployment", "-pull-worker")
+        return dep["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
+
+    assert checksum("0") != checksum("1")
+
+
+@needs_helm
+@pytest.mark.parametrize("name", ["HF_TOKEN", "MY_API_KEY", "DB_PASSWORD", "aws_secret",
+                                  "CAIRN_STORAGE", "OBS_STORAGE", "PG_DSN", "CAIRN_DBOS_DSN",
+                                  "OTEL_EXPORTER_OTLP_HEADERS"])
+def test_a_secret_looking_extra_env_name_is_refused(name):
+    err = render_error("values-postgres.example.yaml", sets={
+        **_PULL, "pullWorker.token": "wp-token", f"pullWorker.extraEnv.{name}": "v"})
+    assert f"pullWorker.extraEnv.{name}" in err and "own Secret" in err, err
+
+
+@needs_helm
+def test_the_worker_has_its_own_service_account():
+    docs = render("values-postgres.example.yaml", sets={
+        **_PULL, "pullWorker.token": "wp-token",
+        "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn": "arn:aws:iam::1:role/control-plane",
+        "pullWorker.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn": "arn:aws:iam::1:role/worker",
+        "imagePullSecrets[0].name": "ghcr-pull"})
+    dep = _by_name(docs, "Deployment", "-pull-worker")
+    pod = _pod_spec(dep)
+    sa = _by_name(docs, "ServiceAccount", "-pull-worker")
+    assert pod["serviceAccountName"] == sa["metadata"]["name"]
+    assert pod["automountServiceAccountToken"] is False and sa["automountServiceAccountToken"] is False
+    assert sa["metadata"]["annotations"] == {"eks.amazonaws.com/role-arn": "arn:aws:iam::1:role/worker"}
+    assert pod["imagePullSecrets"] == [{"name": "ghcr-pull"}]
+    server = _pod_spec(_by_name(docs, "Deployment", "-server"))
+    assert server["serviceAccountName"] != pod["serviceAccountName"]
+
+
+def test_deploy_doctor_refuses_a_secret_looking_extra_env_name():
+    def doctor(extra: dict) -> dict[str, str]:
+        from cairn.core.deploy_check import check_values
+
+        values = yaml.safe_load(_values("values-postgres.example.yaml").read_text())
+        values["pullWorker"] = {"enabled": True, "command": ["cairn"], "token": "wp", "extraEnv": extra}
+        return {r.name: r.status for r in check_values(values) if r.name == "pull_worker_extra_env"}
+
+    for name in ("HF_TOKEN", "MY_API_KEY", "DB_PASSWORD", "CAIRN_STORAGE", "PG_DSN",
+                 "OTEL_EXPORTER_OTLP_HEADERS", "BAD-NAME"):
+        assert doctor({name: "v"}) == {"pull_worker_extra_env": "fail"}, name
+    assert doctor({"HF_HUB_OFFLINE": "1"}) == {}
 
 
 def test_deploy_doctor_matches_the_four_chart_refusals():
