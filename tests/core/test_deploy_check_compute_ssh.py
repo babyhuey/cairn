@@ -62,10 +62,9 @@ def test_complete_connection_passes_and_names_the_execution_unit():
     r = rows["compute_target:ml_target"]
     assert r.status == "ok"
     assert "ubuntu@10.0.0.1" in r.detail
-    # a complete-but-venv target is still reported, as a WARN: that is the
-    # drift-prone box install ADR-0104 D1 removes (#2069).
+    # a target with no image runs the box's virtualenv — the default, so OK.
     mode = rows["compute_target:ml_target:mode"]
-    assert mode.status == "warn" and "venv" in mode.detail
+    assert mode.status == "ok" and "venv" in mode.detail
 
 
 def test_image_mode_target_reports_the_pinned_tag():
@@ -106,3 +105,32 @@ def test_no_target_is_not_a_finding():
 def test_every_row_lands_in_the_runtime_category():
     rows = check_compute_ssh("ml_target", "gpu", {"host": "h", "user": "u"}, has_key=True)
     assert rows and {r.category for r in rows} == {"runtime"}
+
+
+def test_venv_rows_are_ok_and_suggest_no_image():
+    """Venv is the default (#202): the row is a plain OK that names no image and
+    tells nobody to set one."""
+    for cfg in ({"host": "10.0.0.1", "user": "ubuntu"},
+                {"host": "10.0.0.1", "user": "ubuntu", "mode": "venv"},
+                {"host": "10.0.0.1", "user": "ubuntu", "mode": "venv",
+                 "image": "ghcr.io/example/cairn-train-gpu:1"}):
+        mode = _by_name(check_compute_ssh("ml_target", "gpu", cfg, has_key=True))[
+            "compute_target:ml_target:mode"]
+        assert mode.status == "ok", cfg
+        assert "virtualenv" in mode.detail
+        for word in ("ghcr.io", "cairn-train-gpu", "CAIRN_TRAIN_IMAGE", "remote_image", "Set "):
+            assert word not in mode.detail, (cfg, word)
+
+
+def test_image_mode_with_no_image_warns_with_both_remedies():
+    """``mode = image`` and no image on the connection: the engine refuses at
+    submit unless the environment names one. The row says so, and names the
+    connection's two fixes."""
+    mode = _by_name(check_compute_ssh(
+        "ml_target", "gpu", {"host": "10.0.0.1", "user": "ubuntu", "mode": "image"},
+        has_key=True))["compute_target:ml_target:mode"]
+    assert mode.status == "warn"
+    assert "refused at submit" in mode.detail
+    assert "remote_image" in mode.detail and "CAIRN_TRAIN_IMAGE" in mode.detail
+    assert "connection's `image`" in mode.detail and "`mode`" in mode.detail
+    assert "ghcr.io" not in mode.detail and "cairn-train-gpu" not in mode.detail

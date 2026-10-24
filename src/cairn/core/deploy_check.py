@@ -798,10 +798,11 @@ def check_compute_ssh(
     runs ML in-process, which is a legal dev shape.
 
     A second row reports the EXECUTION UNIT (ADR-0104 D1): a target with no
-    image still runs from the box's hand-installed virtualenv, which is the
-    thing that drifted and blocked 2026-09-07 (#2069), and an image pinned to
-    ``:latest`` (or to no tag at all) means the run record cannot name the
-    build that produced its artifacts.
+    image runs from the box's virtualenv (the default); one that sets
+    ``mode = image`` with no image is refused at submit unless the
+    environment names one; and an image pinned to ``:latest`` (or to no tag
+    at all) means the run record cannot name the build that produced its
+    artifacts.
     """
     name = f"compute_target:{key}"
     if not (target or "").strip():
@@ -837,24 +838,28 @@ def check_compute_ssh(
     image = str(config.get("image") or "").strip()
     mode = str(config.get("mode") or "").strip().lower()
     mode_name = f"{name}:mode"
-    if mode == "venv" or (not image and mode != "image"):
+    if mode == "venv":
         out.append(CheckResult(
-            mode_name, "warn",
-            f"{target!r} runs from the box's hand-installed virtualenv (venv "
-            f"mode) — that install drifts and stopped carrying the flow kernel "
-            f"the fine-tune flow needs (#2069). Set the connection's `image` "
-            f"(or the `remote_image` backend / CAIRN_TRAIN_IMAGE) to the pinned "
-            f"cairn-train-gpu tag; ADR-0104 D1.",
+            mode_name, "ok",
+            f"{target!r} runs from the box's virtualenv (the connection's mode "
+            f"is venv)",
+            category="runtime"))
+        return out
+    if not image and mode != "image":
+        out.append(CheckResult(
+            mode_name, "ok",
+            f"{target!r} names no image, so it runs from the box's virtualenv "
+            f"(venv mode)",
             category="runtime"))
         return out
     tag = image.rsplit("/", 1)[-1].partition(":")[2] if image else ""
     if not image:
         out.append(CheckResult(
             mode_name, "warn",
-            f"{target!r} is in image mode but names no image — the engine "
-            f"refuses the leg unless the `remote_image` backend / "
-            f"CAIRN_TRAIN_IMAGE names one; set the connection's `image` or that "
-            f"key to a pinned tag.",
+            f"{target!r} sets mode = image but names no image — a dispatch "
+            f"is refused at submit unless the `remote_image` backend / "
+            f"CAIRN_TRAIN_IMAGE names one. Set the connection's `image` to a "
+            f"pinned tag, or change its `mode`.",
             category="runtime"))
     elif not tag or tag == "latest":
         out.append(CheckResult(

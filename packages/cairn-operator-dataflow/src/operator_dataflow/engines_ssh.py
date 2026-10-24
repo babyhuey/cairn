@@ -53,12 +53,19 @@ from operator_dataflow.engines import BuiltinLocalEngine, _selected
 #: What image mode with no image named is told (#202). There is no built-in
 #: image: the deployment names the build it runs, so the run record names it
 #: too. PIN A TAG, never ``:latest`` — otherwise the record cannot say which
-#: build produced the artifacts.
+#: build produced the artifacts. Two triggers, two remedies: the environment's
+#: ``remote_exec_mode`` does not override a connection's own ``mode``.
 IMAGE_REQUIRED = (
     "remote_exec_mode is 'image' but no image is named: set the remote_image "
     "backend (CAIRN_TRAIN_IMAGE) or the compute.ssh connection's 'image' to a "
     "pinned tag, or set remote_exec_mode to 'auto' or 'venv' to run the box's "
     "virtualenv"
+)
+CONNECTION_IMAGE_REQUIRED = (
+    "the compute.ssh connection sets mode = 'image' but no image is named: set "
+    "the connection's 'image' (or the remote_image backend, CAIRN_TRAIN_IMAGE) "
+    "to a pinned tag, or change the connection's 'mode' to 'auto' or 'venv' — "
+    "remote_exec_mode does not override a connection's own mode"
 )
 
 #: Env names the CONTAINER needs that the engine does not put in ``inp.env``
@@ -98,7 +105,10 @@ def resolve_exec_mode(config: Mapping[str, Any]) -> tuple[str, str, str]:
     * ``image`` — the connection's ``image`` (it names THIS box's build) beats
       the environment's ``remote_image`` backend / ``CAIRN_TRAIN_IMAGE`` (the
       fleet default). There is no built-in default (#202): ``image`` mode with
-      neither raises :class:`EngineError` (:data:`IMAGE_REQUIRED`).
+      neither raises :class:`EngineError` — :data:`CONNECTION_IMAGE_REQUIRED`
+      when the connection's own ``mode`` chose image, else
+      :data:`IMAGE_REQUIRED`. This runs at submit, where the connection and
+      the environment are both known, before anything reaches the box.
     * ``gpus`` — the ``--gpus`` value; empty string disables the flag (a CPU
       box, or a runtime without the NVIDIA container toolkit).
 
@@ -106,6 +116,7 @@ def resolve_exec_mode(config: Mapping[str, Any]) -> tuple[str, str, str]:
     byte-for-byte what it was, including its handle meta.
     """
     mode = str(config.get("mode") or "").strip().lower()
+    from_connection = bool(mode)
     if not mode:
         mode = _selected("remote_exec_mode", "auto").strip().lower() or "auto"
     named = (
@@ -122,22 +133,8 @@ def resolve_exec_mode(config: Mapping[str, Any]) -> tuple[str, str, str]:
         else getenv("CAIRN_DATAFLOW_IMAGE_GPUS", "all")
     ).strip()
     if not named:
-        raise EngineError(IMAGE_REQUIRED)
+        raise EngineError(CONNECTION_IMAGE_REQUIRED if from_connection else IMAGE_REQUIRED)
     return "image", named, gpus
-
-
-def _environment_image_problem() -> list[str]:
-    """What :meth:`BuiltinSshEngine.validate` can see of the mode decision.
-
-    Only the environment: a connection's own ``mode``/``image`` resolve at
-    submit (the connection store is async), where :func:`resolve_exec_mode`
-    refuses the same case. So an environment that selects ``image`` names the
-    fleet image too (even when a connection names its own, or sets its own
-    ``mode``); a connection's ``image`` still overrides it per box."""
-    mode = _selected("remote_exec_mode", "auto").strip().lower()
-    if mode == "image" and not _selected("remote_image", "").strip():
-        return [IMAGE_REQUIRED]
-    return []
 
 
 def _docker_command(image: str, inner: str, env_names: Iterable[str], gpus: str) -> str:
@@ -228,7 +225,7 @@ class BuiltinSshEngine:
     # local capability discovery — the box installs the same wheels (the
     # fix-remote deployment contract), so the local registry is authoritative.
     def validate(self, spec: DataflowSpec) -> list[str]:
-        return BuiltinLocalEngine().validate(spec) + _environment_image_problem()
+        return BuiltinLocalEngine().validate(spec)
 
     async def _exec_ctx(self, ctx: Any) -> SimpleNamespace:
         from cairn.core.operator import resolve_connection  # noqa: PLC0415 - lazy: keeps engine importable off the engine path

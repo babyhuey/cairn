@@ -30,6 +30,7 @@ from cairn.core.operator.jobs import JobHandle
 from cairn.core.dataflow import EngineError
 
 from operator_dataflow.engines_ssh import (
+    CONNECTION_IMAGE_REQUIRED,
     IMAGE_REQUIRED,
     BuiltinSshEngine,
     resolve_exec_mode,
@@ -113,7 +114,7 @@ def test_explicit_mode_image_with_no_image_anywhere_is_refused(monkeypatch):
     deployment names the build, so the run record can name it too."""
     with pytest.raises(EngineError) as e:
         resolve_exec_mode({"host": "box", "mode": "image"})
-    assert str(e.value) == IMAGE_REQUIRED
+    assert str(e.value) == CONNECTION_IMAGE_REQUIRED
 
 
 def test_explicit_mode_venv_wins_over_a_configured_image(monkeypatch):
@@ -245,28 +246,69 @@ def test_result_records_the_image_tag(monkeypatch, tmp_path):
 
 
 # ── no default image: image mode names one or refuses (#202) ─────────
+#
+# The refusal lives at submit (resolve_exec_mode), where the connection and the
+# environment are both known; validate() sees only the spec.
 
 
-def test_image_mode_with_no_image_is_refused_by_validate(monkeypatch):
-    """The environment selects image mode but names no image: the leg is
-    refused at validate, before any budget is reserved or anything reaches the
-    box, and the problem says what to set. There is no built-in fallback image."""
+def test_environment_image_mode_with_no_image_anywhere_is_refused_before_the_exec_seam(monkeypatch):
+    """The environment selects image mode and nothing names an image: submit
+    refuses with a message naming what to set, and the exec layer is never asked
+    to run anything. There is no built-in fallback image."""
     monkeypatch.setenv("OBS_REMOTE_EXEC_MODE", "image")
-    problems = BuiltinSshEngine("gpu").validate(_spec())
-    assert len(problems) == 1, problems
-    assert "remote_image" in problems[0] and "CAIRN_TRAIN_IMAGE" in problems[0]
-    assert "venv" in problems[0]
+    _bind_connection(monkeypatch)
+    captured = _capture_submit(monkeypatch)
+    with pytest.raises(EngineError) as e:
+        _submit(BuiltinSshEngine("gpu"), _spec())
+    assert str(e.value) == IMAGE_REQUIRED
+    assert "remote_image" in str(e.value) and "CAIRN_TRAIN_IMAGE" in str(e.value)
+    assert "inp" not in captured
 
 
-def test_connection_image_mode_with_no_image_fails_before_the_box(monkeypatch):
-    """A connection's own ``mode = "image"`` is invisible to validate (the
-    connection resolves at submit), so submit refuses it before the exec layer
-    is asked to run anything."""
+def test_connection_image_mode_with_no_image_is_refused_naming_the_connection(monkeypatch):
+    """A connection's own ``mode = "image"`` is not overridden by the
+    environment, so the message says to fix the connection."""
     _bind_connection(monkeypatch, mode="image")
     captured = _capture_submit(monkeypatch)
-    with pytest.raises(EngineError, match="CAIRN_TRAIN_IMAGE"):
+    with pytest.raises(EngineError) as e:
         _submit(BuiltinSshEngine("gpu"), _spec())
+    assert str(e.value) == CONNECTION_IMAGE_REQUIRED
+    assert "connection's 'image'" in str(e.value) and "'mode'" in str(e.value)
     assert "inp" not in captured
+
+
+def test_environment_image_mode_with_a_connection_image_submits_that_image(monkeypatch):
+    monkeypatch.setenv("OBS_REMOTE_EXEC_MODE", "image")
+    _bind_connection(monkeypatch, image="ghcr.io/example/box-local:9")
+    engine = BuiltinSshEngine("gpu")
+    assert engine.validate(_spec()) == []
+    captured = _capture_submit(monkeypatch)
+    handle = _submit(engine, _spec())
+    assert " ghcr.io/example/box-local:9 " in captured["inp"].command
+    assert handle.meta["mode"] == "image"
+    assert handle.meta["image"] == "ghcr.io/example/box-local:9"
+
+
+def test_environment_image_mode_with_a_connection_mode_venv_runs_venv(monkeypatch):
+    monkeypatch.setenv("OBS_REMOTE_EXEC_MODE", "image")
+    _bind_connection(monkeypatch, mode="venv")
+    engine = BuiltinSshEngine("gpu")
+    assert engine.validate(_spec()) == []
+    captured = _capture_submit(monkeypatch)
+    handle = _submit(engine, _spec())
+    assert captured["inp"].command == "cairn-dataflow-run"
+    assert handle.meta["mode"] == "venv" and handle.meta["image"] == ""
+
+
+def test_environment_image_mode_with_remote_image_set_submits_it(monkeypatch):
+    """Positive control: the environment names both the mode and the image."""
+    monkeypatch.setenv("OBS_REMOTE_EXEC_MODE", "image")
+    monkeypatch.setenv("OBS_TRAIN_IMAGE", "ghcr.io/example/cairn-train-gpu:fleet")
+    _bind_connection(monkeypatch)
+    captured = _capture_submit(monkeypatch)
+    handle = _submit(BuiltinSshEngine("gpu"), _spec())
+    assert " ghcr.io/example/cairn-train-gpu:fleet " in captured["inp"].command
+    assert handle.meta["image"] == "ghcr.io/example/cairn-train-gpu:fleet"
 
 
 def test_auto_mode_with_no_image_picks_venv(monkeypatch):
