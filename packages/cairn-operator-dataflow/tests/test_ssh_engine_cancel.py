@@ -145,3 +145,62 @@ async def test_a_job_that_died_on_its_own_is_still_retried(box):
     out = await execute_leg("flow:demo/train", inputs={}, engine=engine, run_id="r-train",
                             poll_budget_s=1.0)
     assert engine.submits == 2, (out.state, out.error)
+
+
+async def test_a_cancelled_priced_leg_settles_its_box_time_once(box, monkeypatch):
+    """With #211's per-attempt pricing (ADR-0151 D5): the cancelled attempt settles
+    its wall-clock once, the leg ends `cancelled`, and no second attempt (and no
+    second settle) follows."""
+    from datetime import datetime, timedelta, timezone
+
+    from cairn.core import budget_reservations as B
+    from cairn.core.dispatch import leg_executor as LE
+    from cairn.core.dispatch.leg_hooks import flow_leg_record
+    from cairn.core.dispatch.pipeline_bridge import _leg_run_status
+
+    monkeypatch.delenv("OBS_STORAGE", raising=False)
+    monkeypatch.delenv("CAIRN_STORAGE", raising=False)
+    B.reset_reservations()
+    t0 = datetime(2026, 10, 24, 8, 0, tzinfo=timezone.utc)
+    ticks = [t0, t0 + timedelta(hours=2)]
+    monkeypatch.setattr(LE, "_wall_now", lambda: ticks.pop(0) if len(ticks) > 1 else ticks[0])
+    settled: list[float] = []
+    released: list = []
+    real_settle, real_release = LE.settle, LE.release
+
+    async def _settle(res, actual_usd=0.0):
+        settled.append(round(actual_usd, 6))
+        return await real_settle(res, actual_usd=actual_usd)
+
+    async def _release(res):
+        released.append(res)
+        return await real_release(res)
+
+    monkeypatch.setattr(LE, "settle", _settle)
+    monkeypatch.setattr(LE, "release", _release)
+
+    engine = _Engine()
+    handles: list = []
+
+    async def _on_submit(handle):
+        handles.append(handle)
+
+    leg = asyncio.create_task(execute_leg(
+        "flow:demo/train", inputs={}, engine=engine, run_id="r-train", on_submit=_on_submit,
+        series_id="s-gpu", estimated_usd=6.0, spent_usd=0.0, budget_usd=25.0,
+        hourly_usd=0.5, poll_budget_s=3.0))
+    for _ in range(200):
+        if handles:
+            break
+        await asyncio.sleep(0.01)
+    await engine.cancel(handles[0])
+    out = await asyncio.wait_for(leg, timeout=10)
+    try:
+        assert engine.submits == 1
+        assert out.state == "cancelled" and _leg_run_status(out) == "cancelled"
+        assert settled == [1.0] and released == [], "the box time settles once, never as 'no spend'"
+        assert out.gpu_usd == 1.0
+        assert flow_leg_record({}, out)["cost"]["gpu_usd"] == 1.0
+        assert await B.reserved_total("s-gpu") == 0.0
+    finally:
+        B.reset_reservations()
