@@ -911,10 +911,27 @@ async def _settle_die_adopt(monkeypatch, run_id: str, series: str) -> LegOutcome
     return out
 
 
-async def test_an_adopt_after_a_settled_attempt_settles_only_the_rest_memory(monkeypatch, memory_budget):
-    await _settle_die_adopt(monkeypatch, "r-f1", "s-f1")
-    assert await B.reserved_total("s-f1") == 0.0
-    assert await B.settled_usd_for_run("r-f1") == 2.25, "0.50 + 1.75: the window, counted once"
+async def test_an_in_process_adopt_with_held_rows_settles_only_the_rest_memory(monkeypatch, memory_budget):
+    """The in-memory backend keeps a run's settled total only while the run holds a
+    claim, which is the only time an adopt can read it in-process: attempt 2 is held
+    when attempt 1 settles, and the adopt then settles the window less $0.50."""
+    seen = _ledger(monkeypatch)
+    run_id, series = "r-f1", "s-f1"
+    r1 = await B.reserve(series, est_usd=2.0, spent_usd=0.0, budget_usd=25.0, run_id=run_id)
+    await B.reserve(series, est_usd=2.0, spent_usd=0.0, budget_usd=25.0, run_id=run_id)
+    await B.settle(r1, actual_usd=0.5)
+    assert await B.settled_usd_for_run(run_id) == 0.5
+    _stub_flow(monkeypatch)
+    monkeypatch.setattr(LE, "_wall_now", lambda: T0 + timedelta(hours=4.5))
+    out = await execute_leg(
+        "flow:gpupack/train", inputs={}, engine=_Engine("succeeded"), run_id=run_id,
+        series_id=series, estimated_usd=2.0, spent_usd=0.0, budget_usd=25.0,
+        hourly_usd=0.5, adopted_started_at=T0.isoformat(),
+        adopt={"job_id": "old", "engine": "stub", "meta": {}})
+    assert out.ok and out.gpu_usd == 2.25
+    assert seen["settle"] == [1.75], "2.25 window − 0.50 already settled"
+    assert await B.reserved_total(series) == 0.0
+    assert B._backend()._settled == {}, "the run's last hold closed: its total is dropped"
 
 
 async def test_live_pg_an_adopt_after_a_settled_attempt_settles_only_the_rest(monkeypatch):
@@ -937,3 +954,81 @@ async def test_live_pg_an_adopt_after_a_settled_attempt_settles_only_the_rest(mo
         assert await B.settled_usd_for_run(f"r-{sid}") == 2.25
     finally:
         await pool.close()
+
+
+# ── the in-memory settled totals stay bounded by the runs in flight ─────────
+
+async def test_memory_settled_totals_are_dropped_with_each_runs_last_hold(memory_budget):
+    for i in range(200):
+        r = await B.reserve("s-many", est_usd=1.0, spent_usd=0.0, budget_usd=0.0, run_id=f"run-{i}")
+        if i % 2:
+            await B.settle(r, actual_usd=0.25)
+        else:
+            await B.release(r)
+    assert B._backend()._settled == {}, "no run holds a claim, so no total is kept"
+    a = await B.reserve("s-many", est_usd=1.0, spent_usd=0.0, budget_usd=0.0, run_id="live")
+    b = await B.reserve("s-many", est_usd=1.0, spent_usd=0.0, budget_usd=0.0, run_id="live")
+    await B.settle(a, actual_usd=0.4)
+    assert B._backend()._settled == {"live": 0.4}, "kept while the run still holds b"
+    await B.settle(b, actual_usd=0.1)
+    assert B._backend()._settled == {}
+
+
+# ── adopt edge cases ────────────────────────────────────────────────────────
+
+async def test_an_adopt_with_no_readable_start_settles_the_engine_cost_as_is(monkeypatch, memory_budget):
+    """No window to overlap earlier attempts, so nothing is subtracted from the
+    engine-reported cost."""
+    seen = _ledger(monkeypatch)
+    r1 = await B.reserve("s-e", est_usd=2.0, spent_usd=0.0, budget_usd=25.0, run_id="r-e")
+    await B.reserve("s-e", est_usd=2.0, spent_usd=0.0, budget_usd=25.0, run_id="r-e")
+    await B.settle(r1, actual_usd=0.5)
+    _stub_flow(monkeypatch)
+
+    class _Costly(_Engine):
+        async def result(self, handle):
+            return types.SimpleNamespace(stats={}, output_artifacts=[], cost_usd=0.3)
+
+    out = await execute_leg(
+        "flow:gpupack/train", inputs={}, engine=_Costly("succeeded"), run_id="r-e",
+        series_id="s-e", estimated_usd=2.0, spent_usd=0.0, budget_usd=25.0,
+        hourly_usd=0.5, adopted_started_at=None,
+        adopt={"job_id": "old", "engine": "stub", "meta": {}})
+    assert out.ok and out.gpu_usd == 0.0 and out.cost_usd == 0.3
+    assert seen["settle"] == [0.3], "the engine cost, not 0.3 − 0.5 floored to 0"
+
+
+async def test_an_adopt_with_several_held_rows_settles_the_first_and_closes_the_rest(
+        monkeypatch, memory_budget):
+    seen = _ledger(monkeypatch)
+    for _ in range(3):                                   # three dead processes' holds
+        await B.reserve("s-m", est_usd=2.0, spent_usd=0.0, budget_usd=25.0, run_id="r-m")
+    _stub_flow(monkeypatch)
+    monkeypatch.setattr(LE, "_wall_now", lambda: T0 + timedelta(hours=3))
+    out = await execute_leg(
+        "flow:gpupack/train", inputs={}, engine=_Engine("succeeded"), run_id="r-m",
+        series_id="s-m", estimated_usd=2.0, spent_usd=0.0, budget_usd=25.0,
+        hourly_usd=0.5, adopted_started_at=T0.isoformat(),
+        adopt={"job_id": "old", "engine": "stub", "meta": {}})
+    assert out.ok and out.gpu_usd == 1.5
+    assert seen["settle"] == [1.5, 0.0, 0.0]
+    assert await B.reserved_total("s-m") == 0.0 and await B.held_for_run("r-m") == []
+
+
+async def test_an_unreadable_settled_total_leaves_the_rows_held_and_names_it(monkeypatch, memory_budget):
+    await B.reserve("s-u", est_usd=2.0, spent_usd=0.0, budget_usd=25.0, run_id="r-u")
+
+    async def _broken(run_id):
+        raise ConnectionError("ledger read failed")
+
+    monkeypatch.setattr(LE, "settled_usd_for_run", _broken)
+    _stub_flow(monkeypatch)
+    monkeypatch.setattr(LE, "_wall_now", lambda: T0 + timedelta(hours=3))
+    out = await execute_leg(
+        "flow:gpupack/train", inputs={}, engine=_Engine("succeeded"), run_id="r-u",
+        series_id="s-u", estimated_usd=2.0, spent_usd=0.0, budget_usd=25.0,
+        hourly_usd=0.5, adopted_started_at=T0.isoformat(),
+        adopt={"job_id": "old", "engine": "stub", "meta": {}})
+    assert out.ok and out.gpu_usd == 1.5
+    assert "budget ledger" in out.error and "ledger read failed" in out.error
+    assert [r.amount_usd for r in await B.held_for_run("r-u")] == [2.0], "held at the estimate"

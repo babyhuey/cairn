@@ -58,17 +58,18 @@ engine cost (its partial engine spend is unknown), and a leg with neither figure
 `Run.cost` — unknown, never $0 (a succeeded leg's payload still carries `llm_cost_usd`). The rate
 is the one recorded on `PipelineRecord.admission.cost_estimate` at launch, never re-read. Each
 fresh attempt measures its own window (attempt start → end) and is accounted once, after its
-outcome is known (`_close_attempt`, `src/cairn/core/dispatch/leg_executor.py:546`): the window
+outcome is known (`_close_attempt`, `src/cairn/core/dispatch/leg_executor.py:547`): the window
 joins `Run.cost.gpu_usd`, then the attempt's own hold is settled at its cost (released when it cost
 nothing). The backoff between two fresh attempts is not billed (a known under-count). A ledger
 error is logged and appended to the leg's error, and never changes the engine outcome or the box
 time. An adopted attempt holds no reservation of its own; its window runs from the persisted
 `run.started_at` (the start of each attempt is not persisted), so it covers the run's earlier
 attempts and backoff, and `Run.cost.gpu_usd` is then an over-estimate of the box time (accepted).
-In the ledger it closes the hold the dead process left (`held_for_run`), settled at the adopted
-window less what the run's claims already settled (`budget_reservations.settled_usd_for_run`),
-floored at 0: the run's settled rows add up to the adopted window, and no attempt is settled
-twice.
+In the ledger it closes the hold the dead process left (`held_for_run`): with a window, the first
+held row settles at engine-reported cost + window − what the run's claims already settled
+(`budget_reservations.settled_usd_for_run`), floored at 0, and any further one at 0, so no attempt is
+settled twice; with no window (no readable `run.started_at`) the engine cost settles as is. If the
+ledger cannot be read the rows stay held at their estimate and the leg's error names it (ADR-0152).
 
 **Descriptors and lineage.** `DataflowResult.output_artifacts` holds one descriptor per stage,
 in order (the stage-contract re-check reads it by position). Its parent is the previous stage's

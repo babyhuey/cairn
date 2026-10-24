@@ -125,8 +125,11 @@ class _MemoryBackend:
     def __init__(self) -> None:
         # series_id → reservation_id → Reservation. Held ONLY while in flight.
         self._held: dict[str, dict[str, Reservation]] = {}
-        # run_id → the actual_usd its settled claims recorded (ADR-0152): the
-        # in-memory twin of the Postgres rows' `settled` state, read-only to callers.
+        # run_id → the actual_usd its settled claims recorded (ADR-0152), kept ONLY
+        # while the run still holds a claim: the total is read only to close a held
+        # row (an adopted attempt), so it is dropped with the run's last hold and the
+        # dict stays bounded by the runs in flight. After a restart this backend has
+        # neither holds nor totals; the Postgres rows keep both.
         self._settled: dict[str, float] = {}
         self._lock = asyncio.Lock()
 
@@ -153,7 +156,11 @@ class _MemoryBackend:
         free the same budget."""
         async with self._lock:
             held = self._held.get(reservation.series_id, {}).pop(reservation.id, None)
-            if held is not None and state == "settled" and held.run_id:
+            if held is None or not held.run_id:
+                return
+            if not any(r.run_id == held.run_id for holds in self._held.values() for r in holds.values()):
+                self._settled.pop(held.run_id, None)    # the run's last hold: nothing left to read it
+            elif state == "settled":
                 self._settled[held.run_id] = self._settled.get(held.run_id, 0.0) + float(actual_usd or 0.0)
 
     async def reserved_total(self, series_id: str) -> float:
@@ -478,9 +485,11 @@ async def held_for_run(run_id: str) -> list[Reservation]:
 
 async def settled_usd_for_run(run_id: str) -> float:
     """What the claims admitted for ``run_id`` have already SETTLED (the sum of their
-    ``actual_usd``). Read-only. An adopted leg attempt subtracts it from its window,
-    which runs from the leg's start, so the run's earlier attempts are not settled
-    twice (ADR-0152)."""
+    ``actual_usd``). Read-only. An adopted leg attempt subtracts it when it closes the
+    run's held row, because its window runs from the leg's start, so the run's earlier
+    attempts are not settled twice (ADR-0152). The Postgres backend sums the settled
+    rows; the in-memory backend keeps the total only while the run still holds a claim
+    (the only time a held row can be closed against it)."""
     return await _backend().settled_usd_for_run(run_id)
 
 

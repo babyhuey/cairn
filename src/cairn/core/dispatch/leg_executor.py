@@ -517,7 +517,8 @@ async def execute_leg(
         gpu = _box_time_usd(hourly_usd, attempt_started)
         gpu_total += gpu
         out.gpu_usd = round(gpu_total, 6)
-        note = await _close_attempt(out, reservation, actual_usd=(out.cost_usd if out.ok else 0.0) + gpu,
+        note = await _close_attempt(out, reservation, engine_usd=out.cost_usd if out.ok else 0.0,
+                                    box_usd=gpu,
                                     adopted_run_id=str(run_id or "") if adopted_attempt else "")
         if note:
             ledger_notes.append(note)
@@ -543,27 +544,30 @@ def _with_notes(out: LegOutcome, notes: list[str]) -> LegOutcome:
     return out
 
 
-async def _close_attempt(out: LegOutcome, reservation: Any, *, actual_usd: float,
-                         adopted_run_id: str = "") -> str:
-    """Close one attempt's hold: ``settle`` at ``actual_usd`` when it succeeded or
-    cost something, else ``release`` (nothing billed).
+async def _close_attempt(out: LegOutcome, reservation: Any, *, engine_usd: float,
+                         box_usd: float, adopted_run_id: str = "") -> str:
+    """Close one attempt's hold: ``settle`` at ``engine_usd + box_usd`` when it
+    succeeded or cost something, else ``release`` (nothing billed).
 
     An ADOPTED attempt holds no reservation of its own: the hold is the one the
     process that submitted it took (stamped with the run id) and left ``held`` when
     it died. It is closed the way ``_close_reservations`` closes a template's,
-    through ``held_for_run``. Its window runs from the leg's start, so it already
-    covers the run's earlier attempts; what those settled
-    (``settled_usd_for_run``) is subtracted, floored at 0, so the run's settled rows
-    add up to the adopted window and nothing is settled twice (ADR-0152). Any
-    further held row closes at 0.
+    through ``held_for_run``. Its box window runs from the leg's start, so it already
+    covers the run's earlier attempts: when it has a window (``box_usd > 0``), what
+    the run's claims already settled (``settled_usd_for_run``) is subtracted from
+    ``engine_usd + box_usd``, floored at 0, so nothing is settled twice (ADR-0152).
+    With no window (no readable start, or an unpriced leg) nothing overlaps and the
+    engine cost settles as is. The first held row settles at that figure, any further
+    one at 0. If a read fails the rows stay held at their estimate.
 
     Returns a note when the ledger fails — logged, never a change to the engine
     outcome or the box time already accounted; ``""`` otherwise."""
+    actual_usd = float(engine_usd or 0.0) + float(box_usd or 0.0)
     billed = out.ok or actual_usd > 0
     try:
         if adopted_run_id:
             held_rows = await held_for_run(adopted_run_id)
-            if held_rows and billed:
+            if held_rows and billed and box_usd > 0:
                 already = await settled_usd_for_run(adopted_run_id)
                 actual_usd = max(0.0, round(actual_usd - already, 6))
             for i, held in enumerate(held_rows):

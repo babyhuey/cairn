@@ -87,7 +87,7 @@ step with a key takes the run the fire created (`_claim_unrecorded_leg_runs`) or
   (`_fail_pipeline`, `pipeline_bridge.py:2309`); `Run.error` and `failure_type` carry the cause.
 - Cancellation: `cancel` kills engine compute (`DataflowEngine.cancel`) and settles budget;
   a queued leg cancelled while waiting for a slot is skipped cleanly (`:1573-1600`).
-- Budget: reserved per leg before submit and settled after (`leg_executor.py:396`;
+- Budget: reserved per leg before submit and settled after (`leg_executor.py:401`;
   `budget_reservations.py`); a series cap refuses admission. A leg on a priced box settles
   `hourly_usd × wall-clock` per attempt on every outcome and records it as `Run.cost.gpu_usd`
   (ADR-0151 D5).

@@ -34,7 +34,8 @@ the price can be read, when:
 - `hourly_usd` is malformed (not a number, negative, NaN or infinite).
 
 "Not priced" applies only when the case is definite: no `hourly_usd` (unset or 0), a connection of
-another kind, a `worker:<pool>` target, or no target.
+another kind, or a `worker:<pool>` target; each gets a "not priced" entry in the estimate. A leg
+with no target at all (the local engine) gets no entry: it is left out of the estimate entirely.
 
 **D2 — The door checks the bounded worst case; a leg reserves one attempt.** The door's estimate
 for a leg is `hourly_usd × timeout × loop max_iterations × attempts`:
@@ -62,10 +63,17 @@ a pipeline. That asymmetry is deliberate and documented.
 **D5 — An adopted attempt settles what is left of its window.**
 - An adopted attempt has no reservation of its own. Its window runs from the persisted
   `run.started_at`, because the start of each attempt is not persisted.
-- When it ends, it closes the hold its dead process left (`held_for_run`). That hold is settled at
-  the adopted window less what the run's claims have already settled (`settled_usd_for_run`, a
-  read-only sum on both reservation backends), floored at 0. The run's settled rows therefore add
-  up to the adopted window, and nothing is settled twice.
+- When it ends, it closes the hold its dead process left (`held_for_run`). When it has a window,
+  the first held row is settled at `engine-reported cost + window − what the run's claims have
+  already settled` (`settled_usd_for_run`), floored at 0; any further held row is settled at 0.
+  The run's settled rows therefore add up to the adopted attempt's cost, and nothing is settled
+  twice. When it has no window (no readable `run.started_at`, or an unpriced leg), nothing
+  overlaps the earlier attempts and the engine-reported cost is settled as is. If the ledger
+  cannot be read, the rows stay held at their estimate and the leg's error names it.
+- `settled_usd_for_run` is a read-only sum: Postgres sums the run's `settled` rows; the in-memory
+  backend keeps the total only while the run still holds a claim and drops it with the run's
+  last hold, so its state stays bounded by the runs in flight (after a restart it has neither
+  holds nor totals).
 - The adopted window covers the earlier attempts and the backoff between them. The leg's
   `Run.cost.gpu_usd` is therefore an over-estimate of the box time. That is accepted: an
   over-estimate, never a double count.
@@ -80,8 +88,8 @@ a pipeline. That asymmetry is deliberate and documented.
   attempt would fit.
 - A pipeline with a budget and no series is enforced at launch only.
 - `budget_reservations` gains `settled_usd_for_run`. It is a read over existing state: the
-  `settled` rows carry `run_id` in Postgres, and the in-memory backend keeps a per-run sum. There
-  is no new store or table.
+  `settled` rows carry `run_id` in Postgres, and the in-memory backend keeps a per-run sum only
+  while the run holds a claim. There is no new store or table.
 
 ## Alternatives rejected
 
