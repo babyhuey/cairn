@@ -45,10 +45,8 @@ never imports a pack — that one-way dependency is what lets the same machinery
 run fine-tuning, dataset checks, model evaluation, or incident response, and
 lets any operator inherit the budget, policy gate, and audit for free.
 
-cairn is **open source** (Apache 2.0) and **self-hosted by default**: your
-keys, your GPUs, your logs — nothing leaves your perimeter. A **managed
-cloud** is in private beta for teams who would rather not run it themselves;
-the engine is the same either way.
+cairn is **open source** (Apache 2.0) and **self-hosted**: your keys, your
+GPUs, your logs — nothing leaves your perimeter.
 
 ## Why governed?
 
@@ -155,5 +153,5 @@ surface may still change between releases; see [`CHANGELOG.md`](./CHANGELOG.md).
 
 Licensed under the **Apache License 2.0** — see [`LICENSE`](./LICENSE).
 Contributions are welcome: read [`CONTRIBUTING.md`](./CONTRIBUTING.md) first.
-Interested in the managed cloud or a say in what ships next?
+Want a say in what ships next?
 **[Join the waitlist](https://cairndev.sh).**
