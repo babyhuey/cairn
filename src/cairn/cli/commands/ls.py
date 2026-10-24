@@ -27,6 +27,7 @@ adding a corresponding asset line here.
 from __future__ import annotations
 
 import json as _json
+import os
 from importlib.metadata import entry_points, packages_distributions
 from pathlib import Path
 from typing import Any
@@ -116,34 +117,61 @@ def _flows_by_pack() -> dict[str, list[tuple[str, str]]]:
 # already holds, and each file is read only for its `[profile] visibility`.
 
 
+def _module_root(p: Pack) -> Path | None:
+    """The directory of the module that holds ``p`` (the pack's one-line
+    ``Pack.from_manifest(__file__)`` shim), as imported: an installed pack's
+    ``cairn.packs`` entry-point module, or a ``CAIRN_PACK_PATH`` pack's dev module.
+    Not resolved, so a pack reached through a symlink keeps the path it was
+    imported by."""
+    import sys  # noqa: PLC0415
+
+    from cairn.core.pack.loader import DEV_MODULE_PREFIX  # noqa: PLC0415 — loader internals, CLI-only read
+
+    names = [ep.module for ep in entry_points(group="cairn.packs")]
+    names += [n for n in list(sys.modules) if n.startswith(DEV_MODULE_PREFIX)]
+    for name in names:
+        mod = sys.modules.get(name)
+        where = getattr(mod, "__file__", None)
+        if where and any(v is p for v in vars(mod).values()):
+            root = Path(os.path.abspath(where)).parent
+            if (root / "pack.toml").is_file():
+                return root
+    return None
+
+
 def _pack_root(p: Pack) -> Path | None:
     """The directory holding the pack's ``pack.toml``: any asset dir the manifest
-    names, with its manifest-relative path taken off. ``None`` for a pack with no
-    asset dirs (nothing to anchor on)."""
+    names, with its manifest-relative path taken off; else, when every asset dir
+    resolves somewhere else (a symlink out of the pack), the directory of the
+    module that holds the pack. ``None`` when neither finds a ``pack.toml``."""
     m = p.manifest
-    if m is None:
-        return None
-    for key, attr in Pack._ASSET_FIELDS.items():
-        rel, path = getattr(m, key, None), getattr(p, attr, None)
-        if not rel or not path or ".." in Path(rel).parts:
-            continue
-        root = Path(path).parents[len(Path(rel).parts) - 1]
-        if (root / "pack.toml").is_file():
-            return root
-    return None
+    if m is not None:
+        for key, attr in Pack._ASSET_FIELDS.items():
+            rel, path = getattr(m, key, None), getattr(p, attr, None)
+            if not rel or not path or ".." in Path(rel).parts:
+                continue
+            root = Path(path).parents[len(Path(rel).parts) - 1]
+            if (root / "pack.toml").is_file():
+                return root
+    return _module_root(p)
 
 
 def _profiles_of(p: Pack) -> list[dict[str, str]]:
     """``[{name, path, absolute_path, visibility}]`` for each ``profiles/*.toml``
-    the pack ships; ``visibility`` is read the way the console's picker reads it."""
-    root = _pack_root(p)
-    if root is None or not (root / "profiles").is_dir():
-        return []
-    from cairn.core.ui_contract import _profile_visibility  # noqa: PLC0415 — the one reading of a profile's tier (#1570)
+    the pack ships; ``visibility`` is read the way the console's picker reads it.
+    Best-effort like the rest of this listing: a pack whose profiles cannot be
+    read lists none rather than failing ``cairn ls``."""
+    try:
+        root = _pack_root(p)
+        if root is None or not (root / "profiles").is_dir():
+            return []
+        from cairn.core.ui_contract import _profile_visibility  # noqa: PLC0415 — the one reading of a profile's tier (#1570)
 
-    return [{"name": f.stem, "path": f"profiles/{f.name}", "absolute_path": str(f.resolve()),
-             "visibility": _profile_visibility(f)}
-            for f in sorted((root / "profiles").glob("*.toml"))]
+        return [{"name": f.stem, "path": f"profiles/{f.name}", "absolute_path": os.path.abspath(f),
+                 "visibility": _profile_visibility(f)}
+                for f in sorted((root / "profiles").glob("*.toml"))]
+    except Exception:  # noqa: BLE001 — an unreadable profiles dir is not a reason to blank the listing
+        return []
 
 
 def _pack_to_dict(p: Pack, *, pipelines: dict[str, list[tuple[str, int, str]]] | None = None,
