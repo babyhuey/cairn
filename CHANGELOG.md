@@ -4,7 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
-## [0.2.2] - 2026-10-24
+## [0.3.0] - 2026-10-24
+
+A minor release because it contains breaking changes: the artifact registry migrates its storage in place (ADR-0147, ADR-0148), and the Helm chart's pull-worker values change (`docs/compatibility.md`: a break before 1.0 is a MINOR bump with migration notes). See Upgrade notes.
 
 Workspace-scoped artifact tags and reads, a hardened SSH path for remote training boxes, a Secret of its own for the Helm chart's pull worker, and launch-time refusals under the Temporal runtime. The artifact registry migrates on first start, and the Helm chart changes for pull-worker users: read the upgrade notes before upgrading.
 
