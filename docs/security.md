@@ -37,15 +37,57 @@ the deployment's row count.
 
 **Known gap:** with `CAIRN_JWT_SECRET` unset the control plane starts OPEN and says so at
 startup (`AUTH DISABLED …`, `src/cairn/core/triggers/server.py`); any authenticated user can
-approve any gate (`15-architecture-risks.md` C2, #1486). Never expose an unset-secret
-server beyond localhost.
+approve any gate. Never expose an unset-secret server beyond localhost.
+
+## Accounts and workspaces (0.2.0)
+With auth on, one deployment serves several accounts. The boundaries below are what 0.2.0
+added; with auth off, or on a single-node deployment where everything belongs to the
+`default` account and workspace, they change nothing.
+
+- **Connections and secrets are scoped to the run's account** (the account that owns the
+  run's workspace; ADR-0143). A team account resolves only its own connections, and only
+  secrets stored under `cairn://secrets#<account>/…`; an environment-variable name,
+  `${env:NAME}` and the deployment's stored secrets resolve to nothing for it
+  (`src/cairn/core/connections.py`, `src/cairn/core/secrets_store.py`). Its declared
+  secrets reach `ctx.secrets` (a team account's run does not receive them in the process
+  environment), and the bound `secrets.store` provider is not read for it. A connection bound
+  in the deployment's profile (`ml_target`, `dataflow_target`) belongs to the deployment and
+  is not used for a team account's flow legs; they use a target connection of the account's
+  own, named in the pipeline or flow.
+- **No workspace in scope is refused.** With auth on, resolving a connection, a secret or a
+  dataset reference outside any workspace raises `WorkspaceScopeRequired`
+  (`src/cairn/core/workspace.py`) instead of resolving as the deployment.
+- **Datasets** resolve within the run's workspace: `dataset:` refs and `@latest` see only
+  that workspace's versions.
+- **Pull-lane claims and heartbeats** (`POST /jobs/claim`) need a worker-pool token
+  (`cairn remote worker-token`) or the deployment admin's token; a signed-in user's token
+  gets `403`.
+- **Pack install and uninstall** over the API (`POST /registry/install|uninstall`) are
+  deployment-admin only (`CAIRN_API_USER`).
+- **Deciding a paused saga** through `POST /triggers/approve/{workflow_id}` checks the
+  saga's account through its action handler's `workspace_of`; without one, only the
+  deployment admin may decide it.
+- **MCP servers and corpus sources** default to closed: `mcp_server_spec`,
+  `resolve_corpus_source` and `index_workspace_corpus` take a stdio server, a private or
+  local address, or a local path only with `allow_stdio`, `allow_private_network` or
+  `allow_local`, which are for the deployment's own callers. The address check runs when
+  the spec is built and resolves the host at that time; `CAIRN_PROBE_ALLOW_PRIVATE` allows
+  private addresses for deployments that need them (`src/cairn/core/clients/mcp_client.py`).
+- **Run hooks on `pipeline.launching` fail closed:** a provider that raises anything other
+  than `AdmissionRefused` refuses the launch. Every other event still fails open.
+
+**Known limit:** artifact tags (`resolve` / `promote`) and artifact `get`, `lineage`,
+`list_artifacts` and `find_by_uri` are still deployment-wide. A content-addressed artifact
+row carries no workspace, so scoping them needs a storage key change, left for a follow-up.
 
 ## Secrets and credentials
 Declared connections, never values in pack data or specs: `secrets/env`, `secrets/infisical`
 operators; `.env` on the box (Infisical profile replaces it); provider tokens live in
 connections. Secrets reach a flow as a scoped set of what its stages declare (ADR-0089 D3),
 not wholesale env (the pre-#1344 shape is recorded debt for the Metaflow adapter).
-Never log or echo a secret; the redactor (`src/cairn/core/obs/redact.py`, `redact.text` in
+For a team account's run, the
+connections and secrets in scope are that account's own (see *Accounts and workspaces*
+above). Never log or echo a secret; the redactor (`src/cairn/core/obs/redact.py`, `redact.text` in
 `src/cairn/profiles/secure.toml`) runs on LLM traffic and logs; every LLM call goes through
 `build_chat_model` (`services/llm/factory.py:97`) — invariant 2.
 
@@ -59,7 +101,7 @@ decision (ADR-0106 D6) and writes no record.
 
 ## Remote and cloud execution
 Work moves as an **image + a spec**: the GPU trainer image is built by CI and pinned by tag
-(never `:latest`, `RUNBOOK-gpu-finetune-ssh.md`); the box is a declared `compute.ssh`
+(never `:latest`); the box is a declared `compute.ssh`
 connection; provisioning engines (SkyPilot) sit behind a door and a cost gate that run
 **before** any cloud spend (`src/cairn/core/dataflow/engine_door.py` (the flow-engine door, ADR-0134 D3c; SkyPilot answers through its `check_ready()`); ADR-0104 D5); compute
 acquisition/release is a governed pair with a lease sweep (ADR-0097). Budget is reserved
@@ -80,5 +122,5 @@ box calls back on (idempotent ingest, spooled); the control plane never opens in
 to boxes. Console assets are static; the API is the only console↔engine contract.
 
 ## Reporting
-Security findings go to the maintainer privately (see `SECURITY.md` at the repo root if
-present; otherwise a private issue), not to a public issue.
+Security findings go to the maintainer privately, as `SECURITY.md` at the repository root
+describes, not to a public issue.

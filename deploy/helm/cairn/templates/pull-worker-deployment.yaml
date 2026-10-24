@@ -1,13 +1,14 @@
 {{- if .Values.pullWorker.enabled }}
 {{/*
-D2 (#565) — a machine that dials OUT: it claims work from the control plane,
-runs the image, and reports over the job channel. No inbound access.
+`cairn worker --pull` (#565): a machine that dials OUT. It claims work from the
+control plane, runs the image, and reports over the job channel. No inbound
+access.
 
-This chart ships the DEPLOYMENT SHAPE ONLY. `cairn worker --pull` is being
-built in the D2 slice in parallel with this one, so hard-coding its flags here
-would bake in a guess; `pullWorker.command` is required and unvalidated
-(_helpers.tpl refuses an empty one). When D2 lands, the command becomes a
-default here and this comment goes away.
+`pullWorker.command` is required and has no default (_helpers.tpl refuses an
+empty one), e.g. ["cairn", "worker", "--pull", "--engine-url", "https://<host>"].
+With auth on, claiming needs a worker-pool token (`cairn remote worker-token
+--name <pool>`) in CAIRN_ENGINE_TOKEN; the container reads the same ConfigMap
+and Secret as the server (cairn.envFrom).
 */}}
 apiVersion: apps/v1
 kind: Deployment

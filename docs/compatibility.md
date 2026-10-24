@@ -4,7 +4,7 @@ Cairn is pre-1.0 (`0.2.1`). The policy is strict about *what* is public and hone
 *how* it may change; independently installable packs depend on it.
 
 ## What is public
-The **locked surfaces** (root `CLAUDE.md` §5): `Operation`, `Pack`/`pack.toml`, `PipelineDef`,
+The **locked surfaces**: `Operation`, `Pack`/`pack.toml`, `PipelineDef`,
 `DataflowSpec`, `Run`, `console/openapi.json`; plus the entry-point group names, the
 storage schemas of persisted records (`PipelineRecord`, `RunEvent`, `ArtifactRecord`,
 `dataset_versions`), the `cairn` CLI verbs and exit codes, and the event topics. Each family

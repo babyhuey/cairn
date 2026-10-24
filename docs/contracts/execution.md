@@ -101,7 +101,7 @@ proof for Metaflow is `tests/core/test_training_core_golden_path.py::test_the_sa
 ## Local vs remote boundaries
 The control plane never reaches into a box for rows; a box never reaches the database.
 Remote execution moves **the image and the spec** (ADR-0104): the GPU trainer image is built
-by CI and pinned by tag (`RUNBOOK-gpu-finetune-ssh.md`), secrets reach the flow as a scoped
+by CI and pinned by tag, secrets reach the flow as a scoped
 set (ADR-0089 D3), tracking credentials are forwarded by the `run-train-remote` binding.
 Doors that refuse before a record exists: job-channel, SkyPilot, pull-worker
 (`dispatcher.py:888-911`, `pipeline_launch.py:283`).
