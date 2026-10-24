@@ -50,9 +50,17 @@ an `obs.cost_scope` without the session backstop, and a stage that made at least
 `cost_usd` is the kernel's own value when the kernel reported one, else `llm_usd`. They are
 added after the raw output check and ride the descriptor and findings like any stat
 (`<stage>_llm_usd`). The control plane settles the leg's reservation at `cost_usd` and writes
-it on the leg's `Run` (`llm_cost_usd` → `Run.cost`, `leg_hooks.flow_leg_record`, both owners);
-a failed leg, and a succeeded leg whose engine reported no cost (a GPU train stage today), records no
-`Run.cost` — unknown, never $0 (the payload still carries `llm_cost_usd`).
+it on the leg's `Run` (`llm_cost_usd` → `Run.cost.llm_usd`, `leg_hooks.flow_leg_record`, both owners).
+A leg on a priced `compute.ssh` box (ADR-0151 D5) also records its box time,
+`hourly_usd × wall-clock` per attempt, summed over the attempts, under `gpu_usd` →
+`Run.cost.gpu_usd` — on success AND on failure, timeout or cancel; it never folds into
+`llm_usd` (`src/cairn/core/dispatch/leg_hooks.py:59`). A failed leg reports no engine cost (its
+partial engine spend is unknown), and a leg with neither figure records no `Run.cost` — unknown,
+never $0 (a succeeded leg's payload still carries `llm_cost_usd`). The rate is the one recorded on
+`PipelineRecord.admission.cost_estimate` at launch, never re-read; an adopted attempt is priced
+from the persisted `run.started_at` (the start of each earlier attempt is not persisted, so after
+a restart the adopted window includes them; nothing is counted twice, because a leg's `Run.cost`
+is written once, at its end).
 
 **Descriptors and lineage.** `DataflowResult.output_artifacts` holds one descriptor per stage,
 in order (the stage-contract re-check reads it by position). Its parent is the previous stage's

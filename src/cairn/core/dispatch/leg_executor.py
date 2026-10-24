@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from cairn.core.budget_reservations import BudgetExceeded, release, reserve, settle
@@ -55,6 +56,10 @@ class LegOutcome:
     #: #1441 — what the engine reported the leg spent (``DataflowResult.cost_usd``,
     #: the runner's sum of stage ``cost_usd``); 0.0 until a leg succeeds.
     cost_usd: float = 0.0
+    #: ADR-0151 D5 — the box time of a leg on a priced target: ``hourly_usd`` ×
+    #: each attempt's wall-clock, summed over the attempts, on ANY outcome. Kept
+    #: apart from ``cost_usd`` (engine-reported, LLM) so the two never fold.
+    gpu_usd: float = 0.0
 
     @property
     def ok(self) -> bool:
@@ -188,6 +193,10 @@ async def execute_leg(
     # ADR-0118 D4 — the stage contracts this leg was admitted with, from the record
     # (`recorded_stage_contracts`); None = no record (legacy) and the spec is untouched.
     stage_contracts: Optional[dict] = None,
+    # ADR-0151 D5 — the RECORDED rate of a leg on a priced box (0 = not priced) and,
+    # for an adopted attempt, the persisted start it is priced from (`run.started_at`).
+    hourly_usd: float = 0.0,
+    adopted_started_at: Optional[str] = None,
 ) -> LegOutcome:
     """Run one ``flow:`` leg on the environment's engine.
 
@@ -199,7 +208,9 @@ async def execute_leg(
        exists to close simply reopens one tier up.
     3. **submit → poll → result** — the engine owns the loop; this owns position.
     4. **settle or release** — a failed leg that keeps its reservation leaks
-       budget until the series can run nothing at all.
+       budget until the series can run nothing at all. An attempt that cost
+       something settles it, on any outcome; one that cost nothing releases
+       (ADR-0151 D5: a priced box bills for every attempt's wall-clock).
 
     Never raises for an execution failure: a failed leg is an outcome the
     pipeline decides about, not a crash that takes the control plane with it.
@@ -351,6 +362,9 @@ async def execute_leg(
 
     out = LegOutcome(state="failed", error="leg never attempted")
     adopting = _adopt_handle(adopt)
+    #: ADR-0151 D5 — box time settled by the attempts so far; each attempt settles
+    #: only its own window, and the next one's reservation counts what came before.
+    gpu_total = 0.0
     for attempt in range(1, attempts + 1):
         # Governance invariant: EVERY attempt is admitted — the reservation is
         # taken per attempt (a retry is new spend, never free) and a budget
@@ -359,24 +373,30 @@ async def execute_leg(
         # admitted when the job was first submitted; re-attaching to it is not
         # new spend (and the reservation lived in the dead process anyway).
         reservation = None
+        # The attempt's window starts here; an adopted attempt's started in the
+        # process that submitted it, so it starts at the persisted run start.
+        attempt_started = (_wall_now() if adopting is None
+                           else _parse_started(adopted_started_at, hourly_usd, ref))
         if series_id and adopting is None:
             if spent_usd is None:
                 # #1441 — the caller could not read what earlier legs spent (an
                 # adopted leg proceeds without it); a FRESH attempt is new spend
                 # and unknown spend is never "nothing spent".
-                return LegOutcome(state="failed", error=(
+                return LegOutcome(state="failed", gpu_usd=round(gpu_total, 6), error=(
                     "budget: the spend of earlier legs is unreadable; a new attempt is not admitted"))
             try:
                 reservation = await reserve(
                     series_id, est_usd=float(estimated_usd or 0.0),
-                    spent_usd=float(spent_usd or 0.0), budget_usd=float(budget_usd or 0.0),
+                    spent_usd=float(spent_usd or 0.0) + gpu_total,
+                    budget_usd=float(budget_usd or 0.0),
                     # #1530 — stamp the run so a hold left behind by a dead
                     # process is attributable (and reapable) by run id, not just
                     # by the object this frame happens to hold.
                     run_id=str(run_id or ""),
                 )
             except BudgetExceeded as e:
-                return LegOutcome(state="failed", error=str(e))
+                # an earlier attempt's box time stays on the leg's record
+                return LegOutcome(state="failed", error=str(e), gpu_usd=round(gpu_total, 6))
 
         retriable = False
         try:
@@ -462,8 +482,11 @@ async def execute_leg(
                         out_stats=out.stats)
                 # #1441 — the hold gives way to what the leg ACTUALLY spent (the
                 # template path's rule, dispatcher.py `_close_reservations`), not the
-                # estimate it was admitted on.
-                await settle(reservation, actual_usd=out.cost_usd)
+                # estimate it was admitted on — engine-reported plus box time.
+                gpu = _box_time_usd(hourly_usd, attempt_started)
+                gpu_total += gpu
+                out.gpu_usd = round(gpu_total, 6)
+                await settle(reservation, actual_usd=out.cost_usd + gpu)
                 return out
             out = LegOutcome(
                 state=str(getattr(status, "state", "failed")), handle=handle,
@@ -477,7 +500,15 @@ async def execute_leg(
             logger.exception("leg %s failed", ref)
             out = LegOutcome(state="failed", error=f"{type(e).__name__}: {e}")
 
-        await release(reservation)
+        # ADR-0151 D5 — a failed, timed-out or cancelled attempt on a priced box
+        # still billed its wall-clock: settle it. Nothing billed → release.
+        gpu = _box_time_usd(hourly_usd, attempt_started)
+        gpu_total += gpu
+        out.gpu_usd = round(gpu_total, 6)
+        if gpu > 0:
+            await settle(reservation, actual_usd=gpu)
+        else:
+            await release(reservation)
         if not retriable or attempt >= attempts:
             return out
         if on_retry is not None:
@@ -490,6 +521,35 @@ async def execute_leg(
         await asyncio.sleep(min(delay, float(policy.maximum_interval_seconds or delay)))
         delay = delay * float(policy.backoff_coefficient or 1.0)
     return out
+
+
+def _wall_now() -> datetime:
+    """The wall clock an attempt's box time is measured on (a seam for tests)."""
+    return datetime.now(timezone.utc)
+
+
+def _parse_started(started_at: Optional[str], hourly_usd: float, ref: str) -> Optional[datetime]:
+    """The persisted start of an ADOPTED attempt; ``None`` (its box time unknown,
+    never guessed from this process's clock) when it is missing or unreadable."""
+    if not started_at:
+        if hourly_usd > 0:
+            logger.warning("leg %s: adopted on a priced box with no persisted start; "
+                           "its box time is not recorded", ref)
+        return None
+    try:
+        dt = datetime.fromisoformat(str(started_at))
+    except ValueError:
+        logger.warning("leg %s: unreadable started_at %r; box time not recorded", ref, started_at)
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _box_time_usd(hourly_usd: float, started: Optional[datetime]) -> float:
+    """ADR-0151 D5 — ``hourly_usd`` × the attempt's wall-clock (0 when not priced)."""
+    if not hourly_usd or hourly_usd <= 0 or started is None:
+        return 0.0
+    seconds = max(0.0, (_wall_now() - started).total_seconds())
+    return round(float(hourly_usd) * seconds / 3600.0, 6)
 
 
 def _reported_cost(result: Any) -> float:

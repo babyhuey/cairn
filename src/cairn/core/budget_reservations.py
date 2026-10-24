@@ -416,7 +416,9 @@ async def reserve(series_id: str, *, est_usd: float, spent_usd: float,
 
 
 async def release(reservation: Optional[Reservation]) -> None:
-    """Free a reservation whose run failed or was cancelled — no spend occurred.
+    """Free a reservation whose run failed or was cancelled with nothing billed —
+    no spend occurred. A flow leg on a priced box always billed its wall-clock, so
+    it settles instead, on every outcome (ADR-0151 D5).
 
     Idempotent: terminal handling can fire more than once (the completion path
     and the reconciler both see the same run), and a double release must not
@@ -429,7 +431,8 @@ async def release(reservation: Optional[Reservation]) -> None:
 
 async def settle(reservation: Optional[Reservation],
                  actual_usd: float = 0.0) -> None:
-    """Close a reservation whose run SUCCEEDED.
+    """Close a reservation whose run SUCCEEDED — or, for a flow leg on a priced
+    box, whose attempt ended in any state with box time to record (ADR-0151 D5).
 
     The hold stops counting: the actual cost is now recorded as spend in the
     ledger, so holding the estimate as well would double-count it. Under the

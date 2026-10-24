@@ -60,27 +60,189 @@ def flow_leg_record(step_output: Any, outcome: Any) -> dict:
     """The terminal ``result_payloads`` + ``cost`` of a flow leg's ``Run`` — ONE
     shape for both owners (#1441).
 
-    A succeeded leg's cost is what its engine REPORTED (``LegOutcome.cost_usd`` ←
-    ``DataflowResult.cost_usd``), carried under the explicit ``llm_cost_usd`` key
+    A succeeded leg's engine cost is what its engine REPORTED (``LegOutcome.cost_usd``
+    ← ``DataflowResult.cost_usd``), carried under the explicit ``llm_cost_usd`` key
     ``_aggregate_cost`` reads; it is never scanned out of the leg's stats or
-    findings. A failed leg writes no cost: its partial spend is unknown, not $0 —
-    and neither does a leg whose engine reported none (a GPU train stage today):
-    an explicit $0 would read as "free".
+    findings. A failed leg reports no engine cost: its partial engine spend is
+    unknown, not $0.
+
+    ADR-0151 D5 — a leg on a priced box also carries its box time
+    (``LegOutcome.gpu_usd``: ``hourly_usd`` × each attempt's wall-clock), under
+    ``gpu_usd``, on success AND on failure: the box billed either way. A leg with
+    neither figure writes no cost — an explicit $0 would read as "free".
     """
     payload: dict[str, Any] = {
         "output": step_output,
         "stats": dict(getattr(outcome, "stats", None) or {}),
         "metrics": dict(getattr(outcome, "metrics", None) or {}),
     }
-    if not getattr(outcome, "ok", False):
+    gpu = round(float(getattr(outcome, "gpu_usd", 0.0) or 0.0), 6)
+    llm = 0.0
+    if getattr(outcome, "ok", False):
+        llm = payload["llm_cost_usd"] = round(float(getattr(outcome, "cost_usd", 0.0) or 0.0), 6)
+    if gpu > 0:
+        payload["gpu_usd"] = gpu
+    if llm <= 0 and gpu <= 0:
         return {"result_payloads": [payload]}
     from cairn.core.dispatch.dispatcher import _aggregate_cost  # noqa: PLC0415 — cycle: dispatcher → bridge → here
 
-    payload["llm_cost_usd"] = round(float(getattr(outcome, "cost_usd", 0.0) or 0.0), 6)
-    if payload["llm_cost_usd"] <= 0:
-        return {"result_payloads": [payload]}
     return {"result_payloads": [payload],
-            "cost": _aggregate_cost([{"llm_cost_usd": payload["llm_cost_usd"]}])}
+            "cost": _aggregate_cost([{"llm_cost_usd": llm, "gpu_usd": gpu}])}
+
+
+# ── ADR-0151 D1–D4: a leg on a priced compute.ssh box ──────────────────────
+
+#: The connection kind whose ``hourly_usd`` prices a leg (D1).
+PRICED_TARGET_KIND = "compute.ssh"
+#: Where the launch door records the estimate: one sub-dict of
+#: ``PipelineRecord.admission`` (D2), never a column.
+COST_ESTIMATE_KEY = "cost_estimate"
+NOT_PRICED = "not priced"
+
+
+def compute_target_for_kind(kind: str) -> str:
+    """The compute TARGET a flow of ``kind`` dispatches to — the same selection
+    ``resolve_engine`` reads (``ml_target`` for ``kind: ml``, ``dataflow_target``
+    otherwise) through the one config plane. ``""`` = no target (the local
+    builtin engine). Shared by the bridge (``_leg_target``) and the launch door,
+    so the leg that is priced is the leg that runs there."""
+    try:
+        from cairn.core.backend_selection import selected  # noqa: PLC0415 - cycle: selection → profile → pack
+
+        key = "ml_target" if kind == "ml" else "dataflow_target"
+        return str(selected(key, default="") or "").strip()
+    except Exception:  # noqa: BLE001 — an unreadable selection means "no target"
+        logger.debug("could not resolve the compute target for kind %r", kind, exc_info=True)
+        return ""
+
+
+async def price_flow_leg(target: str, timeout_s: Optional[float], *,
+                         store: Any = None) -> Optional[dict]:
+    """ADR-0151 D1 — the price of one flow leg on ``target``: ``hourly_usd ×
+    timeout``, read from the target's connection config core-to-core (the way
+    ``target_cap`` reads ``max_in_flight``; no secret is resolved).
+
+    ``None`` when the leg has no target. Otherwise a record entry:
+    ``{"priced": True, "connection", "hourly_usd", "hours", "estimate_usd", "basis"}``
+    — ``hours``/``estimate_usd`` are ``None`` for a priced leg with no timeout,
+    which the launch door refuses (D3) — or ``{"priced": False, "connection",
+    "basis": "not priced: …"}`` for a target with no ``hourly_usd``: never $0."""
+    name = str(target or "").strip()
+    if not name:
+        return None
+    try:
+        from cairn.core.connections import (  # noqa: PLC0415 - cycle: connections → secrets stack
+            default_connection_store, lookup_account, run_account,
+        )
+
+        account = lookup_account(await run_account())
+        owned = store is None
+        store = store or default_connection_store()
+        try:
+            conn = await store.get_by_name(name, account_id=account)
+        finally:
+            close = getattr(store, "close", None)
+            if owned and callable(close):
+                close()
+    except Exception as e:  # noqa: BLE001 — unreadable is "not priced", said so, never $0
+        logger.warning("target %r: connection unreadable, leg not priced", name, exc_info=True)
+        return {"priced": False, "connection": name,
+                "basis": f"{NOT_PRICED}: connection {name!r} could not be read ({type(e).__name__})"}
+    if conn is None or str(getattr(conn, "kind", "")) != PRICED_TARGET_KIND:
+        why = "is not a registered connection" if conn is None else f"is kind {conn.kind!r}"
+        return {"priced": False, "connection": name, "basis": f"{NOT_PRICED}: {name!r} {why}"}
+    from cairn.core.compute_lifecycle import ComputeBox  # noqa: PLC0415 — core→core, off the hot path
+
+    hourly = ComputeBox(name, dict(getattr(conn, "config", None) or {})).hourly_usd
+    if not hourly or hourly <= 0:
+        return {"priced": False, "connection": name,
+                "basis": f"{NOT_PRICED}: connection {name!r} sets no hourly_usd"}
+    if not timeout_s or float(timeout_s) <= 0:
+        return {"priced": True, "connection": name, "hourly_usd": hourly, "hours": None,
+                "estimate_usd": None, "basis": f"${hourly:g}/h on {name}, no timeout declared"}
+    hours = float(timeout_s) / 3600.0
+    est = round(hourly * hours, 6)
+    return {"priced": True, "connection": name, "hourly_usd": hourly, "hours": round(hours, 6),
+            "estimate_usd": est, "basis": f"${hourly:g}/h × {hours:g}h on {name} = ${est:.2f}"}
+
+
+async def price_plan(plan: Any, *, store: Any = None) -> dict:
+    """The launch door's estimate (D2): every flow leg with a compute target,
+    priced by :func:`price_flow_leg`, in plan order. ``{}`` when no leg has a
+    target, so a pipeline with no box records exactly what it recorded before."""
+    from cairn.core.dispatch.leg_executor import flow_kind_of, leg_kind_of  # noqa: PLC0415 - cycle: executor → storage → here
+
+    legs: list[dict] = []
+    for s in getattr(plan, "steps", None) or []:
+        if leg_kind_of(getattr(s, "ref", "")) != "flow":
+            continue
+        price = await price_flow_leg(compute_target_for_kind(flow_kind_of(s.ref)),
+                                     getattr(s, "timeout_s", None), store=store)
+        if price is not None:
+            legs.append({"step": s.id, **price})
+    if not legs:
+        return {}
+    total = sum(float(e.get("estimate_usd") or 0.0) for e in legs if e.get("priced"))
+    return {"estimate_usd": round(total, 6), "legs": legs}
+
+
+def _declared(rec: Any, step_id: str) -> str:
+    from cairn.core.engine.pipeline_loop import declared_step_id  # noqa: PLC0415 — engine helper, lazy like its siblings
+
+    return declared_step_id(step_id, getattr(getattr(rec, "plan", None), "loops", None) or {})
+
+
+def recorded_cost_estimate(rec: Any) -> dict:
+    """The estimate the launch door recorded on ``rec.admission`` (``{}`` for a
+    record written before ADR-0151, or a pipeline with no target)."""
+    est = (getattr(rec, "admission", None) or {}).get(COST_ESTIMATE_KEY)
+    return dict(est) if isinstance(est, dict) else {}
+
+
+def recorded_leg_price(rec: Any, step_id: str) -> Optional[dict]:
+    """This leg's entry in the recorded estimate — read, never re-derived (D2)."""
+    want = {step_id, _declared(rec, step_id)}
+    for e in recorded_cost_estimate(rec).get("legs") or []:
+        if isinstance(e, dict) and e.get("step") in want:
+            return dict(e)
+    return None
+
+
+def leg_price_kwargs(rec: Any, step_id: str, run: Any) -> dict:
+    """What a flow leg reserves and settles with — the SAME call from both owners.
+
+    A leg the launch door priced reserves the RECORDED estimate and settles its box
+    time at the recorded ``hourly_usd`` (D2, D5); an adopted attempt starts from the
+    persisted ``run.started_at``. Any other leg keeps the pipeline-wide
+    ``governance.estimated_usd`` it reserved before."""
+    price = recorded_leg_price(rec, step_id)
+    if price and price.get("priced") and price.get("estimate_usd") is not None:
+        return {"estimated_usd": float(price["estimate_usd"]),
+                "hourly_usd": float(price.get("hourly_usd") or 0.0),
+                "adopted_started_at": getattr(run, "started_at", None)}
+    gov = getattr(rec, "governance", None) or {}
+    return {"estimated_usd": float(gov.get("estimated_usd", 0.0) or 0.0)}
+
+
+def estimate_evidence(rec: Any, step_id: str) -> dict:
+    """D4 — the gate evidence for the approval at ``step_id``: ``estimate_usd`` (the
+    sum of the priced legs) and ``estimate_basis`` (each leg's rate × hours, or "not
+    priced"), on every gate that comes before the first priced leg in plan order (the
+    first leg with a target when none is priced). ``{}`` for any other gate."""
+    est = recorded_cost_estimate(rec)
+    legs = [e for e in est.get("legs") or [] if isinstance(e, dict)]
+    order = [s.id for s in getattr(getattr(rec, "plan", None), "steps", None) or []]
+    gate = _declared(rec, step_id)
+    if not legs or gate not in order:
+        return {}
+    priced = [e for e in legs if e.get("priced")]
+    anchor = [order.index(e["step"]) for e in (priced or legs) if e.get("step") in order]
+    if not anchor or order.index(gate) > min(anchor):
+        return {}
+    out: dict[str, Any] = {"estimate_basis": "; ".join(f"{e['step']}: {e.get('basis', '')}" for e in legs)}
+    if priced:
+        out["estimate_usd"] = float(est.get("estimate_usd") or 0.0)
+    return out
 
 
 async def pipeline_spent_usd(rec: Any, run_store: Any, *, exclude_step: str = "") -> float:
@@ -319,4 +481,6 @@ class FlowLegHooks:
         }
 
 
-__all__ = ["FlowLegHooks", "publish_pipeline_audit"]
+__all__ = ["COST_ESTIMATE_KEY", "FlowLegHooks", "NOT_PRICED", "PRICED_TARGET_KIND",
+           "compute_target_for_kind", "estimate_evidence", "leg_price_kwargs", "price_flow_leg",
+           "price_plan", "publish_pipeline_audit", "recorded_cost_estimate", "recorded_leg_price"]
