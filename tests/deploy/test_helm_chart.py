@@ -402,9 +402,9 @@ def test_pull_worker_without_a_command_is_refused():
 
 @needs_helm
 def test_pull_worker_reads_its_token_from_its_own_secret():
-    """The worker gets CAIRN_ENGINE_TOKEN from a Secret of its own and nothing from
-    the control plane's Secret: no JWT secret, admin hash, database password, model
-    key or SSH key."""
+    """The worker gets CAIRN_ENGINE_TOKEN from a Secret of its own and no longer reads
+    the control plane's Secret. (It still reads the shared ConfigMap, which carries
+    the database DSN and the OTEL headers; this test checks the Secret keys only.)"""
     docs = render("values-postgres.example.yaml", sets={**_PULL, "pullWorker.token": "wp-token"})
     dep = _by_name(docs, "Deployment", "-pull-worker")
     secret = _by_name(docs, "Secret", "-pull-worker")
@@ -452,15 +452,94 @@ def test_pull_worker_token_must_not_be_the_jwt_secret():
     assert "JWT secret" in err, err
 
 
-def test_deploy_doctor_refuses_a_pull_worker_without_its_own_token():
+@needs_helm
+def test_pull_worker_token_is_trimmed():
+    docs = render("values-postgres.example.yaml", sets={**_PULL, "pullWorker.token": " wp-token "})
+    assert _by_name(docs, "Secret", "-pull-worker")["stringData"] == {"CAIRN_ENGINE_TOKEN": "wp-token"}
+
+
+@needs_helm
+@pytest.mark.parametrize("blank", ["   ", "\n", " \t\n "])
+def test_a_whitespace_only_token_is_refused(blank):
+    err = _render_error_with_file({**_PULL_VALUES, "token": blank})
+    assert "needs the worker's own token" in err, err
+
+
+@needs_helm
+def test_a_jwt_secret_with_surrounding_whitespace_is_still_refused():
+    jwt = yaml.safe_load(_values("values-postgres.example.yaml").read_text())["secrets"]["obsJwtSecret"]
+    err = _render_error_with_file({**_PULL_VALUES, "token": f"  {jwt}\n"})
+    assert "JWT secret" in err, err
+
+
+@needs_helm
+def test_a_non_string_token_is_refused():
+    err = render_error("values-postgres.example.yaml", sets={**_PULL, "pullWorker.token": "12345"})
+    assert "must be a string" in err and "--set-string" in err, err
+
+
+@needs_helm
+def test_a_token_change_rolls_the_worker():
+    def checksum(tok: str) -> str:
+        docs = render("values-postgres.example.yaml", sets={**_PULL, "pullWorker.token": tok})
+        dep = _by_name(docs, "Deployment", "-pull-worker")
+        return dep["spec"]["template"]["metadata"]["annotations"]["checksum/token"]
+
+    assert checksum("wp-a") != checksum("wp-b")
+    assert checksum("wp-a") == checksum(" wp-a ")          # trimmed before hashing
+    docs = render("values-postgres.example.yaml", sets={**_PULL, "pullWorker.existingSecret": "pool"})
+    dep = _by_name(docs, "Deployment", "-pull-worker")
+    assert "checksum/token" not in dep["spec"]["template"]["metadata"]["annotations"]
+
+
+@needs_helm
+def test_an_existing_secret_equal_to_a_custom_control_plane_secret_is_refused():
+    err = render_error("values-postgres.example.yaml", sets={
+        **_PULL, "secrets.existingSecret": "my-control-plane",
+        "pullWorker.existingSecret": "my-control-plane"})
+    assert "the control plane's Secret" in err, err
+
+
+_PULL_VALUES = {"enabled": True, "command": ["cairn", "worker", "--pull"]}
+
+
+def _render_error_with_file(pull: dict) -> str:
+    """A values file, so whitespace and newlines reach the chart verbatim."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        yaml.safe_dump({"pullWorker": pull}, f)
+    cmd = [HELM, "template", "cairn", str(CHART), "-f", str(_values("values-postgres.example.yaml")),
+           "-f", f.name]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    assert proc.returncode != 0, f"expected helm template to fail:\n{proc.stdout[:2000]}"
+    return proc.stderr
+
+
+def _doctor(pull: dict, **top) -> dict[str, str]:
     from cairn.core.deploy_check import check_values
 
     values = yaml.safe_load(_values("values-postgres.example.yaml").read_text())
-    values["pullWorker"] = {"enabled": True, "command": ["cairn", "worker", "--pull"]}
-    names = {r.name: r.status for r in check_values(values)}
-    assert names.get("pull_worker_token") == "fail"
-    values["pullWorker"]["token"] = "wp-token"
-    assert "pull_worker_token" not in {r.name for r in check_values(values)}
+    values["pullWorker"] = {"enabled": True, "command": ["cairn", "worker", "--pull"], **pull}
+    for k, v in top.items():
+        values[k] = v
+    return {r.name: r.status for r in check_values(values) if r.name == "pull_worker_token"}
+
+
+def test_deploy_doctor_matches_the_four_chart_refusals():
+    jwt = yaml.safe_load(_values("values-postgres.example.yaml").read_text())["secrets"]["obsJwtSecret"]
+    assert _doctor({}) == {"pull_worker_token": "fail"}                       # no token
+    assert _doctor({"token": "  \n"}) == {"pull_worker_token": "fail"}       # whitespace only
+    assert _doctor({"token": "a", "existingSecret": "b"}) == {"pull_worker_token": "fail"}
+    assert _doctor({"token": f" {jwt} "}) == {"pull_worker_token": "fail"}     # the JWT secret
+    assert _doctor({"token": 12345}) == {"pull_worker_token": "fail"}          # not a string
+    cp = {"existingSecret": "my-control-plane", "obsJwtSecret": jwt}
+    assert _doctor({"existingSecret": "my-control-plane"}, secrets=cp) == {"pull_worker_token": "fail"}
+    assert _doctor({"existingSecret": "x-cairn-secrets"}, fullnameOverride="x-cairn") == {
+        "pull_worker_token": "fail"}
+    assert _doctor({"existingSecret": "rel-cairn-secrets"}) == {"pull_worker_token": "warn"}
+    assert _doctor({"token": "wp-token"}) == {}
+    assert _doctor({"existingSecret": "pool-gpu"}) == {}
 
 
 # ── the compose profiles are mirrored, not invented ──────────────────────

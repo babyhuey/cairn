@@ -576,6 +576,47 @@ def env_from_values(values: dict) -> dict[str, str]:
     return env
 
 
+def _pull_worker_token_checks(values: dict) -> list[CheckResult]:
+    """The chart's four pull-worker token refusals (_helpers.tpl), before a render.
+
+    The release name is a `helm install` argument, so the control plane's Secret is
+    known here only when `secrets.existingSecret` or `fullnameOverride` names it; a
+    pull-worker Secret that merely looks like the chart's default name is a warning."""
+    def fail(msg: str) -> CheckResult:
+        return CheckResult("pull_worker_token", "fail", msg, category="secrets")
+
+    raw = _get(values, "pullWorker", "token", default="")
+    if raw and not isinstance(raw, str):
+        return [fail(f"pullWorker.token must be a string, not {type(raw).__name__} — quote it.")]
+    token = (raw or "").strip()
+    existing = str(_get(values, "pullWorker", "existingSecret", default="") or "").strip()
+    if token and existing:
+        return [fail("pullWorker.token AND pullWorker.existingSecret are both set — pick one.")]
+    if not token and not existing:
+        return [fail("pullWorker.enabled=true but neither pullWorker.token nor "
+                     "pullWorker.existingSecret is set (a whitespace-only token counts as "
+                     "unset) — the pull worker reads a worker-pool token (`cairn remote "
+                     "worker-token --name <pool>`) from a Secret of its own.")]
+    jwt = str(_get(values, "secrets", "obsJwtSecret", default="") or "").strip()
+    if token and jwt and token == jwt:
+        return [fail("pullWorker.token equals secrets.obsJwtSecret — the worker must never "
+                     "hold the control plane's JWT secret.")]
+    if existing:
+        cp = str(_get(values, "secrets", "existingSecret", default="") or "").strip()
+        override = str(_get(values, "fullnameOverride", default="") or "").strip()
+        known = {n for n in (cp, f"{override}-secrets" if override and not cp else "") if n}
+        if existing in known:
+            return [fail(f"pullWorker.existingSecret is {existing!r}, the control plane's "
+                         "Secret — give the worker a Secret of its own.")]
+        if not cp and existing.endswith("-secrets"):
+            return [CheckResult(
+                "pull_worker_token", "warn",
+                f"pullWorker.existingSecret {existing!r} looks like the chart's control-plane "
+                "Secret name (<release>-secrets); the chart refuses it if it is.",
+                category="secrets")]
+    return []
+
+
 def check_values(values: dict, strict: bool = False) -> list[CheckResult]:
     """The chart-only rules — everything else comes from ``check_deploy``."""
     out: list[CheckResult] = []
@@ -637,14 +678,8 @@ def check_values(values: dict, strict: bool = False) -> list[CheckResult]:
             "pullWorker.enabled=true but pullWorker.command is empty — the chart does not "
             "hard-code D2's command (#565); supply it explicitly.",
             category="runtime"))
-    if _get(values, "pullWorker", "enabled") and not (
-            _get(values, "pullWorker", "token") or _get(values, "pullWorker", "existingSecret")):
-        out.append(CheckResult(
-            "pull_worker_token", "fail",
-            "pullWorker.enabled=true but neither pullWorker.token nor pullWorker.existingSecret "
-            "is set — the pull worker reads a worker-pool token (`cairn remote worker-token "
-            "--name <pool>`) from a Secret of its own, never the control plane's.",
-            category="secrets"))
+    if _get(values, "pullWorker", "enabled"):
+        out.extend(_pull_worker_token_checks(values))
 
     # ── ingress ──────────────────────────────────────────────────────────
     if _get(values, "ingress", "enabled", default=True):

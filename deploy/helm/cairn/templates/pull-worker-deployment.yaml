@@ -8,11 +8,12 @@ access.
 empty one), e.g. ["cairn", "worker", "--pull", "--engine-url", "https://<host>"].
 With auth on, claiming needs a worker-pool token (`cairn remote worker-token
 --name <pool>`) in CAIRN_ENGINE_TOKEN. The worker reads it from a Secret of its
-OWN (pullWorker.token, rendered below, or pullWorker.existingSecret), never from
-the control plane's Secret: the worker gets no JWT secret, admin password hash,
-database password, model key or SSH key. It still reads the shared ConfigMap.
+OWN (pullWorker.token, rendered below, or pullWorker.existingSecret) and no longer
+reads the control plane's Secret. It still reads the shared ConfigMap, which
+carries the database DSN (with its password, for the bundled Postgres), the OTEL
+headers and env.extra, and it runs under the release's ServiceAccount.
 */}}
-{{- if not .Values.pullWorker.existingSecret }}
+{{- if not (trim (toString (default "" .Values.pullWorker.existingSecret))) }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -23,7 +24,7 @@ metadata:
 type: Opaque
 stringData:
   # A worker-pool token: it may claim and report pull-lane jobs, nothing else.
-  CAIRN_ENGINE_TOKEN: {{ .Values.pullWorker.token | quote }}
+  CAIRN_ENGINE_TOKEN: {{ include "cairn.pullWorkerToken" . | quote }}
 ---
 {{- end }}
 apiVersion: apps/v1
@@ -46,9 +47,9 @@ spec:
         app.kubernetes.io/component: pull-worker
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        {{- if not .Values.pullWorker.existingSecret }}
-        # a rotated token restarts the worker
-        checksum/token: {{ .Values.pullWorker.token | sha256sum }}
+        {{- if not (trim (toString (default "" .Values.pullWorker.existingSecret))) }}
+        # a rotated pullWorker.token restarts the worker (an existingSecret's does not)
+        checksum/token: {{ include "cairn.pullWorkerToken" . | sha256sum }}
         {{- end }}
     spec:
       serviceAccountName: {{ include "cairn.serviceAccountName" . }}

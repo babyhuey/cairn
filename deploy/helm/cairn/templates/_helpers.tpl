@@ -68,11 +68,23 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 
 {{/* The pull worker's OWN Secret (CAIRN_ENGINE_TOKEN), never the control plane's. */}}
 {{- define "cairn.pullWorkerSecretName" -}}
-{{- if .Values.pullWorker.existingSecret -}}
-{{- .Values.pullWorker.existingSecret -}}
+{{- if trim (toString (default "" .Values.pullWorker.existingSecret)) -}}
+{{- trim (toString .Values.pullWorker.existingSecret) -}}
 {{- else -}}
 {{- printf "%s-pull-worker" (include "cairn.fullname" .) -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+pullWorker.token, trimmed. A non-string value (an unquoted `--set
+pullWorker.token=123`) refuses to render: a token must arrive as text.
+*/}}
+{{- define "cairn.pullWorkerToken" -}}
+{{- $tok := .Values.pullWorker.token -}}
+{{- if and $tok (not (kindIs "string" $tok)) -}}
+{{- fail (printf "pullWorker.token must be a string, not %s — quote it, or pass it with --set-string pullWorker.token=…" (kindOf $tok)) -}}
+{{- end -}}
+{{- trim (toString (default "" $tok)) -}}
 {{- end -}}
 
 {{/* The pull worker's envFrom: the shared ConfigMap, then its own Secret (it wins). */}}
@@ -214,15 +226,17 @@ deployment that has actually gone wrong somewhere, on compose or on a box.
 {{- end -}}
 {{- /* Its token comes from a Secret of its own, never the control plane's. */ -}}
 {{- if .Values.pullWorker.enabled -}}
-{{- if and .Values.pullWorker.token .Values.pullWorker.existingSecret -}}
+{{- $tok := include "cairn.pullWorkerToken" . -}}
+{{- $existing := trim (toString (default "" .Values.pullWorker.existingSecret)) -}}
+{{- if and $tok $existing -}}
 {{- fail "pullWorker.token AND pullWorker.existingSecret are both set — pick one: the chart renders a Secret from pullWorker.token only when pullWorker.existingSecret is empty." -}}
 {{- end -}}
-{{- $_ := required "pullWorker.enabled=true needs the worker's own token: set pullWorker.token to a worker-pool token (`cairn remote worker-token --name <pool>`), or pullWorker.existingSecret to a Secret with the key CAIRN_ENGINE_TOKEN. The pull worker never reads the control plane's Secret." (.Values.pullWorker.token | default .Values.pullWorker.existingSecret) -}}
-{{- if and .Values.pullWorker.token (eq .Values.pullWorker.token (toString .Values.secrets.obsJwtSecret)) -}}
+{{- $_ := required "pullWorker.enabled=true needs the worker's own token: set pullWorker.token to a worker-pool token (`cairn remote worker-token --name <pool>`), or pullWorker.existingSecret to a Secret with the key CAIRN_ENGINE_TOKEN. A token that is empty or only whitespace counts as unset. The pull worker never reads the control plane's Secret." ($tok | default $existing) -}}
+{{- if and $tok (eq $tok (trim (toString (default "" .Values.secrets.obsJwtSecret)))) -}}
 {{- fail "pullWorker.token equals secrets.obsJwtSecret — the worker must never hold the control plane's JWT secret. Mint a worker-pool token with `cairn remote worker-token --name <pool>`." -}}
 {{- end -}}
-{{- if eq (toString .Values.pullWorker.existingSecret) (include "cairn.secretName" .) -}}
-{{- fail (printf "pullWorker.existingSecret is %q, the control plane's Secret — the pull worker must not receive the JWT secret or the admin password hash. Give it a Secret of its own holding only CAIRN_ENGINE_TOKEN." .Values.pullWorker.existingSecret) -}}
+{{- if and $existing (eq $existing (include "cairn.secretName" .)) -}}
+{{- fail (printf "pullWorker.existingSecret is %q, the control plane's Secret — the pull worker must not receive the JWT secret or the admin password hash. Give it a Secret of its own holding only CAIRN_ENGINE_TOKEN." $existing) -}}
 {{- end -}}
 {{- end -}}
 

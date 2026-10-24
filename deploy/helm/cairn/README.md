@@ -130,14 +130,27 @@ signed-in user's token gets `403` on `/jobs/claim`.
 The worker reads that token from a **Secret of its own**: `pullWorker.token` is
 rendered into `<release>-pull-worker`, or `pullWorker.existingSecret` names a
 Secret you manage holding the key `CAIRN_ENGINE_TOKEN` (plus anything the
-worker's jobs need). The worker does **not** read the control plane's Secret, so
-it never holds `CAIRN_JWT_SECRET`, `CAIRN_API_PASSWORD_HASH`, the database
-password, the model key or the SSH key. It still reads the shared ConfigMap.
+worker's jobs need). The worker no longer reads the control plane's Secret
+(`CAIRN_JWT_SECRET`, `CAIRN_API_PASSWORD_HASH`, `POSTGRES_PASSWORD`, the model
+key, the SSH key).
 
-Rendering refuses an enabled worker with neither value, with both, with
-`existingSecret` set to the control plane's Secret, or with a token equal to
-`secrets.obsJwtSecret`. `cairn deploy doctor --values` reports the missing-token
-case too.
+It still reads the **shared ConfigMap**, which carries the database DSN family
+(`CAIRN_STORAGE` / `CAIRN_CHECKPOINTER_DSN` / `CAIRN_DBOS_DSN` and their `OBS_`
+twins; with the bundled Postgres the DSN includes `postgres.password`),
+`OTEL_EXPORTER_OTLP_HEADERS` and `env.extra`, and it runs under the release's
+ServiceAccount. Treat the pull worker's pod as able to read those.
+
+The token is trimmed. Rendering refuses an enabled worker with no token (empty
+or whitespace only) and no `existingSecret`, with both, with `existingSecret`
+set to the control plane's Secret, with a token equal to `secrets.obsJwtSecret`,
+or with a token that is not a string (use `--set-string`). `cairn deploy doctor
+--values` reports the same cases.
+
+Changing `pullWorker.token` rolls the worker (`checksum/token`). Rotating the
+token inside a Secret you manage (`existingSecret`) does not; restart the worker
+(`kubectl rollout restart deployment/<release>-pull-worker`). A Secret you
+already have named `<release>-pull-worker` collides with the one the chart
+renders from `pullWorker.token`; use `existingSecret` for it instead.
 
 ### Postgres connection assumptions (in-process leg liveness)
 
