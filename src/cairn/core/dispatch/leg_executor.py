@@ -547,10 +547,19 @@ async def register_leg_descriptors(descriptors: list, artifact_store, *, run_id:
     a descriptor is a model (`candidate_artifact_id`, C6/I14) so evaluation,
     registration and serving key on an id, never on a URI. Flow legs call it
     from :func:`execute_leg`; a task leg whose operator returns descriptors
-    registers through the same function (#1488, wiring per producer)."""
+    registers through the same function (#1488, wiring per producer).
+
+    Everything lands in the run's workspace, scoped from its record (ADR-0148):
+    URI parents resolve among that workspace's artifacts and the workspace owns
+    what is registered. With auth on and no workspace in scope it is refused
+    before anything registers."""
+    from cairn.core.workspace import scoped_workspace  # noqa: PLC0415 — off the hot import path
+
     _check_stage_roles(descriptors)
-    await _resolve_uri_parents(descriptors, artifact_store)
-    ids = [await artifact_store.register(d, producer_run_id=run_id, producer_job=producer_job)
+    ws = scoped_workspace()
+    await _resolve_uri_parents(descriptors, artifact_store, workspace_id=ws)
+    ids = [await artifact_store.register(d, producer_run_id=run_id, producer_job=producer_job,
+                                         workspace_id=ws)
            for d in descriptors]
     out_stats["artifact_ids"] = ids
     out_stats["artifact_uris"] = [str(getattr(d, "uri", "")) for d in descriptors]
@@ -657,12 +666,14 @@ async def _stamp_intake_verdict(artifact_store, name: str, version: int, flow_st
         flow_stats.setdefault("intake_verdicts", []).append(f"{name}@{version}={verdict.verdict}")
 
 
-async def _resolve_uri_parents(descriptors: list, artifact_store) -> None:
+async def _resolve_uri_parents(descriptors: list, artifact_store, *,
+                               workspace_id: Optional[str] = None) -> None:
     """#1432 — a descriptor's parent given as a URI (an upstream leg's export,
     e.g. ``s3://…/train-ready.jsonl``) becomes that artifact's REGISTRY ID when
-    the registry knows the URI, so the lineage DAG walks across legs. Unknown
-    URIs (external inputs) stay as recorded. Best effort: a lookup failure
-    never fails the leg."""
+    the registry knows the URI among ``workspace_id``'s artifacts (else the one
+    in scope), so the lineage DAG walks across legs. Unknown URIs (external
+    inputs, or another workspace's) stay as recorded. Best effort: a lookup
+    failure never fails the leg."""
     find = getattr(artifact_store, "find_by_uri", None)
     if find is None:
         return
@@ -674,7 +685,7 @@ async def _resolve_uri_parents(descriptors: list, artifact_store) -> None:
         for p in parents:
             if "://" in p:
                 try:
-                    hit = await find(p)
+                    hit = await find(p, workspace_id=workspace_id)
                 except Exception:  # noqa: BLE001 — lineage is best effort
                     hit = None
                 resolved.append(hit or p)

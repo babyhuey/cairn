@@ -218,8 +218,13 @@ class FlowLegHooks:
             src = await self._pull_remote_checkpoints()
             if src is None:
                 return
+        # owned by the workspace the leg's run record names (ADR-0148), read once
+        # per leg; an unreadable record leaves it to the workspace in scope
+        if getattr(self, "_relay_workspace", None) is None:
+            self._relay_workspace = await self._run_workspace(self.run_id)
         try:
-            new = await relay_local_checkpoints(src, run_id=self.run_id, store=self.artifact_store)
+            new = await relay_local_checkpoints(src, run_id=self.run_id, store=self.artifact_store,
+                                                workspace_id=self._relay_workspace)
         except Exception:  # noqa: BLE001 — relay must never disturb the leg
             logger.debug("checkpoint relay failed for %s", self.run_id, exc_info=True)
             return

@@ -1102,8 +1102,14 @@ async def check_artifact_bytes() -> list[CheckResult]:
         return [CheckResult("artifact_bytes", "warn",
                             "no artifact registry configured (CAIRN_STORAGE unset) — nothing to check",
                             category="store")]
+    # The registry answers per workspace (ADR-0148); the CLI checks the process's
+    # own workspace (CAIRN_WORKSPACE, else `default`), which owns every artifact
+    # registered before workspace scoping.
+    from cairn.core.workspace import current_workspace  # noqa: PLC0415 - CLI startup latency
+
+    ws = current_workspace()
     try:
-        health = await registry_health(store)
+        health = await registry_health(store, workspace_id=ws)
     except Exception as e:  # noqa: BLE001 - a doctor probe reports, it never crashes
         return [backend, CheckResult("artifact_registry_bytes", "warn",
                                      f"could not read the artifact registry: {e}", category="store")]
@@ -1115,11 +1121,11 @@ async def check_artifact_bytes() -> list[CheckResult]:
 
     if health["dangling"]:
         names = ", ".join(f"{a['id'][:12]} ({a['uri']})" for a in health["dangling_sample"])
-        detail = (f"{health['dangling']} dangling of {health['total']} registered "
+        detail = (f"{health['dangling']} dangling of {health['total']} registered in workspace {ws!r} "
                   f"({health['durable']} durable, {health['local']} local-only) — first: {names}")
         status = "warn"
     else:
-        detail = (f"{health['total']} registered artifacts resolve "
+        detail = (f"{health['total']} registered artifacts in workspace {ws!r} resolve "
                   f"({health['durable']} durable, {health['local']} local-only)")
         status = "ok"
     return [backend, CheckResult("artifact_registry_bytes", status, detail, category="store")]

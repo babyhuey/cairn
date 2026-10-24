@@ -58,10 +58,12 @@ async def relay_local_checkpoints(
     run_id: str,
     store: ArtifactStore,
     dest_root: Optional[Path] = None,
+    workspace_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Relay every not-yet-relayed checkpoint under ``workdir`` (H6b, local
     form): copy ``checkpoints/stage-NN/`` to the durable root and register a
-    descriptor. Idempotent per (run, stage) — safe on every heartbeat tick.
+    descriptor, owned by ``workspace_id`` (else the workspace in scope; ADR-0148).
+    Idempotent per (run, stage) — safe on every heartbeat tick.
     Best-effort by contract: relay failure must never disturb the leg.
     """
     out: list[dict[str, Any]] = []
@@ -99,6 +101,7 @@ async def relay_local_checkpoints(
                 ),
                 producer_run_id=run_id,
                 producer_job="checkpoint-relay",
+                workspace_id=workspace_id,
             )
             manifest["_relayed_uri"] = f"file://{dest}"
             out.append(manifest)
@@ -121,9 +124,11 @@ async def find_resume_checkpoint(
     relayed it) is that workspace. The spec key is a hash of the spec, so two
     workspaces running the same spec share it; without this a leg could resume
     from another workspace's bytes. A producer run that cannot be read does not
-    count — the leg starts fresh instead."""
+    count — the leg starts fresh instead. The registry read itself is in
+    ``workspace_id`` too (ADR-0148): another workspace's checkpoints are not
+    listed at all."""
     try:
-        records = await store.list_artifacts(kind="dataset", limit=200)
+        records = await store.list_artifacts(kind="dataset", limit=200, workspace_id=workspace_id)
     except Exception:  # noqa: BLE001 — a registry hiccup means "no resume"
         _log.debug("checkpoint lookup failed", exc_info=True)
         return None
