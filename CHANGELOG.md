@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- A pipeline input declared `type: list` takes a comma-separated string as well as JSON: `-i report_to=mlflow,wandb` gives `["mlflow", "wandb"]` (items trimmed, empty items dropped). The launch door types it, so the CLI, the console and schedules agree, and `cairn pipeline explain -i` shows the typed value. A value that parses as JSON keeps the JSON rule, and one that opens with `[` but is not valid JSON is refused as before. (#197)
+
 ### Changed
 - The builtin engine's SSH dispatch has no built-in container image. Image mode runs only an image named by the `compute.ssh` connection's `image` or by `remote_image` / `CAIRN_TRAIN_IMAGE`. When the leg's mode resolves to image and no image is named, submit refuses the leg before anything reaches the box, with a message naming the settings to change; for a connection's own `mode = image` it names the connection's `image` and `mode`. A connection's `mode` and `image` still override the environment per box. `auto`, the default, runs the box's virtualenv when no image is named, as before. `cairn doctor` reports each compute target's execution unit from the connection and the environment's `remote_exec_mode` / `remote_image`, in the engine's order: venv is OK with no image suggestion, and image mode with no image anywhere fails the row. `operator_dataflow.engines_ssh.DEFAULT_TRAIN_IMAGE` is removed. (ADR-0150)
 - Sign-up, a Google or GitHub sign-in that would create an account, and invite redemption refuse a username or email equal to the deployment admin's name (`CAIRN_API_USER`, `admin` when unset), compared trimmed and case-insensitively. The name reads as taken (`already_registered` / `username_taken`); nothing is created and the invite stays usable.

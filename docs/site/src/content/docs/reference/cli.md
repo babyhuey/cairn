@@ -31,8 +31,8 @@ set them first when you run outside `cairn dev`:
 |---|---|
 | `cairn pipeline ls` | Lists every installed pipeline with its legs and content hash, internal ones included. |
 | `cairn pipeline show <ref>` | A pipeline's inputs, legs, gates and wiring. `--plan` shows the execution plan instead. |
-| `cairn pipeline explain <ref>` | What will happen before anything spends: each input and where its value comes from, each leg and what triggers it, the gates and the budget. `-i key=value` shows the effect of a launch input, `-e` resolves for an environment, `--json` prints the raw result. |
-| `cairn pipeline run <ref>` | Launches a pipeline and follows it to the end. `-i key=value` (repeatable; values are parsed as JSON when possible), `-e` the environment, `--detach` returns at once. |
+| `cairn pipeline explain <ref>` | What will happen before anything spends: each input and where its value comes from, each leg and what triggers it, the gates and the budget. `-i key=value` shows the effect of a launch input, typed as the launch types it (a `list` input takes JSON or a comma-separated string, `-i report_to=mlflow,wandb`), `-e` resolves for an environment, `--json` prints the raw result. |
+| `cairn pipeline run <ref>` | Launches a pipeline and follows it to the end. `-i key=value` (repeatable; values are parsed as JSON when possible, and a `list` input also takes a comma-separated string), `-e` the environment, `--detach` returns at once. |
 
 A **ref** is `<pack>/<name>`, for example `hello-cairn/profile-and-publish`.
 When a flow has the same name as a pipeline, `show` and `explain` refuse the

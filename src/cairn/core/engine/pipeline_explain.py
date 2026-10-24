@@ -754,6 +754,18 @@ async def explain_pipeline(
 
     problems += gate_path_problems(d, plan)
 
+    # #197 — the values typed by the launch door's own coercion, so `-i k=a,b` on
+    # a `list` input reads here as the list the launch will use; a value the
+    # door would refuse is a reported refusal, shown as supplied.
+    from cairn.core.dispatch.pipeline_launch import (  # noqa: PLC0415 - cycle: dispatch → engine
+        InputCoercionError, coerce_declared_inputs,
+    )
+
+    try:
+        inputs = coerce_declared_inputs(d, inputs or {})
+        preset_inputs = coerce_declared_inputs(d, preset_inputs or {})
+    except InputCoercionError as e:
+        problems.append(f"launch would refuse the inputs: {e}")
     layers = input_layers(d, supplied=inputs, preset_inputs=preset_inputs,
                           preset_name=preset_name)
     authored = _authored(d)
