@@ -98,6 +98,15 @@ PRICED_TARGET_KIND = "compute.ssh"
 #: ``PipelineRecord.admission`` (D2), never a column.
 COST_ESTIMATE_KEY = "cost_estimate"
 NOT_PRICED = "not priced"
+#: A target spelled ``worker:<pool>`` is a pull-worker pool, not a connection.
+WORKER_TARGET_PREFIX = "worker:"
+
+
+class LegPriceUnreadable(RuntimeError):
+    """A leg that may run on a priced box whose price cannot be READ: the target
+    selection, the connection store or the named connection failed, or its
+    ``hourly_usd`` is malformed. Unknown is never "not priced": the launch door
+    refuses (ADR-0151, fail-closed), and a retry can succeed once it is readable."""
 
 
 def compute_target_for_kind(kind: str) -> str:
@@ -105,31 +114,55 @@ def compute_target_for_kind(kind: str) -> str:
     ``resolve_engine`` reads (``ml_target`` for ``kind: ml``, ``dataflow_target``
     otherwise) through the one config plane. ``""`` = no target (the local
     builtin engine). Shared by the bridge (``_leg_target``) and the launch door,
-    so the leg that is priced is the leg that runs there."""
-    try:
-        from cairn.core.backend_selection import selected  # noqa: PLC0415 - cycle: selection → profile → pack
+    so the leg that is priced is the leg that runs there. A selection that cannot
+    be read RAISES: the door refuses on it; the bridge's cap lookup degrades."""
+    from cairn.core.backend_selection import selected  # noqa: PLC0415 - cycle: selection → profile → pack
 
-        key = "ml_target" if kind == "ml" else "dataflow_target"
-        return str(selected(key, default="") or "").strip()
-    except Exception:  # noqa: BLE001 — an unreadable selection means "no target"
-        logger.debug("could not resolve the compute target for kind %r", kind, exc_info=True)
-        return ""
+    key = "ml_target" if kind == "ml" else "dataflow_target"
+    return str(selected(key, default="") or "").strip()
+
+
+def _hourly_rate(name: str, config: dict) -> float:
+    """``hourly_usd`` off a connection config: 0.0 when unset (not priced), the
+    rate when it is a finite number >= 0, :class:`LegPriceUnreadable` otherwise."""
+    raw = str((config or {}).get("hourly_usd") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        rate = float(raw)
+    except ValueError:
+        rate = float("nan")
+    if not (0.0 <= rate < float("inf")):   # NaN fails both comparisons
+        raise LegPriceUnreadable(f"connection {name!r} has a malformed hourly_usd {raw!r}; "
+                                 f"set a number of dollars per hour (or unset it)")
+    return rate
 
 
 async def price_flow_leg(target: str, timeout_s: Optional[float], *,
-                         store: Any = None) -> Optional[dict]:
+                         store: Any = None, multiplier: int = 1,
+                         multiplier_basis: str = "") -> Optional[dict]:
     """ADR-0151 D1 — the price of one flow leg on ``target``: ``hourly_usd ×
     timeout``, read from the target's connection config core-to-core (the way
     ``target_cap`` reads ``max_in_flight``; no secret is resolved).
 
-    ``None`` when the leg has no target. Otherwise a record entry:
-    ``{"priced": True, "connection", "hourly_usd", "hours", "estimate_usd", "basis"}``
-    — ``hours``/``estimate_usd`` are ``None`` for a priced leg with no timeout,
-    which the launch door refuses (D3) — or ``{"priced": False, "connection",
-    "basis": "not priced: …"}`` for a target with no ``hourly_usd``: never $0."""
+    ``None`` when the leg has no target. "Not priced" only for the definite cases:
+    a target that is not a ``compute.ssh`` connection (a ``worker:`` pool, another
+    kind) or one that sets no ``hourly_usd`` — ``{"priced": False, "connection",
+    "basis": "not priced: …"}``, never $0. A store, connection or rate that cannot
+    be read raises :class:`LegPriceUnreadable`.
+
+    A priced entry: ``{"priced": True, "connection", "hourly_usd", "hours",
+    "per_attempt_usd", "runs", "estimate_usd", "basis"}``. ``per_attempt_usd`` =
+    ``hourly_usd × timeout`` is what one attempt reserves at leg time; ``runs`` =
+    ``multiplier`` (loop iterations × attempts, the bounded worst case) and
+    ``estimate_usd`` = ``per_attempt_usd × runs`` is what the door checks. The money
+    fields are ``None`` for a priced leg with no timeout, which the door refuses (D3)."""
     name = str(target or "").strip()
     if not name:
         return None
+    if name.startswith(WORKER_TARGET_PREFIX):
+        return {"priced": False, "connection": name,
+                "basis": f"{NOT_PRICED}: {name!r} is a worker pool, not a compute.ssh connection"}
     try:
         from cairn.core.connections import (  # noqa: PLC0415 - cycle: connections → secrets stack
             default_connection_store, lookup_account, run_account,
@@ -144,40 +177,81 @@ async def price_flow_leg(target: str, timeout_s: Optional[float], *,
             close = getattr(store, "close", None)
             if owned and callable(close):
                 close()
-    except Exception as e:  # noqa: BLE001 — unreadable is "not priced", said so, never $0
-        logger.warning("target %r: connection unreadable, leg not priced", name, exc_info=True)
+    except Exception as e:  # noqa: BLE001 — unreadable is unknown, never "not priced"
+        raise LegPriceUnreadable(
+            f"connection {name!r} could not be read ({type(e).__name__}: {e})") from e
+    if conn is None:
+        raise LegPriceUnreadable(f"connection {name!r} is not registered in this account; "
+                                 f"add it with `cairn connect ssh --name {name}`")
+    if str(getattr(conn, "kind", "")) != PRICED_TARGET_KIND:
         return {"priced": False, "connection": name,
-                "basis": f"{NOT_PRICED}: connection {name!r} could not be read ({type(e).__name__})"}
-    if conn is None or str(getattr(conn, "kind", "")) != PRICED_TARGET_KIND:
-        why = "is not a registered connection" if conn is None else f"is kind {conn.kind!r}"
-        return {"priced": False, "connection": name, "basis": f"{NOT_PRICED}: {name!r} {why}"}
-    from cairn.core.compute_lifecycle import ComputeBox  # noqa: PLC0415 — core→core, off the hot path
-
-    hourly = ComputeBox(name, dict(getattr(conn, "config", None) or {})).hourly_usd
-    if not hourly or hourly <= 0:
+                "basis": f"{NOT_PRICED}: {name!r} is kind {conn.kind!r}"}
+    hourly = _hourly_rate(name, dict(getattr(conn, "config", None) or {}))
+    if hourly <= 0:
         return {"priced": False, "connection": name,
                 "basis": f"{NOT_PRICED}: connection {name!r} sets no hourly_usd"}
+    runs = max(1, int(multiplier or 1))
     if not timeout_s or float(timeout_s) <= 0:
         return {"priced": True, "connection": name, "hourly_usd": hourly, "hours": None,
-                "estimate_usd": None, "basis": f"${hourly:g}/h on {name}, no timeout declared"}
+                "per_attempt_usd": None, "runs": runs, "estimate_usd": None,
+                "basis": f"${hourly:g}/h on {name}, no timeout declared"}
     hours = float(timeout_s) / 3600.0
-    est = round(hourly * hours, 6)
+    per = round(hourly * hours, 6)
+    est = round(per * runs, 6)
+    basis = f"${hourly:g}/h × {hours:g}h on {name}"
+    if runs > 1:
+        basis += f" × {runs} ({multiplier_basis or 'runs'})"
     return {"priced": True, "connection": name, "hourly_usd": hourly, "hours": round(hours, 6),
-            "estimate_usd": est, "basis": f"${hourly:g}/h × {hours:g}h on {name} = ${est:.2f}"}
+            "per_attempt_usd": per, "runs": runs, "estimate_usd": est,
+            "basis": f"{basis} = ${est:.2f}"}
+
+
+def _leg_runs(plan: Any, s: Any, flow_kind: str) -> tuple[int, str]:
+    """The bounded worst-case number of times a leg runs: its loop's
+    ``max_iterations`` (1 outside a loop) × the attempts ``execute_leg`` allows —
+    the leg's ``retry: {max_attempts}`` when it declares one, else the kind's
+    default (1 for ``ml``, 2 for ``data``)."""
+    iterations = 1
+    for ldef in (getattr(plan, "loops", None) or {}).values():
+        body = {str(b.get("id") or "") for b in ((ldef or {}).get("steps") or []) if isinstance(b, dict)}
+        if s.id in body:
+            iterations = max(1, int((ldef or {}).get("max_iterations") or 1))
+            break
+    raw = (getattr(s, "inputs", None) or {}).get("retry")
+    if isinstance(raw, dict):
+        attempts = max(1, int(raw.get("max_attempts", 2) or 2))   # `_leg_retry_policy`'s default
+    else:
+        attempts = 1 if flow_kind == "ml" else 2                  # `execute_leg`'s default
+    parts = [f"{iterations} loop iterations"] if iterations > 1 else []
+    if attempts > 1:
+        parts.append(f"{attempts} attempts")
+    return iterations * attempts, " × ".join(parts)
 
 
 async def price_plan(plan: Any, *, store: Any = None) -> dict:
     """The launch door's estimate (D2): every flow leg with a compute target,
-    priced by :func:`price_flow_leg`, in plan order. ``{}`` when no leg has a
-    target, so a pipeline with no box records exactly what it recorded before."""
+    priced by :func:`price_flow_leg` at its bounded worst case (loop iterations ×
+    attempts), in plan order. ``{}`` when no leg has a target, so a pipeline with
+    no box records exactly what it recorded before. Raises
+    :class:`LegPriceUnreadable` naming the leg when a price cannot be read."""
     from cairn.core.dispatch.leg_executor import flow_kind_of, leg_kind_of  # noqa: PLC0415 - cycle: executor → storage → here
 
     legs: list[dict] = []
     for s in getattr(plan, "steps", None) or []:
         if leg_kind_of(getattr(s, "ref", "")) != "flow":
             continue
-        price = await price_flow_leg(compute_target_for_kind(flow_kind_of(s.ref)),
-                                     getattr(s, "timeout_s", None), store=store)
+        kind = flow_kind_of(s.ref)
+        try:
+            target = compute_target_for_kind(kind)
+        except Exception as e:  # noqa: BLE001 — a selection error is unknown, never "no target"
+            raise LegPriceUnreadable(f"leg {s.id!r}: its compute target cannot be read "
+                                     f"({type(e).__name__}: {e})") from e
+        runs, why = _leg_runs(plan, s, kind)
+        try:
+            price = await price_flow_leg(target, getattr(s, "timeout_s", None), store=store,
+                                         multiplier=runs, multiplier_basis=why)
+        except LegPriceUnreadable as e:
+            raise LegPriceUnreadable(f"leg {s.id!r}: {e}") from e
         if price is not None:
             legs.append({"step": s.id, **price})
     if not legs:
@@ -217,7 +291,10 @@ def leg_price_kwargs(rec: Any, step_id: str, run: Any) -> dict:
     ``governance.estimated_usd`` it reserved before."""
     price = recorded_leg_price(rec, step_id)
     if price and price.get("priced") and price.get("estimate_usd") is not None:
-        return {"estimated_usd": float(price["estimate_usd"]),
+        # one attempt reserves one attempt's figure; the loop × retry worst case
+        # (`estimate_usd`) is what the launch door checked
+        per = price.get("per_attempt_usd")
+        return {"estimated_usd": float(per if per is not None else price["estimate_usd"]),
                 "hourly_usd": float(price.get("hourly_usd") or 0.0),
                 "adopted_started_at": getattr(run, "started_at", None)}
     gov = getattr(rec, "governance", None) or {}
@@ -481,6 +558,6 @@ class FlowLegHooks:
         }
 
 
-__all__ = ["COST_ESTIMATE_KEY", "FlowLegHooks", "NOT_PRICED", "PRICED_TARGET_KIND",
+__all__ = ["COST_ESTIMATE_KEY", "FlowLegHooks", "LegPriceUnreadable", "NOT_PRICED", "PRICED_TARGET_KIND",
            "compute_target_for_kind", "estimate_evidence", "leg_price_kwargs", "price_flow_leg",
            "price_plan", "publish_pipeline_audit", "recorded_cost_estimate", "recorded_leg_price"]

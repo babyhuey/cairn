@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-from cairn.core.budget_reservations import BudgetExceeded, release, reserve, settle
+from cairn.core.budget_reservations import BudgetExceeded, held_for_run, release, reserve, settle
 from cairn.core.dataflow import DataflowSpec
 from cairn.core.runtime.retry import RetryPolicy
 from cairn.core.dataflow.engine import is_terminal
@@ -382,7 +382,8 @@ async def execute_leg(
         reservation = None
         # The attempt's window starts here; an adopted attempt's started in the
         # process that submitted it, so it starts at the persisted run start.
-        attempt_started = (_wall_now() if adopting is None
+        adopted_attempt = adopting is not None
+        attempt_started = (_wall_now() if not adopted_attempt
                            else _parse_started(adopted_started_at, hourly_usd, ref))
         if series_id and adopting is None:
             if spent_usd is None:
@@ -487,36 +488,32 @@ async def execute_leg(
                         descriptors + named, artifact_store, run_id=run_id,
                         producer_job=str(getattr(handle, "job_id", "") or ""),
                         out_stats=out.stats)
-                # #1441 — the hold gives way to what the leg ACTUALLY spent (the
-                # template path's rule, dispatcher.py `_close_reservations`), not the
-                # estimate it was admitted on — engine-reported plus box time.
-                gpu = _box_time_usd(hourly_usd, attempt_started)
-                gpu_total += gpu
-                out.gpu_usd = round(gpu_total, 6)
-                await settle(reservation, actual_usd=out.cost_usd + gpu)
-                return out
-            out = LegOutcome(
-                state=str(getattr(status, "state", "failed")), handle=handle,
-                metrics=dict(getattr(status, "metrics", {}) or {}),
-                error=str(getattr(status, "error", "") or ""),
-            )
-            # Only the ENGINE may call a failure transient (cancellation never
-            # is); an exception below has no flag and is not retried.
-            retriable = (out.state == "failed") and bool(getattr(status, "retriable", False))
+                # settled below, once, with every other outcome of this attempt
+            else:
+                out = LegOutcome(
+                    state=str(getattr(status, "state", "failed")), handle=handle,
+                    metrics=dict(getattr(status, "metrics", {}) or {}),
+                    error=str(getattr(status, "error", "") or ""),
+                )
+                # Only the ENGINE may call a failure transient (cancellation never
+                # is); an exception below has no flag and is not retried.
+                retriable = (out.state == "failed") and bool(getattr(status, "retriable", False))
         except Exception as e:  # noqa: BLE001 — a leg failure is an outcome, not a crash
             logger.exception("leg %s failed", ref)
             out = LegOutcome(state="failed", error=f"{type(e).__name__}: {e}")
 
-        # ADR-0151 D5 — a failed, timed-out or cancelled attempt on a priced box
-        # still billed its wall-clock: settle it. Nothing billed → release.
+        # ADR-0151 D5 — the attempt is accounted ONCE, here, outside the try: its
+        # window joins the leg's box time, then its hold closes. #1441 — the hold
+        # gives way to what the attempt ACTUALLY spent (the template path's rule,
+        # dispatcher.py `_close_reservations`): engine-reported plus box time, on
+        # any outcome (a failed, timed-out or cancelled attempt on a priced box still
+        # billed its wall-clock). Nothing billed → release.
         gpu = _box_time_usd(hourly_usd, attempt_started)
         gpu_total += gpu
         out.gpu_usd = round(gpu_total, 6)
-        if gpu > 0:
-            await settle(reservation, actual_usd=gpu)
-        else:
-            await release(reservation)
-        if not retriable or attempt >= attempts:
+        await _close_attempt(out, reservation, actual_usd=(out.cost_usd if out.ok else 0.0) + gpu,
+                             adopted_run_id=str(run_id or "") if adopted_attempt else "")
+        if out.ok or not retriable or attempt >= attempts:
             return out
         if on_retry is not None:
             # visibility invariant: every retry is announced (run event) with
@@ -528,6 +525,36 @@ async def execute_leg(
         await asyncio.sleep(min(delay, float(policy.maximum_interval_seconds or delay)))
         delay = delay * float(policy.backoff_coefficient or 1.0)
     return out
+
+
+async def _close_attempt(out: LegOutcome, reservation: Any, *, actual_usd: float,
+                         adopted_run_id: str = "") -> None:
+    """Close one attempt's hold: ``settle`` at ``actual_usd`` when it succeeded or
+    cost something, else ``release`` (nothing billed). An ADOPTED attempt holds no reservation of its own: the hold is
+    the one the process that submitted it took (stamped with the run id) and left
+    ``held`` when it died; it is closed here the way ``_close_reservations`` closes a
+    template's, through ``held_for_run`` — the first at the attempt's cost, any other
+    at 0 — so a dead process's estimate stops counting once the window is recorded.
+
+    A ledger failure is surfaced as one (logged, and named in ``out.error``); it
+    never changes the engine outcome or the box time already accounted."""
+    billed = out.ok or actual_usd > 0
+    try:
+        if adopted_run_id:
+            for i, held in enumerate(await held_for_run(adopted_run_id)):
+                if billed:
+                    await settle(held, actual_usd=actual_usd if i == 0 else 0.0)
+                else:
+                    await release(held)
+        elif billed:
+            await settle(reservation, actual_usd=actual_usd)
+        else:
+            await release(reservation)
+    except Exception as e:  # noqa: BLE001 — a ledger error is not an engine outcome
+        logger.exception("budget ledger: could not close the reservation for run %s", adopted_run_id
+                         or getattr(reservation, "run_id", ""))
+        note = f"budget ledger: the reservation could not be closed ({type(e).__name__}: {e})"
+        out.error = f"{out.error}; {note}" if out.error else note
 
 
 def _wall_now() -> datetime:

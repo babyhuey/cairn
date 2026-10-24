@@ -75,8 +75,9 @@ def conns(monkeypatch):
         return "default"
 
     monkeypatch.setattr(W, "workspace_account", _account)
-    # every flow leg dispatches to the box
+    # every flow leg dispatches to the box, and is an ml leg (one attempt by default)
     monkeypatch.setattr(LH, "compute_target_for_kind", lambda kind: BOX)
+    monkeypatch.setattr(LE, "flow_kind_of", lambda ref: "ml")
     return store
 
 
@@ -92,20 +93,22 @@ def memory_budget(monkeypatch):
 _PIPE = """
 name: sft
 kind: pipeline
-governance: {{series: s-gpu, budget: {{usd: {budget}}}}}
+governance: {{{series}budget: {{usd: {budget}}}}}
 steps:
   - {{id: approve-run, gate: approve-run}}
   - {{id: train, flow: gpupack/train{timeout}, depends_on: [approve-run]}}
 """
 
 
-def _install(tmp_path, monkeypatch, *, budget=25, timeout=", timeout: 12h"):
+def _install(tmp_path, monkeypatch, *, budget=25, timeout=", timeout: 12h", series="series: s-gpu, ",
+             body=None):
     import cairn.core.engine.pipeline_resolve as R
     from cairn.core import pull_worker_door as pw
 
     d = tmp_path / "gpupack" / "pipelines"
     d.mkdir(parents=True, exist_ok=True)
-    (d / "sft.yaml").write_text(textwrap.dedent(_PIPE.format(budget=budget, timeout=timeout)))
+    (d / "sft.yaml").write_text(textwrap.dedent(
+        body or _PIPE.format(budget=budget, timeout=timeout, series=series)))
     monkeypatch.setattr(R, "all_pipeline_dirs", lambda: [str(d)])
 
     async def _never():
@@ -344,7 +347,8 @@ async def test_the_bridge_gate_evidence_carries_the_estimate(monkeypatch):
         return await real(self, rec, s, status, gate_ctx=gate_ctx)
 
     monkeypatch.setattr(PipelineBridge, "_mark_awaiting", _capture)
-    plan = plan_pipeline(parse_pipeline_def(textwrap.dedent(_PIPE.format(budget=25, timeout=", timeout: 12h")),
+    plan = plan_pipeline(parse_pipeline_def(textwrap.dedent(_PIPE.format(
+        budget=25, timeout=", timeout: 12h", series="series: s-gpu, ")),
                                             pack="gpupack", source="<test>"))
     leg = {"step": "train", "priced": True, "connection": BOX, "hourly_usd": 0.53, "hours": 12.0,
            "estimate_usd": 6.36, "basis": "$0.53/h × 12h on gpu-box = $6.36"}
@@ -596,5 +600,196 @@ async def test_live_pg_a_retried_priced_leg_settles_each_window_as_a_row(monkeyp
             rows = await c.fetch("SELECT state, actual_usd::float8 AS a FROM series_reservations "
                                  "WHERE series_id = $1 ORDER BY created_at", sid)
         assert [(r["state"], r["a"]) for r in rows] == [("settled", 0.5), ("settled", 1.5)]
+    finally:
+        await pool.close()
+
+
+# ── fail-closed: a price that cannot be read refuses the launch ─────────────
+
+async def _refused(tmp_path, monkeypatch, **kw):
+    _install(tmp_path, monkeypatch, budget=1000, **kw)
+    bridge = _Bridge()
+    with pytest.raises(AdmissionRefusedError) as ei:
+        await launch_pipeline("gpupack/sft", inputs={}, bridge=bridge, workspace_id="default")
+    assert bridge.calls == [], "a refused launch must leave no record"
+    rec = ei.value.decision.as_record()
+    assert rec["verdict"] == REFUSED
+    return rec["refusing_reasons"][-1]
+
+
+async def test_an_unreadable_connection_store_refuses_the_launch(tmp_path, monkeypatch, conns, memory_budget):
+    async def _boom(name, account_id=None):
+        raise OSError("connections.db is locked")
+
+    monkeypatch.setattr(conns, "get_by_name", _boom)
+    why = await _refused(tmp_path, monkeypatch)
+    assert "'train'" in why and "could not be read" in why and "retry" in why
+
+
+async def test_an_unregistered_target_connection_refuses_the_launch(tmp_path, monkeypatch, conns, memory_budget):
+    why = await _refused(tmp_path, monkeypatch)          # no connection named gpu-box
+    assert "not registered" in why and BOX in why
+
+
+@pytest.mark.parametrize("raw", ["abc", "-1", "nan", "inf"])
+async def test_a_malformed_hourly_rate_refuses_the_launch(tmp_path, monkeypatch, conns, memory_budget, raw):
+    conns.set_rate(raw)
+    why = await _refused(tmp_path, monkeypatch)
+    assert "malformed hourly_usd" in why and repr(raw) in why
+
+
+async def test_a_target_selection_error_refuses_never_reads_as_unpriced(tmp_path, monkeypatch, conns, memory_budget):
+    def _broken(kind):
+        raise RuntimeError("profile unreadable")
+
+    monkeypatch.setattr(LH, "compute_target_for_kind", _broken)
+    why = await _refused(tmp_path, monkeypatch)
+    assert "compute target cannot be read" in why and "profile unreadable" in why
+
+
+def test_the_selection_itself_raises_instead_of_answering_no_target(monkeypatch):
+    import cairn.core.backend_selection as BS
+
+    def _broken(key, default=""):
+        raise RuntimeError("profile unreadable")
+
+    monkeypatch.setattr(BS, "selected", _broken)
+    with pytest.raises(RuntimeError):
+        LH.compute_target_for_kind("ml")
+
+
+async def test_a_worker_pool_target_is_definitely_not_priced():
+    p = await price_flow_leg("worker:gpu", 3600)
+    assert p["priced"] is False and "worker pool" in p["basis"]
+
+
+# ── 3b: a budget with no series is still checked at the door ────────────────
+
+async def test_a_budget_without_a_series_is_checked_at_the_door(tmp_path, monkeypatch, conns, memory_budget):
+    conns.set_rate(0.53)
+    _install(tmp_path, monkeypatch, budget=5, series="")
+    bridge = _Bridge()
+    with pytest.raises(AdmissionRefusedError, match=r"\$6\.36 .*\$5\.00 of \$5\.00 left"):
+        await launch_pipeline("gpupack/sft", inputs={}, bridge=bridge, workspace_id="default")
+    assert bridge.calls == []
+
+
+# ── 3c: loops and retries are estimated at their bounded worst case ─────────
+
+_LOOP = """
+name: sft
+kind: pipeline
+governance: {series: s-gpu, budget: {usd: 100}}
+steps:
+  - {id: approve-run, gate: approve-run}
+  - loop: cycle
+    depends_on: [approve-run]
+    max_iterations: 3
+    until: 'steps.train.ok == true'
+    steps:
+      - id: train
+        flow: gpupack/train
+        timeout: 2h
+        with:
+          retry: {max_attempts: 2}
+"""
+
+
+async def test_a_looped_retried_leg_is_estimated_at_its_worst_case(tmp_path, monkeypatch, conns, memory_budget):
+    conns.set_rate(0.5)
+    _install(tmp_path, monkeypatch, body=_LOOP)
+    bridge = _Bridge()
+    await launch_pipeline("gpupack/sft", inputs={}, bridge=bridge, workspace_id="default")
+    admission = bridge.calls[0]["admission"]
+    leg = admission[COST_ESTIMATE_KEY]["legs"][0]
+    # $0.5/h × 2 h = $1 an attempt; × 3 iterations × 2 attempts = $6 at the door
+    assert (leg["per_attempt_usd"], leg["runs"], leg["estimate_usd"]) == (1.0, 6, 6.0)
+    assert "× 6 (3 loop iterations × 2 attempts)" in leg["basis"]
+    rec = SimpleNamespace(admission=admission, governance={}, plan=bridge.calls[0]["plan"])
+    for step in ("train", "train#2", "train#3"):    # every iteration reserves ONE attempt's figure
+        kw = leg_price_kwargs(rec, step, SimpleNamespace(started_at=None))
+        assert kw["estimated_usd"] == 1.0 and kw["hourly_usd"] == 0.5, step
+
+
+async def test_a_looped_leg_whose_worst_case_exceeds_the_budget_is_refused(
+        tmp_path, monkeypatch, conns, memory_budget):
+    conns.set_rate(0.5)
+    _install(tmp_path, monkeypatch, body=_LOOP.replace("usd: 100", "usd: 5"))
+    bridge = _Bridge()
+    with pytest.raises(AdmissionRefusedError, match=r"\$6\.00"):
+        await launch_pipeline("gpupack/sft", inputs={}, bridge=bridge, workspace_id="default")
+    assert bridge.calls == []
+
+
+# ── B1: an attempt is accounted exactly once ────────────────────────────────
+
+async def test_a_settle_failure_is_a_ledger_error_not_a_doubled_failed_leg(monkeypatch, memory_budget):
+    _stub_flow(monkeypatch)
+    monkeypatch.setattr(LE, "_wall_now", _Clock(0, 2))
+
+    async def _broken_settle(res, actual_usd=0.0):
+        raise ConnectionError("ledger down")
+
+    released: list = []
+
+    async def _release(res):
+        released.append(res)
+
+    monkeypatch.setattr(LE, "settle", _broken_settle)
+    monkeypatch.setattr(LE, "release", _release)
+    out = await execute_leg("flow:gpupack/train", inputs={}, engine=_Engine("succeeded"), run_id="r1",
+                            series_id="s-gpu", estimated_usd=6.36, spent_usd=0.0, budget_usd=25.0,
+                            hourly_usd=0.53)
+    assert out.ok, "the engine succeeded; a ledger error does not change that"
+    assert out.gpu_usd == 1.06, "one window, not two"
+    assert "budget ledger" in out.error and "ledger down" in out.error
+    assert released == []
+
+
+# ── B2: an adopted attempt closes the hold its dead process left ─────────────
+
+async def _die_then_adopt(monkeypatch, run_id: str, series: str):
+    """Process A reserves the attempt's estimate and dies; process B adopts the job
+    (no reservation of its own) and watches it to the end, 3 h after run start."""
+    await B.reserve(series, est_usd=6.0, spent_usd=0.0, budget_usd=25.0, run_id=run_id)   # A
+    assert await B.reserved_total(series) == 6.0
+    _stub_flow(monkeypatch)
+    monkeypatch.setattr(LE, "_wall_now", lambda: T0 + timedelta(hours=3))
+    out = await execute_leg(                                                               # B
+        "flow:gpupack/train", inputs={}, engine=_Engine("succeeded"), run_id=run_id,
+        series_id=series, estimated_usd=6.0, spent_usd=0.0, budget_usd=25.0,
+        hourly_usd=0.5, adopted_started_at=T0.isoformat(),
+        adopt={"job_id": "old", "engine": "stub", "meta": {}})
+    assert out.ok and out.gpu_usd == 1.5
+    return out
+
+
+async def test_an_adopted_attempt_settles_the_dead_processes_hold_memory(monkeypatch, memory_budget):
+    """The in-memory backend — the one a SQLite deployment uses (there is no SQLite
+    reservation backend; `CAIRN_STORAGE` selects Postgres or memory)."""
+    seen = _ledger(monkeypatch)
+    await _die_then_adopt(monkeypatch, "r-adopt", "s-adopt")
+    assert await B.reserved_total("s-adopt") == 0.0, "no hold left counting"
+    assert await B.held_for_run("r-adopt") == []
+    assert seen["settle"] == [1.5] and seen["reserve"] == []
+
+
+async def test_live_pg_an_adopted_attempt_settles_the_dead_processes_hold(monkeypatch):
+    import uuid
+
+    dsn = os.environ.get("PGSTORE_DSN")
+    if not dsn:
+        pytest.skip("PGSTORE_DSN not set — skipping live Postgres integration")
+    asyncpg = pytest.importorskip("asyncpg")
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    sid = f"t-adopt-{uuid.uuid4().hex[:12]}"
+    try:
+        monkeypatch.setattr(B, "_backend_instance", B._PostgresBackend(pool=pool))
+        await _die_then_adopt(monkeypatch, f"r-{sid}", sid)
+        assert await B.reserved_total(sid) == 0.0
+        async with pool.acquire() as c:
+            rows = await c.fetch("SELECT state, actual_usd::float8 AS a FROM series_reservations "
+                                 "WHERE series_id = $1", sid)
+        assert [(r["state"], r["a"]) for r in rows] == [("settled", 1.5)]
     finally:
         await pool.close()

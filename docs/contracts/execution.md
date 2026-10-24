@@ -57,10 +57,16 @@ A leg on a priced `compute.ssh` box (ADR-0151 D5) also records its box time,
 `llm_usd` (`src/cairn/core/dispatch/leg_hooks.py:59`). A failed leg reports no engine cost (its
 partial engine spend is unknown), and a leg with neither figure records no `Run.cost` — unknown,
 never $0 (a succeeded leg's payload still carries `llm_cost_usd`). The rate is the one recorded on
-`PipelineRecord.admission.cost_estimate` at launch, never re-read; an adopted attempt is priced
-from the persisted `run.started_at` (the start of each earlier attempt is not persisted, so after
-a restart the adopted window includes them; nothing is counted twice, because a leg's `Run.cost`
-is written once, at its end).
+`PipelineRecord.admission.cost_estimate` at launch, never re-read. Each attempt is accounted
+once, after its outcome is known (`_close_attempt`, `src/cairn/core/dispatch/leg_executor.py:530`):
+its window joins the leg's box time, then its own hold is settled at its cost (released when it
+cost nothing); a ledger error is logged and named in the leg's error, and never changes the engine
+outcome or the box time. An adopted attempt holds no reservation of its own: the hold the dead
+process took (stamped with the run id) is closed through `held_for_run`, settled at the adopted
+window, so the dead process's estimate stops counting once the window is recorded. The adopted
+window starts at the persisted `run.started_at` (the start of each earlier attempt is not
+persisted), so after a restart it also covers earlier attempts and backoff: an over-estimate of
+box time, by decision, never a double count.
 
 **Descriptors and lineage.** `DataflowResult.output_artifacts` holds one descriptor per stage,
 in order (the stage-contract re-check reads it by position). Its parent is the previous stage's
