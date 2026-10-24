@@ -215,3 +215,81 @@ async def test_the_finalizer_release_stops_the_box_on_every_outcome(ec2, mode, c
     assert rec.step_state["release"].status == "done"
     assert ec2.calls.index("tags") < ec2.calls.index("start") < ec2.calls.index("stop")
     assert ec2.state == "stopped", "the box must not bill after the pipeline ended"
+
+
+# ── ADR-0151 D9: on cancel, the job on the box is cancelled before the box stops ──
+class _Engine:
+    """The flow engine the bridge resolves for a leg; records its cancels on the
+    SAME timeline the fake EC2 writes, so the order is observable."""
+
+    def __init__(self, timeline: list[str], *, fail: bool = False) -> None:
+        self.timeline = timeline
+        self.fail = fail
+
+    async def cancel(self, handle):
+        self.timeline.append(f"cancel:{handle.job_id}")
+        if self.fail:
+            raise RuntimeError("ssh: the box did not answer the cancel")
+
+
+async def _cancel_with_running_legs(ec2, monkeypatch, legs: dict[str, str], *, fail: bool = False):
+    """A pipeline whose flow legs `legs` (step id → recorded compute target) are
+    running on an engine job, with a finalizer `compute/release` of the box
+    `$input.compute_connection` = "gpu". Cancel it; return the settled record."""
+    from cairn.core.engine.bundle_pipeline import PipelinePlan, PipelinePlanStep
+    from cairn.core.engine.schema import TriggerEvent
+    from cairn.core.storage.pipeline_store import PipelineRecord, StepState
+    from cairn.core.storage.protocols import Run
+
+    ec2.state = "running"
+    plan = PipelinePlan(name="gpu", steps=[
+        *(PipelinePlanStep(id=sid, ref="flow:t201/train") for sid in legs),
+        PipelinePlanStep(id="release", ref="task:compute/release", finalizer=True,
+                         inputs={"connection": "$input.compute_connection"})])
+    d = RunDispatcher(FakeRunner(), backend=build_storage())
+    b = PipelineBridge(d, store=InMemoryPipelineStore())
+    engine = _Engine(ec2.calls, fail=fail)
+    monkeypatch.setattr(b, "_leg_engine", lambda s: engine)
+    await b.start()
+    try:
+        rec = await b.store.put(PipelineRecord(
+            pipeline_name="gpu", status="running", plan=plan,
+            inputs={"compute_connection": "gpu"},
+            step_state={sid: StepState(status="running", run_id=f"r-{sid}",
+                                       handle={"job_id": f"j-{sid}", "engine": "ssh", "meta": {}})
+                        for sid in legs}))
+        for sid, target in legs.items():
+            await d.store.create(Run(
+                id=f"r-{sid}", trigger=TriggerEvent(source="manual", payload={}), status="running",
+                template_ref="flow:t201/train", compute_target=target,
+                bundle_pipeline_id=rec.pipeline_id, step_id=sid, workspace_id=rec.workspace_id))
+        await b.cancel_pipeline(rec.pipeline_id)
+        return await _wait(b.store, rec.pipeline_id, lambda r: r.status in ("done", "failed", "cancelled"))
+    finally:
+        b.stop()
+
+
+async def test_cancel_stops_the_job_on_the_box_before_the_box(ec2, monkeypatch):
+    rec = await _cancel_with_running_legs(ec2, monkeypatch, {"train": "gpu"})
+
+    assert rec.status == "cancelled" and rec.step_state["release"].status == "done"
+    assert "cancel:j-train" in ec2.calls and "stop" in ec2.calls
+    assert ec2.calls.index("cancel:j-train") < ec2.calls.index("stop"), ec2.calls
+    assert ec2.state == "stopped"
+
+
+async def test_a_failed_job_cancel_still_stops_the_box(ec2, monkeypatch):
+    rec = await _cancel_with_running_legs(ec2, monkeypatch, {"train": "gpu"}, fail=True)
+
+    assert ec2.calls.index("cancel:j-train") < ec2.calls.index("stop"), ec2.calls
+    assert rec.status == "cancelled" and rec.step_state["release"].status == "done"
+    assert ec2.state == "stopped", "a cancel that failed must never keep the box billing"
+
+
+async def test_a_running_leg_on_another_target_is_left_alone(ec2, monkeypatch):
+    """Only the legs on the box the pipeline releases are cancelled; any other
+    running leg keeps today's rule (left to its own path, #207)."""
+    await _cancel_with_running_legs(ec2, monkeypatch, {"train": "gpu", "side": "cpu-box"})
+
+    assert "cancel:j-train" in ec2.calls
+    assert "cancel:j-side" not in ec2.calls, ec2.calls

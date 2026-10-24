@@ -114,6 +114,10 @@ is not `compute.ssh`, fails closed with the `cairn connect ssh` command that fix
   behind an unanswered gate is a box billing while it waits. Declare it
   `finalizer: true`, wired off `$input` (not off `acquire`'s output), so it resolves
   even when `acquire` never ran.
+- On a pipeline cancel, the bridge first cancels the engine job of every running flow
+  leg whose recorded compute target is the connection the `compute/release` finalizer
+  stops, then submits the release (ADR-0151 D9). A job cancel that fails is logged and
+  audited (`leg_job_cancel`, `sent: false`); the release runs regardless.
 - `remote/exec` is `external_write`.
 - In-process and DBOS run finalizers on done, failed and cancelled. The Temporal
   pipeline owner schedules by `depends_on` only, so a trailing release would run on
