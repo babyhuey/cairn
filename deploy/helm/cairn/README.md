@@ -62,6 +62,7 @@ The full list with comments is `values.yaml`. The ones that decide the shape:
 | `secrets.*` / `secrets.existingSecret` | `""` | `CAIRN_JWT_SECRET` + `CAIRN_API_PASSWORD_HASH` (+ `POSTGRES_PASSWORD` with a bundled database) either rendered into a chart-managed Secret, or taken from one you already have. |
 | `server.persistence` | `enabled, 5Gi` | `~/.cairn` — the SQLite-backed config stores that do not yet honour `CAIRN_STORAGE`. ReadWriteOnce, so keep `server.replicaCount: 1`. |
 | `pullWorker.enabled` / `.command` | `false` / `[]` | The `cairn worker --pull` dial-out worker (#565). No default command — see below. |
+| `pullWorker.token` / `.existingSecret` | `""` / `""` | The worker's own Secret: a worker-pool token (`CAIRN_ENGINE_TOKEN`). One is required when the worker is enabled. |
 | `env.extra` | `{}` | Any other variable, verbatim into the ConfigMap. Name cairn variables `CAIRN_*`. |
 | `env.extra.CAIRN_PUBLIC_URL` | unset | `https://<ingress.host>`. Set it behind the chart's TLS ingress: the console's `cairn_refresh` sign-in cookie is `Secure` only when it is https, and the OAuth callback is built from it. The example values files set it. |
 | `artifacts.s3.*` | disabled | `CAIRN_ARTIFACT_S3_*`, the dbos-postgres tier's artifact store. |
@@ -118,14 +119,25 @@ default and has no default command**; enabling it without one refuses to render.
 pullWorker:
   enabled: true
   command: ["cairn", "worker", "--pull", "--engine-url", "https://cairn.example.com"]
+  token: "<worker-pool token>"        # or: existingSecret: cairn-pool-gpu
 ```
 
 With auth on (the chart's default), claiming work needs a worker credential: a
 worker-pool token, minted where `CAIRN_JWT_SECRET` is set with
-`cairn remote worker-token --name <pool>`, read from `CAIRN_ENGINE_TOKEN` (or
-`--token`). A signed-in user's token gets `403` on `/jobs/claim`. The worker
-container reads the same ConfigMap and Secret as the server (`envFrom`); the
-chart has no separate Secret for the worker token.
+`cairn remote worker-token --name <pool>`, read from `CAIRN_ENGINE_TOKEN`. A
+signed-in user's token gets `403` on `/jobs/claim`.
+
+The worker reads that token from a **Secret of its own**: `pullWorker.token` is
+rendered into `<release>-pull-worker`, or `pullWorker.existingSecret` names a
+Secret you manage holding the key `CAIRN_ENGINE_TOKEN` (plus anything the
+worker's jobs need). The worker does **not** read the control plane's Secret, so
+it never holds `CAIRN_JWT_SECRET`, `CAIRN_API_PASSWORD_HASH`, the database
+password, the model key or the SSH key. It still reads the shared ConfigMap.
+
+Rendering refuses an enabled worker with neither value, with both, with
+`existingSecret` set to the control plane's Secret, or with a token equal to
+`secrets.obsJwtSecret`. `cairn deploy doctor --values` reports the missing-token
+case too.
 
 ### Postgres connection assumptions (in-process leg liveness)
 
@@ -163,6 +175,15 @@ the Postgres volume are annotated `helm.sh/resource-policy: keep`, so
 
 A rollback rolls back the *manifests*. It does not undo a database migration —
 the DSN is the same database before and after.
+
+**Upgrading a chart with the pull worker enabled:** the worker no longer reads
+the control plane's Secret. Before upgrading, mint a worker-pool token
+(`cairn remote worker-token --name <pool>`) and set `pullWorker.token`, or put
+`CAIRN_ENGINE_TOKEN` in a Secret of its own and set `pullWorker.existingSecret`;
+the render fails until one is set. If the token was in the control plane's
+Secret (or `env.extra`), move it. Anything else the worker's jobs read from the
+control plane's Secret (a model key, an SSH key) must now be put in the worker's
+own Secret, deliberately.
 
 **Upgrading from a 0.1.x image:** see *Upgrade from 0.1.x* in the
 [install docs](https://docs.cairndev.sh/install/#upgrade-from-01x) (pull-worker

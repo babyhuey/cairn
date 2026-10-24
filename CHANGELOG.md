@@ -9,6 +9,9 @@ All notable changes to this project are documented here. The format follows [Kee
 - With auth on, a durable remote job started from an operation node (`CAIRN_REMOTE_JOB_DURABLE`, pushed or on a `worker:<pool>` target) is recorded under the workspace in scope; with no workspace in scope the node is refused before anything is registered or dispatched, instead of recording the process default.
 - A flow leg resumes only from a checkpoint a run of its own workspace relayed. A checkpoint whose producing run cannot be read is not used, and the leg starts from the beginning.
 
+### Changed (Helm chart)
+- The Helm chart's pull worker reads its worker-pool token (`CAIRN_ENGINE_TOKEN`) from a Secret of its own (`pullWorker.token`, rendered into `<release>-pull-worker`, or `pullWorker.existingSecret`) and no longer reads the control plane's Secret, so it does not receive the JWT secret, the admin password hash, the database password, the model key or the SSH key. Rendering refuses an enabled pull worker with no token, with both values, with the control plane's Secret, or with a token equal to `secrets.obsJwtSecret`; `cairn deploy doctor --values` reports a missing token. Upgrade notes: `deploy/helm/cairn/README.md`.
+
 ### Fixed
 - A pipeline step whose required wire resolves to nothing fails the pipeline and stops there: no later step starts on the failed record, `advance_step` records no approval and rejects the step's review with the cited reason, and the failure is announced once (including after a passed gate step).
 - With auth on, a re-adopted leg refused because its record names no workspace (a flow leg re-attached after a restart, the Temporal flow-leg activity, the remote-job control worker's poll and relaunch) cancels the engine job recorded for it, best-effort, instead of leaving it running unwatched.

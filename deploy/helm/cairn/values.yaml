@@ -78,11 +78,18 @@ worker:
 # worker-pool token, minted where CAIRN_JWT_SECRET is set with
 #   cairn remote worker-token --name <pool>
 # and read from CAIRN_ENGINE_TOKEN (or `--token`). A signed-in user's token gets
-# 403 on /jobs/claim. The pull worker reads the same ConfigMap and Secret as the
-# server (envFrom); the chart has no separate Secret for the worker token.
+# 403 on /jobs/claim. The worker reads the token from a Secret of its OWN, never
+# the control plane's (no JWT secret, admin password hash, database password,
+# model key or SSH key reaches it); it still reads the shared ConfigMap.
 pullWorker:
   enabled: false
   command: []          # REQUIRED when enabled — rendering fails without it
+  # REQUIRED when enabled, one of the two. `token` is rendered into the
+  # <release>-pull-worker Secret; `existingSecret` names a Secret you manage,
+  # holding the key CAIRN_ENGINE_TOKEN (and anything else the worker's jobs
+  # need). Never the control plane's Secret: the chart refuses that.
+  token: ""            # a worker-pool token (`cairn remote worker-token --name <pool>`)
+  existingSecret: ""
   replicaCount: 1
   resources:
     requests:

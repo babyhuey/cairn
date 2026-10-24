@@ -374,22 +374,93 @@ def test_pull_worker_is_off_by_default():
                 if d["metadata"]["name"].endswith("-pull-worker")]
 
 
+_PULL = {
+    "pullWorker.enabled": "true",
+    "pullWorker.command[0]": "cairn",
+    "pullWorker.command[1]": "worker",
+    "pullWorker.command[2]": "--pull",
+}
+
+#: What the control plane's Secret carries; none of it may reach the pull worker.
+_CONTROL_PLANE_KEYS = {"CAIRN_JWT_SECRET", "CAIRN_API_PASSWORD_HASH", "POSTGRES_PASSWORD",
+                       "OPENAI_API_KEY", "SSH_PRIVATE_KEY"}
+
+
 @needs_helm
 def test_pull_worker_renders_with_the_operator_supplied_command():
-    docs = render("values-postgres.example.yaml", sets={
-        "pullWorker.enabled": "true",
-        "pullWorker.command[0]": "cairn",
-        "pullWorker.command[1]": "worker",
-        "pullWorker.command[2]": "--pull",
-    })
+    docs = render("values-postgres.example.yaml", sets={**_PULL, "pullWorker.token": "wp-token"})
     dep = _by_name(docs, "Deployment", "-pull-worker")
     assert _main_container(dep)["command"] == ["cairn", "worker", "--pull"]
 
 
 @needs_helm
 def test_pull_worker_without_a_command_is_refused():
-    err = render_error("values-postgres.example.yaml", sets={"pullWorker.enabled": "true"})
+    err = render_error("values-postgres.example.yaml",
+                       sets={"pullWorker.enabled": "true", "pullWorker.token": "wp-token"})
     assert "pullWorker.command" in err
+
+
+@needs_helm
+def test_pull_worker_reads_its_token_from_its_own_secret():
+    """The worker gets CAIRN_ENGINE_TOKEN from a Secret of its own and nothing from
+    the control plane's Secret: no JWT secret, admin hash, database password, model
+    key or SSH key."""
+    docs = render("values-postgres.example.yaml", sets={**_PULL, "pullWorker.token": "wp-token"})
+    dep = _by_name(docs, "Deployment", "-pull-worker")
+    secret = _by_name(docs, "Secret", "-pull-worker")
+    assert secret["stringData"] == {"CAIRN_ENGINE_TOKEN": "wp-token"}
+    refs = [r["secretRef"]["name"] for r in _main_container(dep)["envFrom"] if "secretRef" in r]
+    assert refs == [secret["metadata"]["name"]]
+    env = effective_env(docs, dep)
+    assert "CAIRN_ENGINE_TOKEN" in env
+    assert not (_CONTROL_PLANE_KEYS & set(env)), _CONTROL_PLANE_KEYS & set(env)
+    # the server still reads the control plane's Secret, and not the worker's
+    server = effective_env(docs, _by_name(docs, "Deployment", "-server"))
+    assert "CAIRN_JWT_SECRET" in server and "CAIRN_ENGINE_TOKEN" not in server
+
+
+@needs_helm
+def test_pull_worker_takes_an_existing_secret():
+    docs = render("values-postgres.example.yaml", sets={**_PULL, "pullWorker.existingSecret": "pool-gpu"})
+    dep = _by_name(docs, "Deployment", "-pull-worker")
+    assert not [d for d in _kinds(docs, "Secret") if d["metadata"]["name"].endswith("-pull-worker")]
+    refs = [r["secretRef"]["name"] for r in _main_container(dep)["envFrom"] if "secretRef" in r]
+    assert refs == ["pool-gpu"]
+
+
+@needs_helm
+def test_pull_worker_renders_no_secret_when_disabled():
+    docs = render("values-postgres.example.yaml")
+    assert not [d for d in docs if d["metadata"]["name"].endswith("-pull-worker")]
+
+
+@needs_helm
+@pytest.mark.parametrize("extra,needle", [
+    ({}, "needs the worker's own token"),
+    ({"pullWorker.token": "a", "pullWorker.existingSecret": "b"}, "pick one"),
+    ({"pullWorker.existingSecret": "cairn-secrets"}, "the control plane's Secret"),
+])
+def test_pull_worker_token_is_refused_unless_its_own(extra, needle):
+    err = render_error("values-postgres.example.yaml", sets={**_PULL, **extra})
+    assert needle in err, err
+
+
+@needs_helm
+def test_pull_worker_token_must_not_be_the_jwt_secret():
+    jwt = yaml.safe_load(_values("values-postgres.example.yaml").read_text())["secrets"]["obsJwtSecret"]
+    err = render_error("values-postgres.example.yaml", sets={**_PULL, "pullWorker.token": jwt})
+    assert "JWT secret" in err, err
+
+
+def test_deploy_doctor_refuses_a_pull_worker_without_its_own_token():
+    from cairn.core.deploy_check import check_values
+
+    values = yaml.safe_load(_values("values-postgres.example.yaml").read_text())
+    values["pullWorker"] = {"enabled": True, "command": ["cairn", "worker", "--pull"]}
+    names = {r.name: r.status for r in check_values(values)}
+    assert names.get("pull_worker_token") == "fail"
+    values["pullWorker"]["token"] = "wp-token"
+    assert "pull_worker_token" not in {r.name for r in check_values(values)}
 
 
 # ── the compose profiles are mirrored, not invented ──────────────────────

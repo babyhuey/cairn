@@ -7,9 +7,25 @@ access.
 `pullWorker.command` is required and has no default (_helpers.tpl refuses an
 empty one), e.g. ["cairn", "worker", "--pull", "--engine-url", "https://<host>"].
 With auth on, claiming needs a worker-pool token (`cairn remote worker-token
---name <pool>`) in CAIRN_ENGINE_TOKEN; the container reads the same ConfigMap
-and Secret as the server (cairn.envFrom).
+--name <pool>`) in CAIRN_ENGINE_TOKEN. The worker reads it from a Secret of its
+OWN (pullWorker.token, rendered below, or pullWorker.existingSecret), never from
+the control plane's Secret: the worker gets no JWT secret, admin password hash,
+database password, model key or SSH key. It still reads the shared ConfigMap.
 */}}
+{{- if not .Values.pullWorker.existingSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "cairn.pullWorkerSecretName" . }}
+  labels:
+    {{- include "cairn.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pull-worker
+type: Opaque
+stringData:
+  # A worker-pool token: it may claim and report pull-lane jobs, nothing else.
+  CAIRN_ENGINE_TOKEN: {{ .Values.pullWorker.token | quote }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -30,6 +46,10 @@ spec:
         app.kubernetes.io/component: pull-worker
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.pullWorker.existingSecret }}
+        # a rotated token restarts the worker
+        checksum/token: {{ .Values.pullWorker.token | sha256sum }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "cairn.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
@@ -43,7 +63,7 @@ spec:
           command:
             {{- toYaml .Values.pullWorker.command | nindent 12 }}
           envFrom:
-            {{- include "cairn.envFrom" . | nindent 12 }}
+            {{- include "cairn.pullWorkerEnvFrom" . | nindent 12 }}
           resources:
             {{- toYaml .Values.pullWorker.resources | nindent 12 }}
       {{- with .Values.pullWorker.nodeSelector }}

@@ -637,6 +637,14 @@ def check_values(values: dict, strict: bool = False) -> list[CheckResult]:
             "pullWorker.enabled=true but pullWorker.command is empty — the chart does not "
             "hard-code D2's command (#565); supply it explicitly.",
             category="runtime"))
+    if _get(values, "pullWorker", "enabled") and not (
+            _get(values, "pullWorker", "token") or _get(values, "pullWorker", "existingSecret")):
+        out.append(CheckResult(
+            "pull_worker_token", "fail",
+            "pullWorker.enabled=true but neither pullWorker.token nor pullWorker.existingSecret "
+            "is set — the pull worker reads a worker-pool token (`cairn remote worker-token "
+            "--name <pool>`) from a Secret of its own, never the control plane's.",
+            category="secrets"))
 
     # ── ingress ──────────────────────────────────────────────────────────
     if _get(values, "ingress", "enabled", default=True):

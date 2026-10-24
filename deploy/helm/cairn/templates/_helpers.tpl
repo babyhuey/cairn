@@ -66,6 +66,23 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{/* The pull worker's OWN Secret (CAIRN_ENGINE_TOKEN), never the control plane's. */}}
+{{- define "cairn.pullWorkerSecretName" -}}
+{{- if .Values.pullWorker.existingSecret -}}
+{{- .Values.pullWorker.existingSecret -}}
+{{- else -}}
+{{- printf "%s-pull-worker" (include "cairn.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* The pull worker's envFrom: the shared ConfigMap, then its own Secret (it wins). */}}
+{{- define "cairn.pullWorkerEnvFrom" -}}
+- configMapRef:
+    name: {{ include "cairn.configMapName" . }}
+- secretRef:
+    name: {{ include "cairn.pullWorkerSecretName" . }}
+{{- end -}}
+
 {{- define "cairn.configMapName" -}}
 {{- printf "%s-config" (include "cairn.fullname" .) -}}
 {{- end -}}
@@ -194,6 +211,19 @@ deployment that has actually gone wrong somewhere, on compose or on a box.
 {{- /* The pull worker (`cairn worker --pull`, #565) has no default command. */ -}}
 {{- if and .Values.pullWorker.enabled (not .Values.pullWorker.command) -}}
 {{- fail "pullWorker.enabled=true but pullWorker.command is empty — the chart has no default command for the pull worker. Supply pullWorker.command explicitly, e.g. [cairn, worker, --pull, --engine-url, https://<host>]." -}}
+{{- end -}}
+{{- /* Its token comes from a Secret of its own, never the control plane's. */ -}}
+{{- if .Values.pullWorker.enabled -}}
+{{- if and .Values.pullWorker.token .Values.pullWorker.existingSecret -}}
+{{- fail "pullWorker.token AND pullWorker.existingSecret are both set — pick one: the chart renders a Secret from pullWorker.token only when pullWorker.existingSecret is empty." -}}
+{{- end -}}
+{{- $_ := required "pullWorker.enabled=true needs the worker's own token: set pullWorker.token to a worker-pool token (`cairn remote worker-token --name <pool>`), or pullWorker.existingSecret to a Secret with the key CAIRN_ENGINE_TOKEN. The pull worker never reads the control plane's Secret." (.Values.pullWorker.token | default .Values.pullWorker.existingSecret) -}}
+{{- if and .Values.pullWorker.token (eq .Values.pullWorker.token (toString .Values.secrets.obsJwtSecret)) -}}
+{{- fail "pullWorker.token equals secrets.obsJwtSecret — the worker must never hold the control plane's JWT secret. Mint a worker-pool token with `cairn remote worker-token --name <pool>`." -}}
+{{- end -}}
+{{- if eq (toString .Values.pullWorker.existingSecret) (include "cairn.secretName" .) -}}
+{{- fail (printf "pullWorker.existingSecret is %q, the control plane's Secret — the pull worker must not receive the JWT secret or the admin password hash. Give it a Secret of its own holding only CAIRN_ENGINE_TOKEN." .Values.pullWorker.existingSecret) -}}
+{{- end -}}
 {{- end -}}
 
 {{- /* Delegated profiles: refuse loudly, never pretend. */ -}}
