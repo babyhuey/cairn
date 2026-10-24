@@ -35,9 +35,9 @@ set them first when you run outside `cairn dev`:
 | `cairn pipeline run <ref>` | Launches a pipeline and follows it to the end. `-i key=value` (repeatable; values are parsed as JSON when possible), `-e` the environment, `--detach` returns at once. |
 
 A **ref** is `<pack>/<name>`, for example `hello-cairn/profile-and-publish`.
-When a flow has the same name as a pipeline, `show` and `explain` refuse the
-bare name: write `pipeline:<pack>/<name>`. `run` accepts the bare name and
-runs the pipeline.
+When a flow has the same name as a pipeline, `show`, `explain` and `run` all
+resolve the bare name to the declared pipeline (ADR-0106 D1).
+The explicit spelling `pipeline:<pack>/<name>` works too.
 
 Only declared pipelines run. A ref that names a flow, not a pipeline, is
 refused: a flow runs as a leg of a pipeline.
