@@ -1192,6 +1192,14 @@ async def check_compute_targets() -> list[CheckResult]:
     from cairn.core.deploy_check import check_compute_ssh  # noqa: PLC0415 - cli → core
 
     out: list[CheckResult] = []
+    # ADR-0150 D1 — the execution unit is the connection's mode/image over the
+    # environment's; read the environment's half here so the row matches what
+    # the engine will run. Unreadable → None, and the row says it depends.
+    try:
+        env_mode: str | None = selected("remote_exec_mode", default="auto") or "auto"
+        env_image: str | None = selected("remote_image", default="") or ""
+    except Exception:  # noqa: BLE001 — a broken profile is reported by check_profile
+        env_mode = env_image = None
     for key in ("dataflow_target", "ml_target"):
         try:
             target = (selected(key, default="") or "").strip()
@@ -1213,7 +1221,8 @@ async def check_compute_targets() -> list[CheckResult]:
         cfg = dict(getattr(resolved, "config", None) or {}) if resolved is not None else None
         secrets = getattr(resolved, "secrets", None) or {} if resolved is not None else {}
         out.extend(check_compute_ssh(
-            key, target, cfg, has_key=bool(secrets.get("PRIVATE_KEY"))))
+            key, target, cfg, has_key=bool(secrets.get("PRIVATE_KEY")),
+            env_mode=env_mode, env_image=env_image))
     return out
 
 

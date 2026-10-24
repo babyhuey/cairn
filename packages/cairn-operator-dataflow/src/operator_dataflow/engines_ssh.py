@@ -50,16 +50,23 @@ from cairn.core.dataflow.fetch import (  # noqa: F401 — re-exports
 
 from operator_dataflow.engines import BuiltinLocalEngine, _selected
 
-#: The image the engine runs when nothing more specific names one (ADR-0104 D1,
-#: #2071). PINNED on purpose — ``:latest`` means the run record cannot say which
-#: build produced the artifacts, and two dispatches a week apart silently run
-#: different code. The pin's ONE home is ``operator_training.images.GPU_IMAGE``
-#: (#2074): the workflow publishes that tag, and
-#: ``tests/core/test_gpu_image_pin.py`` fails if this copy drifts from it. This
-#: pack must not import the training pack, hence the literal. Prod should pin
-#: the immutable ``:<sha>`` tag via the ``remote_image`` backend /
-#: ``CAIRN_TRAIN_IMAGE``.
-DEFAULT_TRAIN_IMAGE = "ghcr.io/evs-cmd/cairn-train-gpu:v0.1.0"
+#: What image mode with no image named is told (#202). There is no built-in
+#: image: the deployment names the build it runs, so the run record names it
+#: too. PIN A TAG, never ``:latest`` — otherwise the record cannot say which
+#: build produced the artifacts. Two triggers, two remedies: the environment's
+#: ``remote_exec_mode`` does not override a connection's own ``mode``.
+IMAGE_REQUIRED = (
+    "remote_exec_mode is 'image' but no image is named: set the remote_image "
+    "backend (CAIRN_TRAIN_IMAGE) or the compute.ssh connection's 'image' to a "
+    "pinned tag, or set remote_exec_mode to 'auto' or 'venv' to run the box's "
+    "virtualenv"
+)
+CONNECTION_IMAGE_REQUIRED = (
+    "the compute.ssh connection sets mode = 'image' but no image is named: set "
+    "the connection's 'image' (or the remote_image backend, CAIRN_TRAIN_IMAGE) "
+    "to a pinned tag, or change the connection's 'mode' to 'auto' or 'venv' — "
+    "remote_exec_mode does not override a connection's own mode"
+)
 
 #: Env names the CONTAINER needs that the engine does not put in ``inp.env``
 #: itself: ``_submit`` adds CAIRN_RUN_ID after the command is built (#552), so
@@ -93,18 +100,23 @@ def resolve_exec_mode(config: Mapping[str, Any]) -> tuple[str, str, str]:
     * ``mode`` — the connection's ``mode``, else the environment's
       ``remote_exec_mode`` backend (profile record → ``CAIRN_REMOTE_EXEC_MODE``
       → default), else ``auto``. ``auto`` means "image if anything names an
-      image, otherwise the legacy venv" — so a deployment that names no image
-      is NOT flipped to containers behind its operator's back.
+      image, otherwise the box virtualenv" — so a deployment that names no
+      image is NOT flipped to containers behind its operator's back.
     * ``image`` — the connection's ``image`` (it names THIS box's build) beats
       the environment's ``remote_image`` backend / ``CAIRN_TRAIN_IMAGE`` (the
-      fleet default), which beats :data:`DEFAULT_TRAIN_IMAGE`.
+      fleet default). There is no built-in default (#202): ``image`` mode with
+      neither raises :class:`EngineError` — :data:`CONNECTION_IMAGE_REQUIRED`
+      when the connection's own ``mode`` chose image, else
+      :data:`IMAGE_REQUIRED`. This runs at submit, where the connection and
+      the environment are both known, before anything reaches the box.
     * ``gpus`` — the ``--gpus`` value; empty string disables the flag (a CPU
       box, or a runtime without the NVIDIA container toolkit).
 
-    ``mode == "venv"`` always returns an empty image: the legacy path must be
+    ``mode == "venv"`` always returns an empty image: the venv path must be
     byte-for-byte what it was, including its handle meta.
     """
     mode = str(config.get("mode") or "").strip().lower()
+    from_connection = bool(mode)
     if not mode:
         mode = _selected("remote_exec_mode", "auto").strip().lower() or "auto"
     named = (
@@ -120,7 +132,9 @@ def resolve_exec_mode(config: Mapping[str, Any]) -> tuple[str, str, str]:
         if config.get("gpus") is not None
         else getenv("CAIRN_DATAFLOW_IMAGE_GPUS", "all")
     ).strip()
-    return "image", named or DEFAULT_TRAIN_IMAGE, gpus
+    if not named:
+        raise EngineError(CONNECTION_IMAGE_REQUIRED if from_connection else IMAGE_REQUIRED)
+    return "image", named, gpus
 
 
 def _docker_command(image: str, inner: str, env_names: Iterable[str], gpus: str) -> str:
@@ -141,10 +155,10 @@ def _docker_command(image: str, inner: str, env_names: Iterable[str], gpus: str)
       surrounding shell, which ``runner.sh`` has already exported. The per-run
       job-channel token therefore never appears in the container's argv, where
       every ``ps`` on the box could read it.
-    * **``--entrypoint sh``** — the image's own ENTRYPOINT is the train_entry
-      runner (``deploy/images/train-gpu/Dockerfile``), so the flow kernel needs
-      an explicit override; going through ``sh -c`` keeps
-      ``CAIRN_DATAFLOW_IMAGE_CMD`` free to be any command, not just a bare binary.
+    * **``--entrypoint sh``** — a training image's own ENTRYPOINT is its
+      training runner, so the flow kernel needs an explicit override; going
+      through ``sh -c`` keeps ``CAIRN_DATAFLOW_IMAGE_CMD`` free to be any
+      command, not just a bare binary.
     """
     img = shlex.quote(image)
     gpu_flag = f" --gpus {shlex.quote(gpus)}" if gpus else ""
@@ -312,9 +326,10 @@ class BuiltinSshEngine:
             if _val:
                 env[_var] = _val
         # ADR-0104 D1 (#2071): the IMAGE is the unit of remote work. In image
-        # mode the box runs the CI-built cairn-train-gpu image and carries
-        # nothing of cairn's that can drift (#2069); venv mode is the legacy
-        # box install, unchanged.
+        # mode the box runs the image the deployment names and carries nothing
+        # of cairn's that can drift (#2069); venv mode is the box install,
+        # unchanged. Image mode with no image named raises here, before the
+        # exec layer is asked to run anything (#202).
         cfg = dict(getattr(exec_ctx.compute, "config", None) or {})
         mode, image, gpus = resolve_exec_mode(cfg)
         if mode == "image":
