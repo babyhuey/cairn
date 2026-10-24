@@ -103,13 +103,15 @@ _BOOL_WORDS = {"true": True, "1": True, "yes": True, "on": True,
 
 def _comma_list(val: str) -> Optional[list[str]]:
     """#197 — ``"a, b,,c"`` → ``["a", "b", "c"]``; ``None`` when the string is JSON
-    (or is meant to be: it opens with ``[``), so the JSON rule decides it."""
+    (or is meant to be: it opens with ``[``), so the JSON rule decides it. A string
+    with no items (``""``, ``" , "``) is also ``None``: it stays refused as before, so
+    ``-i k=`` cannot satisfy a required list input; an empty list is ``[]``."""
     if val.strip().startswith("["):
         return None
     try:
         json.loads(val)
     except ValueError:
-        return [item.strip() for item in val.split(",") if item.strip()]
+        return [item.strip() for item in val.split(",") if item.strip()] or None
     return None
 
 
@@ -133,9 +135,10 @@ def coerce_declared_inputs(d: PipelineDef, inputs: dict) -> dict:
     #197 — a ``list`` input also takes a comma-separated string
     (``-i report_to=mlflow,wandb`` → ``["mlflow", "wandb"]``; items trimmed,
     empty items dropped), because shell-quoting JSON is the first thing a new
-    user gets wrong. A value that parses as JSON keeps the JSON rule, and one
-    that opens with ``[`` but does not parse is refused as broken JSON rather
-    than split; a list of non-string items still needs JSON.
+    user gets wrong. A value that parses as JSON keeps the JSON rule, one that
+    opens with ``[`` but does not parse is refused as broken JSON rather than
+    split, and one with no items at all (``""``) is refused as before; a list of
+    non-string items, or an empty list, still needs JSON.
     """
     out = dict(inputs)
     for key, spec in (d.inputs or {}).items():

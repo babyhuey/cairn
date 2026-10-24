@@ -758,20 +758,26 @@ async def explain_pipeline(
     problems += [f"the runtime would refuse this launch: {p}" for p in runtime_owner_problems(plan)]
     problems += gate_path_problems(d, plan)
 
-    # #197 — the values typed by the launch door's own coercion, so `-i k=a,b` on
-    # a `list` input reads here as the list the launch will use; a value the
-    # door would refuse is a reported refusal, shown as supplied.
-    from cairn.core.dispatch.pipeline_launch import (  # noqa: PLC0415 - cycle: dispatch → engine
-        InputCoercionError, coerce_declared_inputs,
-    )
-
-    try:
-        inputs = coerce_declared_inputs(d, inputs or {})
-        preset_inputs = coerce_declared_inputs(d, preset_inputs or {})
-    except InputCoercionError as e:
-        problems.append(f"launch would refuse the inputs: {e}")
     layers = input_layers(d, supplied=inputs, preset_inputs=preset_inputs,
                           preset_name=preset_name)
+    # #197 — the values the launch will use, built as `launch_pipeline_def` builds
+    # them (the preset, the caller's inputs over it, then the declared defaults and
+    # the typed coercion, by the door's own functions), so `-i k=a,b` on a `list`
+    # input reads as the list and explain refuses exactly what the launch refuses.
+    # A refused value is reported and shown as written.
+    from cairn.core.dispatch.pipeline_launch import InputCoercionError  # noqa: PLC0415 - cycle: dispatch → engine
+    from cairn.core.dispatch.pipeline_preview import apply_input_defaults  # noqa: PLC0415 - cycle: dispatch → engine
+    from cairn.core.pipeline_presets import merge_over_preset  # noqa: PLC0415 - cycle: presets → engine
+
+    merged, _ = merge_over_preset(preset_inputs or {}, inputs or {})
+    try:
+        typed = apply_input_defaults(d, merged)
+    except InputCoercionError as e:
+        problems.append(f"launch would refuse the inputs: {e}")
+    else:
+        for key, layer in layers.items():
+            if key in typed:
+                layer["value"] = typed[key]
     authored = _authored(d)
 
     # #2134 S4 — the workspace's variables are a real layer (ADR-0101 D2): the

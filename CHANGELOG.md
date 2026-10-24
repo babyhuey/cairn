@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Added
-- A pipeline input declared `type: list` takes a comma-separated string as well as JSON: `-i report_to=mlflow,wandb` gives `["mlflow", "wandb"]` (items trimmed, empty items dropped). The launch door types it, so the CLI, the console and schedules agree, and `cairn pipeline explain -i` shows the typed value. A value that parses as JSON keeps the JSON rule, and one that opens with `[` but is not valid JSON is refused as before. (#197)
+- A pipeline input declared `type: list` takes a comma-separated string as well as JSON: `-i report_to=mlflow,wandb` gives `["mlflow", "wandb"]` (items trimmed, empty items dropped). The launch door types it, so the CLI, the console and schedules agree, and `cairn pipeline explain -i` shows the typed value and refuses what the launch refuses, declared defaults included. A value that parses as JSON keeps the JSON rule; a value that opens with `[` but is not valid JSON, and one with no items (`-i report_to=`), are refused as before. An empty list is `[]`. (#197)
 - `cairn ls <pack>` lists the deployment profiles the pack ships (`profiles/*.toml` beside its `pack.toml`), each with its `visibility` and its absolute installed path, so `CAIRN_PROFILE` can be set without looking in site-packages. `--json` carries the same under `profiles` (`name`, `path`, `absolute_path`, `visibility`). (#196)
 
 ### Changed
