@@ -25,6 +25,16 @@ change and disabling a user revoke the user's families
 (`triggers/auth.py`, `account.py`). An issued access token stays valid until it expires, and
 rotating `CAIRN_JWT_SECRET` does not end refresh families.
 
+**Artifact registry (ADR-0147, ADR-0148).** Tags, artifact reads and lineage are no longer
+deployment-wide: a tag is keyed by `(workspace_id, name)`, and an artifact is visible only to the
+workspaces that registered it. Identical bytes stay one content-addressed identity, but each
+registering workspace keeps and reads only its own registration (location, durable copy,
+provenance, stats) and the parents it declared (`artifact_owners`, `artifact_parents`). Another
+workspace's artifact, tag or lineage node reads as not found, and `promote` refuses an artifact
+the workspace did not register (`src/cairn/core/storage/artifacts.py`). With auth on, an artifact
+or tag call with no workspace named or in scope raises `WorkspaceScopeRequired`. `count` is still
+the deployment's row count.
+
 **Known gap:** with `CAIRN_JWT_SECRET` unset the control plane starts OPEN and says so at
 startup (`AUTH DISABLED …`, `src/cairn/core/triggers/server.py`); any authenticated user can
 approve any gate. Never expose an unset-secret server beyond localhost.
