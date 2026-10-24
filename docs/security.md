@@ -76,10 +76,6 @@ added; with auth off, or on a single-node deployment where everything belongs to
 - **Run hooks on `pipeline.launching` fail closed:** a provider that raises anything other
   than `AdmissionRefused` refuses the launch. Every other event still fails open.
 
-**Known limit:** artifact tags (`resolve` / `promote`) and artifact `get`, `lineage`,
-`list_artifacts` and `find_by_uri` are still deployment-wide. A content-addressed artifact
-row carries no workspace, so scoping them needs a storage key change, left for a follow-up.
-
 ## Secrets and credentials
 Declared connections, never values in pack data or specs: `secrets/env`, `secrets/infisical`
 operators; `.env` on the box (Infisical profile replaces it); provider tokens live in
