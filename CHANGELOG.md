@@ -6,6 +6,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 - A pipeline input declared `type: list` takes a comma-separated string as well as JSON: `-i report_to=mlflow,wandb` gives `["mlflow", "wandb"]` (items trimmed, empty items dropped). The launch door types it, so the CLI, the console and schedules agree, and `cairn pipeline explain -i` shows the typed value. A value that parses as JSON keeps the JSON rule, and one that opens with `[` but is not valid JSON is refused as before. (#197)
+- `cairn ls <pack>` lists the deployment profiles the pack ships (`profiles/*.toml` beside its `pack.toml`), each with its `visibility` and its absolute installed path, so `CAIRN_PROFILE` can be set without looking in site-packages. `--json` carries the same under `profiles` (`name`, `path`, `absolute_path`, `visibility`). (#196)
 
 ### Changed
 - Under `CAIRN_RUNTIME=temporal`, the launch door refuses a pipeline with a `task:` leg or a `finalizer:` step before any record exists, naming each such step and pointing to `inprocess` or `dbos`: HTTP 403 from `/pipelines/launch` and `/start`, exit 3 from `cairn pipeline run`, and a reported problem in `cairn pipeline explain`. The Temporal pipeline owner does not run either yet, so such a pipeline used to start and fail when it reached the step. The check reads what the owner declares it runs (`cairn.core.runtime.temporal.PIPELINE_OWNER_LEG_KINDS`, `PIPELINE_OWNER_RUNS_FINALIZERS`). `inprocess` and `dbos` are unchanged. (#199, ADR-0151 D10)

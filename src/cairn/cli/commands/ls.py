@@ -8,6 +8,8 @@ imports any pack directly — so the surface is exactly what the engine sees.
 
 Use cases:
   - Confirm a pack is discovered and loaded after ``pip install``.
+  - Find the deployment profiles a pack ships, by installed path, to point
+    ``CAIRN_PROFILE`` at one (#196).
   - See which capabilities are available before authoring a template.
   - Audit declared asset dirs vs what ``pack.toml`` claims.
 
@@ -105,6 +107,45 @@ def _flows_by_pack() -> dict[str, list[tuple[str, str]]]:
     return out
 
 
+# ─── shipped profiles (#196) ────────────────────────────────────────────────
+#
+# A pack may ship deployment profiles in `profiles/*.toml` beside its pack.toml
+# (the training pack's `finetune-ssh.toml`, the example's `hello.toml`). Setting
+# `CAIRN_PROFILE` needs the installed path, which otherwise means hunting in
+# site-packages. Read-only: the pack root comes from the asset dirs the registry
+# already holds, and each file is read only for its `[profile] visibility`.
+
+
+def _pack_root(p: Pack) -> Path | None:
+    """The directory holding the pack's ``pack.toml``: any asset dir the manifest
+    names, with its manifest-relative path taken off. ``None`` for a pack with no
+    asset dirs (nothing to anchor on)."""
+    m = p.manifest
+    if m is None:
+        return None
+    for key, attr in Pack._ASSET_FIELDS.items():
+        rel, path = getattr(m, key, None), getattr(p, attr, None)
+        if not rel or not path or ".." in Path(rel).parts:
+            continue
+        root = Path(path).parents[len(Path(rel).parts) - 1]
+        if (root / "pack.toml").is_file():
+            return root
+    return None
+
+
+def _profiles_of(p: Pack) -> list[dict[str, str]]:
+    """``[{name, path, absolute_path, visibility}]`` for each ``profiles/*.toml``
+    the pack ships; ``visibility`` is read the way the console's picker reads it."""
+    root = _pack_root(p)
+    if root is None or not (root / "profiles").is_dir():
+        return []
+    from cairn.core.ui_contract import _profile_visibility  # noqa: PLC0415 — the one reading of a profile's tier (#1570)
+
+    return [{"name": f.stem, "path": f"profiles/{f.name}", "absolute_path": str(f.resolve()),
+             "visibility": _profile_visibility(f)}
+            for f in sorted((root / "profiles").glob("*.toml"))]
+
+
 def _pack_to_dict(p: Pack, *, pipelines: dict[str, list[tuple[str, int, str]]] | None = None,
                   flows: dict[str, list[tuple[str, str]]] | None = None) -> dict[str, Any]:
     """Project a Pack into a JSON-safe summary. Descriptor *factories* are
@@ -118,6 +159,7 @@ def _pack_to_dict(p: Pack, *, pipelines: dict[str, list[tuple[str, int, str]]] |
         "pipelines": [{"name": n, "legs": k, "leg_kinds": kinds.split(",") if kinds else []}
                       for n, k, kinds in (pipelines or {}).get(pack_key(p.name), [])],
         "flows": [{"name": n, "kind": k} for n, k in (flows or {}).get(pack_key(p.name), [])],
+        "profiles": _profiles_of(p),
         "version": p.version,
         "description": p.description,
         "tags": list(p.tags),
@@ -166,6 +208,10 @@ def _render_text(packs: list[Pack]) -> str:
         if not pipelines.get(pack_key(p.name)) and not flows.get(pack_key(p.name)):
             lines.append("  runnable: nothing — this pack contributes code, not "
                          "pipelines or flows")
+        if (profiles := _profiles_of(p)):
+            lines.append("  profiles (export CAIRN_PROFILE=<installed path>):")
+            for prof in profiles:
+                lines.append(f"    - {prof['path']}  [{prof['visibility']}]  {prof['absolute_path']}")
 
         # Contributions summary — one line per non-empty category.
         contrib: list[str] = []

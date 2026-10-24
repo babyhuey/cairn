@@ -23,7 +23,7 @@ set them first when you run outside `cairn dev`:
 | `cairn dev --engine-only` | Starts the engine on SQLite with the in-process runtime and sign-in as `dev`/`dev`. `--port` sets the port (default 8000), `--db` the SQLite file (default `~/.cairn/dev.db`), `--seed` loads demo records first. Without `--engine-only` it also starts the console's dev server, which is part of cairn-platform. |
 | `cairn demo` | Seeds a demo workspace (default `demo`; `-w` to choose). `--archive` removes the demo workspace again, keeping its runs and audit entries. |
 | `cairn doctor` | Checks the environment configuration and whether configured services are reachable. `--strict` fails on warnings. |
-| `cairn ls` | Lists the installed packs and what each contributes; `cairn ls operators` prints the operator map. |
+| `cairn ls` | Lists the installed packs and what each contributes; `cairn ls <pack>` for one pack, `--json` for the raw shape. A pack's deployment profiles (`profiles/*.toml`) are listed with their `visibility` and absolute installed path, the value to give `CAIRN_PROFILE`. `cairn ls operators` prints the operator map. |
 
 ## Pipelines
 
