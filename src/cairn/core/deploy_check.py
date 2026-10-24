@@ -778,12 +778,41 @@ _SSH_REQUIRED = {
 }
 
 
+def _exec_unit(conn_mode: str, conn_image: str, env_mode: str,
+               env_image: str) -> tuple[str, str, bool]:
+    """What the builtin SSH engine will run on a box: ``(kind, image,
+    from_connection)`` with ``kind`` one of ``venv`` / ``image`` / ``refused``.
+
+    A TWIN of ``operator_dataflow.engines_ssh.resolve_exec_mode`` — core may
+    not import an operator pack, so the precedence is restated here and
+    ``tests/core/test_exec_unit_parity.py`` runs one matrix through both. The
+    connection's ``mode`` beats the environment's ``remote_exec_mode``; the
+    connection's ``image`` beats ``remote_image``; ``auto`` (or anything else)
+    is image when an image is named, else venv; image mode with no image
+    anywhere is refused at submit (ADR-0150 D1). ``from_connection`` says
+    whether the connection's own ``mode`` chose it, which decides the remedy."""
+    mode = (conn_mode or "").strip().lower()
+    from_connection = bool(mode)
+    if not mode:
+        mode = (env_mode or "").strip().lower() or "auto"
+    named = (conn_image or "").strip() or (env_image or "").strip()
+    if mode not in ("image", "venv"):
+        mode = "image" if named else "venv"
+    if mode == "venv":
+        return "venv", "", from_connection
+    if not named:
+        return "refused", "", from_connection
+    return "image", named, from_connection
+
+
 def check_compute_ssh(
     key: str,
     target: str,
     config: dict | None,
     *,
     has_key: bool | None = None,
+    env_mode: str | None = None,
+    env_image: str | None = None,
 ) -> list[CheckResult]:
     """Validate the ``compute.ssh`` connection an environment names as its
     compute target. Pure: the caller resolves the connection.
@@ -797,11 +826,15 @@ def check_compute_ssh(
     Empty ``target`` returns no rows: an environment with no compute target
     runs ML in-process, which is a legal dev shape.
 
-    A second row reports the EXECUTION UNIT (ADR-0104 D1): a target with no
-    image still runs from the box's hand-installed virtualenv, which is the
-    thing that drifted and blocked 2026-09-07 (#2069), and an image pinned to
-    ``:latest`` (or to no tag at all) means the run record cannot name the
-    build that produced its artifacts.
+    A second row reports the EXECUTION UNIT (ADR-0104 D1, ADR-0150 D1) with
+    the engine's own precedence (:func:`_exec_unit`): ``env_mode`` /
+    ``env_image`` are the environment's selected ``remote_exec_mode`` /
+    ``remote_image``. Venv is OK; image mode with no image anywhere is a FAIL,
+    because the engine refuses it at submit; an image pinned to ``:latest``
+    (or to no tag at all) warns, because the run record then cannot name the
+    build that produced its artifacts. A caller that cannot read the
+    environment passes neither, and a row whose answer depends on it is a
+    conditional warn that says so.
     """
     name = f"compute_target:{key}"
     if not (target or "").strip():
@@ -834,34 +867,55 @@ def check_compute_ssh(
         f"{key} → {target!r} = {config.get('user')}@{config.get('host')}:{port}",
         category="runtime")]
 
-    image = str(config.get("image") or "").strip()
-    mode = str(config.get("mode") or "").strip().lower()
+    conn_image = str(config.get("image") or "").strip()
+    conn_mode = str(config.get("mode") or "").strip()
     mode_name = f"{name}:mode"
-    if mode == "venv" or (not image and mode != "image"):
+    if env_mode is None and env_image is None:
+        # The environment was not read: decide only what holds for every
+        # environment, and say the rest depends on it.
+        outcomes = {_exec_unit(conn_mode, conn_image, m, i)
+                    for m in ("auto", "venv", "image") for i in ("", "<environment image>")}
+        if len(outcomes) != 1:
+            out.append(CheckResult(
+                mode_name, "warn",
+                f"{target!r}: what runs depends on the environment's "
+                f"`remote_exec_mode` / `remote_image`, which were not read here — "
+                f"the box's virtualenv when no image is named; image mode with no "
+                f"image on the connection or in `remote_image` / CAIRN_TRAIN_IMAGE "
+                f"is refused at submit",
+                category="runtime"))
+            return out
+        kind, image, from_connection = outcomes.pop()
+    else:
+        kind, image, from_connection = _exec_unit(
+            conn_mode, conn_image, env_mode or "", env_image or "")
+    if kind == "venv":
         out.append(CheckResult(
-            mode_name, "warn",
-            f"{target!r} runs from the box's hand-installed virtualenv (venv "
-            f"mode) — that install drifts and stopped carrying the flow kernel "
-            f"the fine-tune flow needs (#2069). Set the connection's `image` "
-            f"(or the `remote_image` backend / CAIRN_TRAIN_IMAGE) to the pinned "
-            f"cairn-train-gpu tag; ADR-0104 D1.",
+            mode_name, "ok", f"{target!r} runs from the box's virtualenv (venv mode)",
             category="runtime"))
         return out
-    tag = image.rsplit("/", 1)[-1].partition(":")[2] if image else ""
-    if not image:
+    if kind == "refused":
+        if from_connection:
+            detail = (f"{target!r} sets mode = image but no image is named — every "
+                      f"dispatch is refused at submit. Set the connection's `image` "
+                      f"to a pinned tag, or change its `mode` (the environment's "
+                      f"`remote_exec_mode` does not override a connection's mode).")
+        else:
+            detail = (f"{target!r} runs in image mode (`remote_exec_mode`) but no "
+                      f"image is named — every dispatch is refused at submit. Set "
+                      f"`remote_image` / CAIRN_TRAIN_IMAGE or the connection's "
+                      f"`image` to a pinned tag, or set `remote_exec_mode` to auto "
+                      f"or venv.")
+        out.append(CheckResult(mode_name, "fail", detail, category="runtime"))
+        return out
+    tag = image.rsplit("/", 1)[-1].partition(":")[2]
+    if not tag or tag == "latest":
         out.append(CheckResult(
             mode_name, "warn",
-            f"{target!r} is in image mode but names no image — the engine falls "
-            f"back to its pinned default; pin the tag explicitly so the "
-            f"environment, not the code, decides which build runs.",
-            category="runtime"))
-    elif not tag or tag == "latest":
-        out.append(CheckResult(
-            mode_name, "warn",
-            f"{target!r} runs {image!r} — a moving tag. The run record then "
-            f"cannot name the build that produced its artifacts (the ambiguity "
-            f"behind #1776). Pin an immutable tag, e.g. the image workflow's "
-            f":<sha>.",
+            f"{target!r} runs the image {image!r} — a moving tag. The run record "
+            f"then cannot name the build that produced its artifacts (the "
+            f"ambiguity behind #1776). Pin an immutable tag, e.g. the image "
+            f"workflow's :<sha>.",
             category="runtime"))
     else:
         out.append(CheckResult(
