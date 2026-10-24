@@ -54,6 +54,7 @@ from cairn.core.dataset_roles import (
 )
 from cairn.core.intake import VERDICTS, normalize_verdict
 from cairn.core.pg_schema_init import schema_init_lock
+from cairn.core.storage.artifact_bytes import local_path as _local_path
 from cairn.core.storage.artifact_bytes import relay as _relay_bytes
 from cairn.core.storage.migrations import (
     add_missing_columns,
@@ -1504,7 +1505,8 @@ def parse_dataset_ref(ref: str) -> Optional[tuple[str, Optional[int]]]:
 
 
 async def resolve_dataset_ref(store: ArtifactStore, ref: str, *,
-                              workspace_id: Optional[str] = None) -> Optional[dict]:
+                              workspace_id: Optional[str] = None,
+                              prefer_durable: bool = False) -> Optional[dict]:
     """Resolve a ``dataset:`` ref against the registry: the concrete location
     PLUS the hash the bytes must match — the retrieval rule that makes a name
     a guarantee, not just a pointer (#1466). ``None`` when ``ref`` isn't a
@@ -1515,7 +1517,15 @@ async def resolve_dataset_ref(store: ArtifactStore, ref: str, *,
     scope (the run's, scoped from its record). The name, a pinned version and
     ``@latest`` see only that workspace's versions; another workspace's is "not
     found". With auth on and no workspace in scope it raises
-    :class:`~cairn.core.workspace.WorkspaceScopeRequired`."""
+    :class:`~cairn.core.workspace.WorkspaceScopeRequired`.
+
+    ``uri`` is where the bytes are read: the location the workspace registered
+    them at, except that the workspace's own durable copy (``durable_uri``,
+    #1395) is handed out instead when there is one and either the caller runs
+    elsewhere (``prefer_durable``: a leg on a remote engine, which cannot read a
+    control-plane path) or that location is a local path that no longer exists
+    (a cleaned ``/tmp``). The registration itself is unchanged: ``rec.uri``
+    stays the provenance (ADR-0149)."""
     parsed = parse_dataset_ref(ref)
     if parsed is None:
         return None
@@ -1525,7 +1535,12 @@ async def resolve_dataset_ref(store: ArtifactStore, ref: str, *,
     if got is None:
         raise KeyError(f"dataset ref {ref!r} not found in the registry")
     v, rec = got
-    return {"name": name, "version": v, "uri": rec.uri,
+    uri = rec.uri
+    if rec.durable_uri:
+        path = _local_path(rec.uri)
+        if prefer_durable or (path is not None and not os.path.exists(path)):
+            uri = rec.durable_uri
+    return {"name": name, "version": v, "uri": uri,
             "content_hash": rec.id, "size_bytes": rec.size_bytes}
 
 
@@ -1546,7 +1561,8 @@ def config_has_dataset_ref(config: dict) -> bool:
 
 
 async def resolve_dataset_refs_in_config(store: ArtifactStore, config: dict, *,
-                                         workspace_id: Optional[str] = None) -> dict:
+                                         workspace_id: Optional[str] = None,
+                                         prefer_durable: bool = False) -> dict:
     """Rewrite every ``dataset:`` ref in a leg's config to its resolved location
     WITH the expected hash as a URI fragment (``s3://…#sha256=<hash>``) — the
     launch-time half of #1466's retrieval rule. The fragment convention rides
@@ -1564,7 +1580,8 @@ async def resolve_dataset_refs_in_config(store: ArtifactStore, config: dict, *,
     defined launch-time meaning, and quietly rewriting one would invent a
     contract nobody declared.
 
-    Every ref resolves in one workspace (see :func:`resolve_dataset_ref`).
+    Every ref resolves in one workspace, and to the location
+    :func:`resolve_dataset_ref` picks with ``prefer_durable``.
     """
     out = dict(config)
     if not config_has_dataset_ref(config):
@@ -1572,14 +1589,16 @@ async def resolve_dataset_refs_in_config(store: ArtifactStore, config: dict, *,
     ws = (workspace_id or "").strip() or scoped_workspace()
     for key, value in config.items():
         if _is_dataset_ref(value):
-            resolved = await resolve_dataset_ref(store, value, workspace_id=ws)
+            resolved = await resolve_dataset_ref(store, value, workspace_id=ws,
+                                                prefer_durable=prefer_durable)
             if resolved is not None:
                 out[key] = f"{resolved['uri']}#sha256={resolved['content_hash']}"
         elif isinstance(value, list) and any(_is_dataset_ref(x) for x in value):
             items = list(value)
             for i, item in enumerate(items):
                 if _is_dataset_ref(item):
-                    r = await resolve_dataset_ref(store, item, workspace_id=ws)
+                    r = await resolve_dataset_ref(store, item, workspace_id=ws,
+                                                  prefer_durable=prefer_durable)
                     if r is not None:
                         items[i] = f"{r['uri']}#sha256={r['content_hash']}"
             out[key] = items

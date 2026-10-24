@@ -251,8 +251,15 @@ async def execute_leg(
         resolve_dataset_refs_in_config,
     )
     if config_has_dataset_ref(config):
+        # An engine whose job runs on another machine (the SSH engine) declares
+        # `needs_durable_inputs`: a control-plane path means nothing there, so its
+        # refs resolve to the durable copy whenever one exists (ADR-0149).
+        from cairn.core.dataflow.engine import needs_durable_inputs  # noqa: PLC0415 - cycle: engine → contract ← this module
+
+        durable = needs_durable_inputs(engine)
         try:
-            config = await resolve_dataset_refs_in_config(build_artifact_store(), config)
+            config = await resolve_dataset_refs_in_config(
+                build_artifact_store(), config, prefer_durable=durable)
         except Exception as e:  # noqa: BLE001 — an unresolvable dataset is a leg failure, not a crash
             return LegOutcome(state="failed", error=f"dataset ref resolution failed: {e}")
     # #1467 — judge refs resolve HERE too (same D4 rationale): `judge:<name>[@N]`

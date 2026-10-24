@@ -145,6 +145,11 @@ BACKENDS: list[BackendField] = [
         default="", env="CAIRN_TRAIN_IMAGE",
         description="The container image the SSH engine runs on the box. There is no default: with no image named here or on the connection, 'auto' runs the box's virtualenv and image mode is refused at submit. PIN A TAG, never :latest — the run record has to name the exact build that produced the artifacts; pin an immutable tag such as the image's :<sha>. A compute.ssh connection's own 'image' key overrides this per box.",
     ),
+    BackendField(
+        key="remote_env", label="Env forwarded to the remote job", group="Data plane", control="text",
+        default="", env="CAIRN_REMOTE_ENV",
+        description="Comma- or space-separated NAMES of control-plane environment variables the builtin SSH engine passes to the job on the compute.ssh box (e.g. CAIRN_CHECKPOINT_BUCKET, CAIRN_CHECKPOINT_PREFIX, AWS_DEFAULT_REGION), in addition to the spec, the live channel and MLFLOW_*. Set ones only; values go in the job's owner-only runner.sh (or docker run -e NAME), never on a command line. A name that looks like a credential (KEY, SECRET, TOKEN, PASSWORD) or that the engine sets itself is refused and the flow does not start: credentials stay on the box (an instance role).",
+    ),
     # ── Metaflow substrate (ADR-0089, #1345) — identity/compute split. Before
     # this block, `<kind>_target` was OVERLOADED as the Metaflow metadata root,
     # so "Metaflow AND a compute target" was unsayable. These keys give each
