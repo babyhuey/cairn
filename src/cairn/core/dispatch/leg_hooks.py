@@ -100,6 +100,10 @@ COST_ESTIMATE_KEY = "cost_estimate"
 NOT_PRICED = "not priced"
 #: A target spelled ``worker:<pool>`` is a pull-worker pool, not a connection.
 WORKER_TARGET_PREFIX = "worker:"
+#: The one engine whose target names a ``compute.ssh`` connection it dispatches to
+#: (ADR-0152): any other engine's ``<kind>_target`` means something else (a legacy
+#: Metaflow metadata root, a pool, a cluster) and is never priced.
+PRICED_ENGINE = "builtin"
 
 
 class LegPriceUnreadable(RuntimeError):
@@ -110,16 +114,20 @@ class LegPriceUnreadable(RuntimeError):
 
 
 def compute_target_for_kind(kind: str) -> str:
-    """The compute TARGET a flow of ``kind`` dispatches to — the same selection
-    ``resolve_engine`` reads (``ml_target`` for ``kind: ml``, ``dataflow_target``
-    otherwise) through the one config plane. ``""`` = no target (the local
-    builtin engine). Shared by the bridge (``_leg_target``) and the launch door,
-    so the leg that is priced is the leg that runs there. A selection that cannot
-    be read RAISES: the door refuses on it; the bridge's cap lookup degrades."""
-    from cairn.core.backend_selection import selected  # noqa: PLC0415 - cycle: selection → profile → pack
+    """The compute TARGET a flow of ``kind`` dispatches to (``ml_target`` for ``kind:
+    ml``, ``dataflow_target`` otherwise) — the target half of
+    :func:`engine_and_target_for_kind`, the bridge's per-target cap key. ``""`` = no
+    target. A selection that cannot be read RAISES (the bridge degrades it to "no cap")."""
+    return engine_and_target_for_kind(kind)[1]
 
-    key = "ml_target" if kind == "ml" else "dataflow_target"
-    return str(selected(key, default="") or "").strip()
+
+def engine_and_target_for_kind(kind: str) -> tuple[str, str]:
+    """``(engine, target)`` the environment selects for a flow of ``kind`` — the
+    selection ``resolve_engine`` builds from (``engine_registry.selected_engine``).
+    A selection that cannot be read RAISES."""
+    from cairn.core.dataflow.engine_registry import selected_engine  # noqa: PLC0415 - cycle: registry → selection → pack
+
+    return selected_engine(kind)
 
 
 def _hourly_rate(name: str, config: dict) -> float:
@@ -242,10 +250,18 @@ async def price_plan(plan: Any, *, store: Any = None) -> dict:
             continue
         kind = flow_kind_of(s.ref)
         try:
-            target = compute_target_for_kind(kind)
+            engine, target = engine_and_target_for_kind(kind)
         except Exception as e:  # noqa: BLE001 — a selection error is unknown, never "no target"
-            raise LegPriceUnreadable(f"leg {s.id!r}: its compute target cannot be read "
+            raise LegPriceUnreadable(f"leg {s.id!r}: its engine and compute target cannot be read "
                                      f"({type(e).__name__}: {e})") from e
+        if not target:
+            continue
+        if engine != PRICED_ENGINE:
+            # ADR-0152 — only the builtin engine dispatches to a connection; another
+            # engine's target is not one, so it is neither priced nor looked up.
+            legs.append({"step": s.id, "priced": False, "connection": target,
+                         "basis": f"{NOT_PRICED} (engine {engine!r} does not dispatch to a connection)"})
+            continue
         runs, why = _leg_runs(plan, s, kind)
         try:
             price = await price_flow_leg(target, getattr(s, "timeout_s", None), store=store,
@@ -558,6 +574,7 @@ class FlowLegHooks:
         }
 
 
-__all__ = ["COST_ESTIMATE_KEY", "FlowLegHooks", "LegPriceUnreadable", "NOT_PRICED", "PRICED_TARGET_KIND",
+__all__ = ["COST_ESTIMATE_KEY", "FlowLegHooks", "LegPriceUnreadable", "NOT_PRICED", "PRICED_ENGINE",
+           "PRICED_TARGET_KIND", "engine_and_target_for_kind",
            "compute_target_for_kind", "estimate_evidence", "leg_price_kwargs", "price_flow_leg",
            "price_plan", "publish_pipeline_audit", "recorded_cost_estimate", "recorded_leg_price"]

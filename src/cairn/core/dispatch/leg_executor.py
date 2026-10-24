@@ -23,7 +23,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-from cairn.core.budget_reservations import BudgetExceeded, held_for_run, release, reserve, settle
+from cairn.core.budget_reservations import (
+    BudgetExceeded, held_for_run, release, reserve, settle, settled_usd_for_run,
+)
 from cairn.core.dataflow import DataflowSpec
 from cairn.core.runtime.retry import RetryPolicy
 from cairn.core.dataflow.engine import is_terminal
@@ -372,6 +374,8 @@ async def execute_leg(
     #: ADR-0151 D5 — box time settled by the attempts so far; each attempt settles
     #: only its own window, and the next one's reservation counts what came before.
     gpu_total = 0.0
+    #: ledger errors of earlier attempts: kept on whatever outcome the leg ends with
+    ledger_notes: list[str] = []
     for attempt in range(1, attempts + 1):
         # Governance invariant: EVERY attempt is admitted — the reservation is
         # taken per attempt (a retry is new spend, never free) and a budget
@@ -390,8 +394,9 @@ async def execute_leg(
                 # #1441 — the caller could not read what earlier legs spent (an
                 # adopted leg proceeds without it); a FRESH attempt is new spend
                 # and unknown spend is never "nothing spent".
-                return LegOutcome(state="failed", gpu_usd=round(gpu_total, 6), error=(
-                    "budget: the spend of earlier legs is unreadable; a new attempt is not admitted"))
+                return _with_notes(LegOutcome(state="failed", gpu_usd=round(gpu_total, 6), error=(
+                    "budget: the spend of earlier legs is unreadable; a new attempt is not admitted")),
+                    ledger_notes)
             try:
                 reservation = await reserve(
                     series_id, est_usd=float(estimated_usd or 0.0),
@@ -404,7 +409,8 @@ async def execute_leg(
                 )
             except BudgetExceeded as e:
                 # an earlier attempt's box time stays on the leg's record
-                return LegOutcome(state="failed", error=str(e), gpu_usd=round(gpu_total, 6))
+                return _with_notes(LegOutcome(state="failed", error=str(e), gpu_usd=round(gpu_total, 6)),
+                                   ledger_notes)
 
         retriable = False
         try:
@@ -511,10 +517,12 @@ async def execute_leg(
         gpu = _box_time_usd(hourly_usd, attempt_started)
         gpu_total += gpu
         out.gpu_usd = round(gpu_total, 6)
-        await _close_attempt(out, reservation, actual_usd=(out.cost_usd if out.ok else 0.0) + gpu,
-                             adopted_run_id=str(run_id or "") if adopted_attempt else "")
+        note = await _close_attempt(out, reservation, actual_usd=(out.cost_usd if out.ok else 0.0) + gpu,
+                                    adopted_run_id=str(run_id or "") if adopted_attempt else "")
+        if note:
+            ledger_notes.append(note)
         if out.ok or not retriable or attempt >= attempts:
-            return out
+            return _with_notes(out, ledger_notes)
         if on_retry is not None:
             # visibility invariant: every retry is announced (run event) with
             # the attempt number and the cause it is retrying past.
@@ -524,24 +532,41 @@ async def execute_leg(
                 logger.debug("leg %s: on_retry emit failed", ref, exc_info=True)
         await asyncio.sleep(min(delay, float(policy.maximum_interval_seconds or delay)))
         delay = delay * float(policy.backoff_coefficient or 1.0)
+    return _with_notes(out, ledger_notes)
+
+
+def _with_notes(out: LegOutcome, notes: list[str]) -> LegOutcome:
+    """Append every ledger note to the outcome the leg ends with (never replace)."""
+    for note in notes:
+        if note not in (out.error or ""):
+            out.error = f"{out.error}; {note}" if out.error else note
     return out
 
 
 async def _close_attempt(out: LegOutcome, reservation: Any, *, actual_usd: float,
-                         adopted_run_id: str = "") -> None:
+                         adopted_run_id: str = "") -> str:
     """Close one attempt's hold: ``settle`` at ``actual_usd`` when it succeeded or
-    cost something, else ``release`` (nothing billed). An ADOPTED attempt holds no reservation of its own: the hold is
-    the one the process that submitted it took (stamped with the run id) and left
-    ``held`` when it died; it is closed here the way ``_close_reservations`` closes a
-    template's, through ``held_for_run`` — the first at the attempt's cost, any other
-    at 0 — so a dead process's estimate stops counting once the window is recorded.
+    cost something, else ``release`` (nothing billed).
 
-    A ledger failure is surfaced as one (logged, and named in ``out.error``); it
-    never changes the engine outcome or the box time already accounted."""
+    An ADOPTED attempt holds no reservation of its own: the hold is the one the
+    process that submitted it took (stamped with the run id) and left ``held`` when
+    it died. It is closed the way ``_close_reservations`` closes a template's,
+    through ``held_for_run``. Its window runs from the leg's start, so it already
+    covers the run's earlier attempts; what those settled
+    (``settled_usd_for_run``) is subtracted, floored at 0, so the run's settled rows
+    add up to the adopted window and nothing is settled twice (ADR-0152). Any
+    further held row closes at 0.
+
+    Returns a note when the ledger fails — logged, never a change to the engine
+    outcome or the box time already accounted; ``""`` otherwise."""
     billed = out.ok or actual_usd > 0
     try:
         if adopted_run_id:
-            for i, held in enumerate(await held_for_run(adopted_run_id)):
+            held_rows = await held_for_run(adopted_run_id)
+            if held_rows and billed:
+                already = await settled_usd_for_run(adopted_run_id)
+                actual_usd = max(0.0, round(actual_usd - already, 6))
+            for i, held in enumerate(held_rows):
                 if billed:
                     await settle(held, actual_usd=actual_usd if i == 0 else 0.0)
                 else:
@@ -553,8 +578,8 @@ async def _close_attempt(out: LegOutcome, reservation: Any, *, actual_usd: float
     except Exception as e:  # noqa: BLE001 — a ledger error is not an engine outcome
         logger.exception("budget ledger: could not close the reservation for run %s", adopted_run_id
                          or getattr(reservation, "run_id", ""))
-        note = f"budget ledger: the reservation could not be closed ({type(e).__name__}: {e})"
-        out.error = f"{out.error}; {note}" if out.error else note
+        return f"budget ledger: the reservation could not be closed ({type(e).__name__}: {e})"
+    return ""
 
 
 def _wall_now() -> datetime:
