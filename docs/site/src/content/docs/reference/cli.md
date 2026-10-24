@@ -49,7 +49,7 @@ refused: a flow runs as a leg of a pipeline.
 | `0` | the pipeline completed |
 | `1` | it failed or was cancelled, or the ref is unknown, ambiguous or missing required inputs |
 | `2` | the ref names a flow, not a pipeline; or `--detach` under the in-process runtime, which would leave nothing driving the pipeline |
-| `3` | refused before it started: a policy denied the launch, or admission refused it |
+| `3` | refused before it started: a policy denied the launch, admission refused it, or the runtime cannot run one of its steps (under `CAIRN_RUNTIME=temporal`, a `task:` leg or a `finalizer:` step) |
 | `130` | interrupted with Ctrl-C |
 
 ## Flows

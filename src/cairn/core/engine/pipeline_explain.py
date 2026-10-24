@@ -752,6 +752,10 @@ async def explain_pipeline(
     except Exception as e:  # noqa: BLE001 — a deny is a REPORTED refusal here, not a raise
         problems.append(f"policy would refuse this launch: {e}")
 
+    # #199 — the launch door's runtime-owner refusal, by the door's own function.
+    from cairn.core.dispatch.pipeline_launch import runtime_owner_problems  # noqa: PLC0415 - cycle: dispatch → engine
+
+    problems += [f"the runtime would refuse this launch: {p}" for p in runtime_owner_problems(plan)]
     problems += gate_path_problems(d, plan)
 
     # #197 — the values typed by the launch door's own coercion, so `-i k=a,b` on

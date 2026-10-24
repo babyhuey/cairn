@@ -156,8 +156,11 @@ engine. Pipelines don't change.
 Always set `CAIRN_STORAGE` for a server you want to keep. SQLite is for one
 host; use Postgres (the `storage-postgres` extra) when more than one process
 touches the data. `dbos` (the `runtime-dbos` extra) recovers a run at the next
-boot without an extra server. Under `temporal` a `task:` leg fails today, so
-use `inprocess` or `dbos` for pipelines with task legs.
+boot without an extra server. Under `temporal` the launch is refused, before
+anything is recorded, for a pipeline with a `task:` leg or a `finalizer:` step:
+the Temporal pipeline owner does not run either yet. The refusal names the step
+(HTTP 403, `cairn pipeline run` exits 3); use `inprocess` or `dbos` for such
+pipelines.
 
 The deployment **profile** decides which operator serves each capability. Set
 it with `CAIRN_PROFILE`; see
