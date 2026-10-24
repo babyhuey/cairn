@@ -101,7 +101,7 @@ proof for Metaflow is `tests/core/test_training_core_golden_path.py::test_the_sa
 ## Local vs remote boundaries
 The control plane never reaches into a box for rows; a box never reaches the database.
 Remote execution moves **the image and the spec** (ADR-0104): the GPU trainer image is built
-by CI and pinned by tag (`RUNBOOK-gpu-finetune-ssh.md`), secrets reach the flow as a scoped
+by CI and pinned by tag, secrets reach the flow as a scoped
 set (ADR-0089 D3), tracking credentials are forwarded by the `run-train-remote` binding.
 On the builtin SSH path (ADR-0149) the job's environment is the spec, the live channel,
 `MLFLOW_*` and the deployment's `remote_env` names (credential-looking names refused). An

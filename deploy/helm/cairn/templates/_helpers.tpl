@@ -191,9 +191,9 @@ deployment that has actually gone wrong somewhere, on compose or on a box.
 {{- fail "CAIRN_ML_ENGINE=skypilot with server.persistence.enabled=false — SkyPilot keeps its cluster state in ~/.sky, so a pod restart would forget every machine it provisioned and `sky down` could not terminate them. They would keep billing. Enable server.persistence, or select an engine that does not provision." -}}
 {{- end -}}
 
-{{- /* D2 (#565) is being built in parallel; the chart must not guess its flags. */ -}}
+{{- /* The pull worker (`cairn worker --pull`, #565) has no default command. */ -}}
 {{- if and .Values.pullWorker.enabled (not .Values.pullWorker.command) -}}
-{{- fail "pullWorker.enabled=true but pullWorker.command is empty — the pull worker's command comes from D2 (#565, `cairn worker --pull`), which this chart deliberately does not hard-code. Supply pullWorker.command explicitly." -}}
+{{- fail "pullWorker.enabled=true but pullWorker.command is empty — the chart has no default command for the pull worker. Supply pullWorker.command explicitly, e.g. [cairn, worker, --pull, --engine-url, https://<host>]." -}}
 {{- end -}}
 
 {{- /* Delegated profiles: refuse loudly, never pretend. */ -}}
