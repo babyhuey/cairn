@@ -136,7 +136,7 @@ BACKENDS: list[BackendField] = [
     # to move the SSH path onto the CI-built image.
     BackendField(
         key="remote_exec_mode", label="Remote execution mode", group="Data plane", control="select",
-        options=_opts(("auto", "Auto (image when one is named)"), ("image", "Container image"), ("venv", "Legacy box virtualenv")),
+        options=_opts(("auto", "Auto (image when one is named)"), ("image", "Container image"), ("venv", "Box virtualenv")),
         default="auto", env="CAIRN_REMOTE_EXEC_MODE",
         description="How the builtin SSH engine runs a flow on a compute.ssh box (ADR-0104 D1): 'image' runs the named image via docker run --gpus all with the workdir bind-mounted and the live-channel env forwarded; 'venv' is the box's virtualenv; 'auto' picks image when remote_image or the connection names one, else venv. A compute.ssh connection's own 'mode' and 'image' override this per box. Image mode with no image named anywhere is refused at submit.",
     ),

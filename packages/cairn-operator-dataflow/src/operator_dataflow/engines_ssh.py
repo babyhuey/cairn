@@ -112,7 +112,7 @@ def resolve_exec_mode(config: Mapping[str, Any]) -> tuple[str, str, str]:
     * ``gpus`` — the ``--gpus`` value; empty string disables the flag (a CPU
       box, or a runtime without the NVIDIA container toolkit).
 
-    ``mode == "venv"`` always returns an empty image: the legacy path must be
+    ``mode == "venv"`` always returns an empty image: the venv path must be
     byte-for-byte what it was, including its handle meta.
     """
     mode = str(config.get("mode") or "").strip().lower()

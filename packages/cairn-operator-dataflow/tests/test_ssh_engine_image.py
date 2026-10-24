@@ -14,7 +14,7 @@ These tests pin BOTH modes at the same seam the existing suite uses
   (including the #2025 live-channel vars, without which the curve never
   streams back), and the tag recorded on the run for provenance.
 * ``venv`` — byte-for-byte what it submitted before D1, so a box that still
-  carries the legacy install is untouched.
+  runs from its virtualenv is untouched (venv is the default, ADR-0150).
 """
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ def _submit(engine: BuiltinSshEngine, spec: DataflowSpec):
 
 
 def test_mode_is_venv_when_nothing_names_an_image(monkeypatch):
-    """No image anywhere = the legacy box install. D1 must not flip a
+    """No image anywhere = the box virtualenv, the default. D1 must not flip a
     deployment to containers behind its operator's back."""
     mode, image, _gpus = resolve_exec_mode({"host": "box"})
     assert mode == "venv" and image == ""

@@ -30,8 +30,7 @@ explicitly.** There is no built-in default image. Image mode runs only an image 
 (`CAIRN_TRAIN_IMAGE`). When a leg's mode resolves to image and no image is named, the engine
 refuses the leg at submit, where the connection and the environment are both known, before
 anything reaches the box; the message names the settings to change. `auto`, the default, runs
-the box's virtualenv when no image is named. `cairn doctor` reports a target with no image as
-running the virtualenv and suggests no image. This amends ADR-0104 D1, which made the CI-built
+the box's virtualenv when no image is named. This amends ADR-0104 D1, which made the CI-built
 image the SSH path's unit of work in place of a virtualenv.
 
 **D2 — The public tree names no private registry namespace.** Code, docs, Helm, compose and
@@ -46,4 +45,11 @@ registry. Locked ADRs keep their text as written.
   `CAIRN_TRAIN_IMAGE`, or the connection's `image`) or run in venv mode. Without one, image mode
   is refused at submit with a message saying what to set.
 - `operator_dataflow.engines_ssh.DEFAULT_TRAIN_IMAGE` is removed.
+- `cairn doctor` reports each compute target's execution unit with the engine's precedence,
+  reading the environment's `remote_exec_mode` and `remote_image` as well as the connection:
+  venv is OK and suggests no image; a pinned image is OK; a moving or missing tag warns; image
+  mode with no image anywhere FAILS, naming the connection's or the environment's remedy. When
+  the environment cannot be read, a row whose answer depends on it is a warn that says so. Core
+  cannot import the engine, so the doctor's precedence is a twin of the engine's, held to it by
+  `tests/core/test_exec_unit_parity.py`.
 - The run record names the image the deployment chose, never one the code chose.
