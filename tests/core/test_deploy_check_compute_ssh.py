@@ -71,11 +71,11 @@ def test_complete_connection_passes_and_names_the_execution_unit():
 def test_image_mode_target_reports_the_pinned_tag():
     rows = _by_name(check_compute_ssh(
         "ml_target", "gpu",
-        {"host": "10.0.0.1", "user": "ubuntu", "image": "ghcr.io/evs-cmd/cairn-train-gpu:2026.09"},
+        {"host": "10.0.0.1", "user": "ubuntu", "image": "ghcr.io/example/cairn-train-gpu:2026.09"},
         has_key=True))
     mode = rows["compute_target:ml_target:mode"]
     assert mode.status == "ok"
-    assert "ghcr.io/evs-cmd/cairn-train-gpu:2026.09" in mode.detail
+    assert "ghcr.io/example/cairn-train-gpu:2026.09" in mode.detail
 
 
 def test_latest_tag_is_a_warning_not_a_green_tick():
@@ -84,7 +84,7 @@ def test_latest_tag_is_a_warning_not_a_green_tick():
     runs to diagnose."""
     rows = _by_name(check_compute_ssh(
         "ml_target", "gpu",
-        {"host": "10.0.0.1", "user": "ubuntu", "image": "ghcr.io/evs-cmd/cairn-train-gpu:latest"},
+        {"host": "10.0.0.1", "user": "ubuntu", "image": "ghcr.io/example/cairn-train-gpu:latest"},
         has_key=True))
     mode = rows["compute_target:ml_target:mode"]
     assert mode.status == "warn" and "latest" in mode.detail
@@ -93,7 +93,7 @@ def test_latest_tag_is_a_warning_not_a_green_tick():
 def test_untagged_image_is_a_warning():
     rows = _by_name(check_compute_ssh(
         "ml_target", "gpu", {"host": "10.0.0.1", "user": "ubuntu",
-                             "image": "ghcr.io/evs-cmd/cairn-train-gpu"}, has_key=True))
+                             "image": "ghcr.io/example/cairn-train-gpu"}, has_key=True))
     assert rows["compute_target:ml_target:mode"].status == "warn"
 
 

@@ -50,16 +50,16 @@ from cairn.core.dataflow.fetch import (  # noqa: F401 — re-exports
 
 from operator_dataflow.engines import BuiltinLocalEngine, _selected
 
-#: The image the engine runs when nothing more specific names one (ADR-0104 D1,
-#: #2071). PINNED on purpose — ``:latest`` means the run record cannot say which
-#: build produced the artifacts, and two dispatches a week apart silently run
-#: different code. The pin's ONE home is ``operator_training.images.GPU_IMAGE``
-#: (#2074): the workflow publishes that tag, and
-#: ``tests/core/test_gpu_image_pin.py`` fails if this copy drifts from it. This
-#: pack must not import the training pack, hence the literal. Prod should pin
-#: the immutable ``:<sha>`` tag via the ``remote_image`` backend /
-#: ``CAIRN_TRAIN_IMAGE``.
-DEFAULT_TRAIN_IMAGE = "ghcr.io/evs-cmd/cairn-train-gpu:v0.1.0"
+#: What image mode with no image named is told (#202). There is no built-in
+#: image: the deployment names the build it runs, so the run record names it
+#: too. PIN A TAG, never ``:latest`` — otherwise the record cannot say which
+#: build produced the artifacts.
+IMAGE_REQUIRED = (
+    "remote_exec_mode is 'image' but no image is named: set the remote_image "
+    "backend (CAIRN_TRAIN_IMAGE) or the compute.ssh connection's 'image' to a "
+    "pinned tag, or set remote_exec_mode to 'auto' or 'venv' to run the box's "
+    "virtualenv"
+)
 
 #: Env names the CONTAINER needs that the engine does not put in ``inp.env``
 #: itself: ``_submit`` adds CAIRN_RUN_ID after the command is built (#552), so
@@ -93,11 +93,12 @@ def resolve_exec_mode(config: Mapping[str, Any]) -> tuple[str, str, str]:
     * ``mode`` — the connection's ``mode``, else the environment's
       ``remote_exec_mode`` backend (profile record → ``CAIRN_REMOTE_EXEC_MODE``
       → default), else ``auto``. ``auto`` means "image if anything names an
-      image, otherwise the legacy venv" — so a deployment that names no image
-      is NOT flipped to containers behind its operator's back.
+      image, otherwise the box virtualenv" — so a deployment that names no
+      image is NOT flipped to containers behind its operator's back.
     * ``image`` — the connection's ``image`` (it names THIS box's build) beats
       the environment's ``remote_image`` backend / ``CAIRN_TRAIN_IMAGE`` (the
-      fleet default), which beats :data:`DEFAULT_TRAIN_IMAGE`.
+      fleet default). There is no built-in default (#202): ``image`` mode with
+      neither raises :class:`EngineError` (:data:`IMAGE_REQUIRED`).
     * ``gpus`` — the ``--gpus`` value; empty string disables the flag (a CPU
       box, or a runtime without the NVIDIA container toolkit).
 
@@ -120,7 +121,23 @@ def resolve_exec_mode(config: Mapping[str, Any]) -> tuple[str, str, str]:
         if config.get("gpus") is not None
         else getenv("CAIRN_DATAFLOW_IMAGE_GPUS", "all")
     ).strip()
-    return "image", named or DEFAULT_TRAIN_IMAGE, gpus
+    if not named:
+        raise EngineError(IMAGE_REQUIRED)
+    return "image", named, gpus
+
+
+def _environment_image_problem() -> list[str]:
+    """What :meth:`BuiltinSshEngine.validate` can see of the mode decision.
+
+    Only the environment: a connection's own ``mode``/``image`` resolve at
+    submit (the connection store is async), where :func:`resolve_exec_mode`
+    refuses the same case. So an environment that selects ``image`` names the
+    fleet image too (even when a connection names its own, or sets its own
+    ``mode``); a connection's ``image`` still overrides it per box."""
+    mode = _selected("remote_exec_mode", "auto").strip().lower()
+    if mode == "image" and not _selected("remote_image", "").strip():
+        return [IMAGE_REQUIRED]
+    return []
 
 
 def _docker_command(image: str, inner: str, env_names: Iterable[str], gpus: str) -> str:
@@ -141,10 +158,10 @@ def _docker_command(image: str, inner: str, env_names: Iterable[str], gpus: str)
       surrounding shell, which ``runner.sh`` has already exported. The per-run
       job-channel token therefore never appears in the container's argv, where
       every ``ps`` on the box could read it.
-    * **``--entrypoint sh``** — the image's own ENTRYPOINT is the train_entry
-      runner (``deploy/images/train-gpu/Dockerfile``), so the flow kernel needs
-      an explicit override; going through ``sh -c`` keeps
-      ``CAIRN_DATAFLOW_IMAGE_CMD`` free to be any command, not just a bare binary.
+    * **``--entrypoint sh``** — a training image's own ENTRYPOINT is its
+      training runner, so the flow kernel needs an explicit override; going
+      through ``sh -c`` keeps ``CAIRN_DATAFLOW_IMAGE_CMD`` free to be any
+      command, not just a bare binary.
     """
     img = shlex.quote(image)
     gpu_flag = f" --gpus {shlex.quote(gpus)}" if gpus else ""
@@ -211,7 +228,7 @@ class BuiltinSshEngine:
     # local capability discovery — the box installs the same wheels (the
     # fix-remote deployment contract), so the local registry is authoritative.
     def validate(self, spec: DataflowSpec) -> list[str]:
-        return BuiltinLocalEngine().validate(spec)
+        return BuiltinLocalEngine().validate(spec) + _environment_image_problem()
 
     async def _exec_ctx(self, ctx: Any) -> SimpleNamespace:
         from cairn.core.operator import resolve_connection  # noqa: PLC0415 - lazy: keeps engine importable off the engine path
@@ -312,9 +329,10 @@ class BuiltinSshEngine:
             if _val:
                 env[_var] = _val
         # ADR-0104 D1 (#2071): the IMAGE is the unit of remote work. In image
-        # mode the box runs the CI-built cairn-train-gpu image and carries
-        # nothing of cairn's that can drift (#2069); venv mode is the legacy
-        # box install, unchanged.
+        # mode the box runs the image the deployment names and carries nothing
+        # of cairn's that can drift (#2069); venv mode is the box install,
+        # unchanged. Image mode with no image named raises here, before the
+        # exec layer is asked to run anything (#202).
         cfg = dict(getattr(exec_ctx.compute, "config", None) or {})
         mode, image, gpus = resolve_exec_mode(cfg)
         if mode == "image":

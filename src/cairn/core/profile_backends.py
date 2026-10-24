@@ -138,12 +138,12 @@ BACKENDS: list[BackendField] = [
         key="remote_exec_mode", label="Remote execution mode", group="Data plane", control="select",
         options=_opts(("auto", "Auto (image when one is named)"), ("image", "Container image"), ("venv", "Legacy box virtualenv")),
         default="auto", env="CAIRN_REMOTE_EXEC_MODE",
-        description="How the builtin SSH engine runs a flow on a compute.ssh box (ADR-0104 D1): 'image' runs the pinned cairn-train-gpu image via docker run --gpus all with the workdir bind-mounted and the live-channel env forwarded; 'venv' is the legacy hand-installed box virtualenv; 'auto' picks image when remote_image or the connection names one, else venv. A compute.ssh connection's own 'mode' key overrides this per box.",
+        description="How the builtin SSH engine runs a flow on a compute.ssh box (ADR-0104 D1): 'image' runs the image remote_image (or the connection) names via docker run --gpus all with the workdir bind-mounted and the live-channel env forwarded, and refuses the leg when remote_image is empty; 'venv' is the box's virtualenv; 'auto' picks image when remote_image or the connection names one, else venv. A compute.ssh connection's own 'mode' key overrides this per box.",
     ),
     BackendField(
         key="remote_image", label="Remote execution image", group="Data plane", control="text",
         default="", env="CAIRN_TRAIN_IMAGE",
-        description="The container image the SSH engine runs on the box. Empty = the engine's pinned default (operator_dataflow.engines_ssh.DEFAULT_TRAIN_IMAGE). PIN A TAG, never :latest — the run record has to name the exact build that produced the artifacts; prod should pin the immutable ghcr.io/evs-cmd/cairn-train-gpu:<sha> tag the image workflow pushes. A compute.ssh connection's own 'image' key overrides this per box.",
+        description="The container image the SSH engine runs on the box. There is no default: empty means 'auto' runs the box's virtualenv and 'image' refuses the leg. PIN A TAG, never :latest — the run record has to name the exact build that produced the artifacts; pin an immutable tag such as the image's :<sha>. A compute.ssh connection's own 'image' key overrides this per box.",
     ),
     # ── Metaflow substrate (ADR-0089, #1345) — identity/compute split. Before
     # this block, `<kind>_target` was OVERLOADED as the Metaflow metadata root,

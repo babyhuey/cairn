@@ -54,7 +54,7 @@ def test_hostless_ml_target_fails(monkeypatch):
 def test_complete_ml_target_passes(monkeypatch):
     monkeypatch.setenv("OBS_ML_TARGET", "gpu")
     _bind(monkeypatch, gpu=({"provider": "ssh", "host": "10.0.0.1", "user": "ubuntu",
-                             "image": "ghcr.io/evs-cmd/cairn-train-gpu:2026.09"},
+                             "image": "ghcr.io/example/cairn-train-gpu:2026.09"},
                             {"PRIVATE_KEY": "k"}))
     rows = _run()
     assert rows["compute_target:ml_target"].status == "ok"

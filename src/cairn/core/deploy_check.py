@@ -851,9 +851,10 @@ def check_compute_ssh(
     if not image:
         out.append(CheckResult(
             mode_name, "warn",
-            f"{target!r} is in image mode but names no image — the engine falls "
-            f"back to its pinned default; pin the tag explicitly so the "
-            f"environment, not the code, decides which build runs.",
+            f"{target!r} is in image mode but names no image — the engine "
+            f"refuses the leg unless the `remote_image` backend / "
+            f"CAIRN_TRAIN_IMAGE names one; set the connection's `image` or that "
+            f"key to a pinned tag.",
             category="runtime"))
     elif not tag or tag == "latest":
         out.append(CheckResult(
