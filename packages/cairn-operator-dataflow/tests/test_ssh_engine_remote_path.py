@@ -372,21 +372,23 @@ def test_a_failed_cancel_is_not_reported_as_sent(monkeypatch):
 # ── a malformed remote_env entry never echoes what follows the name ──────────
 
 
-@pytest.mark.parametrize("entry,lead", [
+@pytest.mark.parametrize("entry,leaked", [
     ("HF_TOKEN=hf_abcSECRETVALUE", "HF_TOKEN"),
     ("MY_VAR:hf_abcSECRETVALUE", "MY_VAR"),
-    ("=hf_abcSECRETVALUE", None),
+    ("=hf_abcSECRETVALUE", "hf_abc"),
+    # an all-upper-case base32 seed with padding reads exactly like NAME=…
+    ("JBSWY3DPEHPK3PXP====", "JBSWY3DPEHPK3PXP"),
+    ("AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI", "AKIAIOSFODNN7EXAMPLE"),
 ])
-def test_a_malformed_entry_does_not_echo_its_value(monkeypatch, entry, lead):
+def test_a_malformed_entry_is_reported_by_position_only(monkeypatch, entry, leaked):
     _bind_connection(monkeypatch)
     _capture_submit(monkeypatch)
     monkeypatch.setenv("CAIRN_REMOTE_ENV", f"AWS_DEFAULT_REGION {entry}")
     with pytest.raises(EngineError) as e:
         _submit(_spec())
-    assert "hf_abcSECRETVALUE" not in str(e.value)
-    assert "entry 2" in str(e.value)
-    if lead:
-        assert f"starting {lead!r}" in str(e.value)
+    assert "entry 2 is not an environment variable name" in str(e.value)
+    assert leaked not in str(e.value)
+    assert "SECRETVALUE" not in str(e.value)
 
 
 @pytest.mark.parametrize("pasted", ["wJalrXUtn/K7MDENG+bPxRfi", "wJalrXUtnFEMIK7MDENG=",

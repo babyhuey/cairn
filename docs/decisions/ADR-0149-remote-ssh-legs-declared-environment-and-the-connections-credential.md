@@ -41,9 +41,9 @@ its value, for:
 - a name containing `KEY`, `SECRET`, `TOKEN` or `PASSWORD` (this covers `AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`): credentials stay on the box, as an instance
   role or the box's own environment;
-- an entry that is not an environment variable name, reported by its position, plus its leading
-  name only when the entry reads as `NAME=…` or `NAME:…` with an upper-case `NAME`; nothing else
-  of the entry is echoed, since it may be a pasted value;
+- an entry that is not an environment variable name, reported by its position only; no part of
+  the entry is echoed, since any of it may be a pasted value (an upper-case base32 seed with `=`
+  padding reads exactly like `NAME=`);
 - a name the engine sets itself for each submission (the spec, lineage and live-channel names).
 
 **D2 — Values reach only the job's runner file.** In venv mode they are exported from the

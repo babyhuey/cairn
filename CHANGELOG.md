@@ -18,7 +18,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - The SSH engine's refusal of control-plane-only dataset versions also looks inside nested config values and the spec's own config, and treats every `file:` URI form as local.
 
 ### Added
-- `remote_env` (`[profile.backends]`, or `CAIRN_REMOTE_ENV`): names of control-plane environment variables the builtin SSH engine forwards to the job on the box, each when set (for example `CAIRN_CHECKPOINT_BUCKET`, `CAIRN_CHECKPOINT_PREFIX`, `AWS_DEFAULT_REGION`). A name containing `KEY`, `SECRET`, `TOKEN` or `PASSWORD`, a malformed entry, or one the engine sets itself refuses the leg before submit, naming the variable (a malformed entry only by its position, plus its leading name when it reads as `NAME=` or `NAME:`) and not its value. Unset, nothing beyond the existing set is forwarded.
+- `remote_env` (`[profile.backends]`, or `CAIRN_REMOTE_ENV`): names of control-plane environment variables the builtin SSH engine forwards to the job on the box, each when set (for example `CAIRN_CHECKPOINT_BUCKET`, `CAIRN_CHECKPOINT_PREFIX`, `AWS_DEFAULT_REGION`). A name containing `KEY`, `SECRET`, `TOKEN` or `PASSWORD`, a malformed entry, or one the engine sets itself refuses the leg before submit, naming the variable (a malformed entry only by its position) and not its value. Unset, nothing beyond the existing set is forwarded.
 - An engine may declare `needs_durable_inputs = True` (the builtin SSH engine does): the leg executor then resolves the leg's `dataset:` refs to their durable copies (ADR-0149). An engine that does not declare it is treated as co-located.
 
 ### Fixed

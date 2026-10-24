@@ -195,8 +195,7 @@ control plane is elsewhere). What the deployment provides on each side:
   tenant cannot extend the list. A name containing `KEY`, `SECRET`, `TOKEN` or
   `PASSWORD`, a malformed entry, or a name the engine sets itself (the spec,
   lineage and live-channel names) refuses the leg before submit, naming the
-  variable (a malformed entry only by position, plus its name when it reads
-  as `NAME=…`/`NAME:…`)
+  variable (a malformed entry only by its position)
   and never its value: credentials stay on the box (an instance role,
   the box's own environment). Values reach the box only in the job's
   `runner.sh`, which is created exclusively with mode 0600 (a stale copy is

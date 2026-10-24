@@ -99,12 +99,10 @@ def remote_env_names() -> tuple[list[str], list[str]]:
         if name in names:
             continue
         if not _ENV_NAME.match(name):
-            # The entry's position, plus its leading name only when it reads as
-            # `NAME=…` / `NAME:…` with an upper-case NAME: anything else (a pasted
-            # value, base64 with `=` padding) may be a secret, so none of it is echoed.
-            m = re.match(r"([A-Z_][A-Z0-9_]*)[=:]", name)
-            problems.append(f"entry {pos}{f' (starting {m.group(1)!r})' if m else ''} "
-                            "is not an environment variable name")
+            # The entry's position only: any part of a malformed entry may be a
+            # pasted secret (an upper-case base32 seed with `=` padding reads exactly
+            # like `NAME=`), so none of it is echoed.
+            problems.append(f"entry {pos} is not an environment variable name")
         elif any(m in name.upper() for m in _CREDENTIAL_MARKERS):
             problems.append(f"{name} looks like a credential; credentials stay on the box "
                             "(an instance role or the box's own environment), never in the job")
