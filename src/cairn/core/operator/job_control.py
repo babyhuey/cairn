@@ -60,11 +60,14 @@ async def _safe_resume(resume: ResumeFn, rec: RemoteJobRecord, status: JobStatus
         logger.exception("resume failed for run %s (job %s)", rec.run_id, rec.id)
 
 
-async def _safe_cancel(cancel: CancelFn, rec: RemoteJobRecord) -> None:
+async def _safe_cancel(cancel: CancelFn, rec: RemoteJobRecord) -> bool:
+    """``True`` when the cancel reached the job; a failure is logged, never raised."""
     try:
         await cancel(rec)
     except Exception:  # noqa: BLE001 — a cancel failure must not kill the loop
         logger.exception("cancel failed for run %s (job %s)", rec.run_id, rec.id)
+        return False
+    return True
 
 
 async def _try_relaunch(
@@ -362,17 +365,17 @@ async def cancel_remote_jobs_for_run(run_id: str, *, registry: Any = None) -> in
 
     Called when a run is cancelled so a cancelled run does NOT orphan the remote
     (GPU) job — a leaked marketplace pod or an SSH training process keeps billing
-    (#601). Best-effort per job (a cancel failure is logged, never raised);
-    returns the number of jobs cancelled."""
+    (#601). Best-effort per job (a cancel failure is logged, never raised); every
+    record is closed, and the count is of the jobs the cancel actually reached."""
     from cairn.core.operator.job_store import get_remote_job_store  # noqa: PLC0415
 
     store = get_remote_job_store()
     cancel = build_default_cancel(registry)
     n = 0
     for rec in await active_remote_jobs_for_run(run_id, store=store):
-        await _safe_cancel(cancel, rec)
+        reached = await _safe_cancel(cancel, rec)
         await store.mark_cancelled(rec.id)
-        n += 1
+        n += int(reached)
     return n
 
 
