@@ -81,8 +81,9 @@ worker:
 # 403 on /jobs/claim. The worker reads the token from a Secret of its OWN and
 # its settings from a ConfigMap of its own (an allowlist plus extraEnv), and runs
 # under a ServiceAccount of its own with no API token mounted. It receives no
-# database settings, no OTEL headers, no env.extra and nothing from the control
-# plane's Secret or ServiceAccount.
+# database settings, no OTEL headers, no env.extra (apart from the
+# CAIRN_ENGINE_URL fallback) and nothing from the control plane's Secret or
+# ServiceAccount.
 pullWorker:
   enabled: false
   command: []          # REQUIRED when enabled — rendering fails without it
@@ -97,16 +98,28 @@ pullWorker:
   token: ""            # a worker-pool token (`cairn remote worker-token --name <pool>`)
   existingSecret: ""
   # CAIRN_ENGINE_URL in the worker's ConfigMap (empty → env.extra.CAIRN_ENGINE_URL,
-  # else none; the command's --engine-url works either way).
+  # else env.extra.OBS_ENGINE_URL, else none; the command's --engine-url works
+  # either way).
   engineUrl: ""
   # The ONLY way to give the worker other settings (it does not read env.extra).
-  # Rendered into its ConfigMap, so a name that looks like a secret or a database
-  # setting (KEY, SECRET, TOKEN, PASSWORD, DSN, *_STORAGE,
-  # OTEL_EXPORTER_OTLP_HEADERS) refuses to render: put those in existingSecret.
+  # Rendered into its ConfigMap. The chart refuses a NAME that looks like a secret
+  # or a database setting (a KEY/SECRET/TOKEN/PASSWORD/DSN segment, *_STORAGE,
+  # CONNECTION_STRING, CAIRN_CONN_*, OTEL_EXPORTER_OTLP_HEADERS) and a VALUE with a
+  # password in a URL (scheme://user:pass@…). That check covers names and URL
+  # credentials only: any other credential belongs in the worker's Secret
+  # (existingSecret). The same goes for MLFLOW_TRACKING_URI and
+  # OTEL_EXPORTER_OTLP_ENDPOINT, which the worker gets verbatim.
   extraEnv: {}
   serviceAccount:
+    # true: the chart renders the worker's ServiceAccount (name below, else
+    # <release>-pull-worker). false: name an existing one (required), never the
+    # control plane's. The pod never mounts an API token either way.
+    create: true
+    name: ""
     # e.g. eks.amazonaws.com/role-arn or iam.gke.io/gcp-service-account for the
-    # worker's own cloud identity. The control plane's are never copied here.
+    # worker's own cloud identity (create=true only). The cloud-side binding is
+    # keyed to the ServiceAccount NAME (IRSA trust policy, GKE Workload Identity
+    # binding, EKS Pod Identity association): point it at this one.
     annotations: {}
   replicaCount: 1
   resources:

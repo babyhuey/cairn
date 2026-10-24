@@ -99,9 +99,22 @@ plane's Secret.
     name: {{ include "cairn.pullWorkerSecretName" . }}
 {{- end -}}
 
-{{/* The worker's ConfigMap and ServiceAccount share one name: <release>-pull-worker. */}}
+{{/* The worker's ConfigMap (and, by default, its ServiceAccount): <release>-pull-worker. */}}
 {{- define "cairn.pullWorkerName" -}}
 {{- printf "%s-pull-worker" (include "cairn.fullname" .) -}}
+{{- end -}}
+
+{{/*
+The worker's ServiceAccount: pullWorker.serviceAccount.name, else <release>-pull-worker
+(create=true). With create=false the name is required (cairn.validate).
+*/}}
+{{- define "cairn.pullWorkerServiceAccountName" -}}
+{{- $n := trim (toString (default "" .Values.pullWorker.serviceAccount.name)) -}}
+{{- if $n -}}
+{{- $n -}}
+{{- else -}}
+{{- include "cairn.pullWorkerName" . -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -110,7 +123,7 @@ The worker's ConfigMap data: an ALLOWLIST. What the claim loop reads
 operator may read, then pullWorker.extraEnv (checked in cairn.validate).
 */}}
 {{- define "cairn.pullWorkerConfig" -}}
-{{- $url := .Values.pullWorker.engineUrl | default (index .Values.env.extra "CAIRN_ENGINE_URL") | default "" -}}
+{{- $url := .Values.pullWorker.engineUrl | default (index .Values.env.extra "CAIRN_ENGINE_URL") | default (index .Values.env.extra "OBS_ENGINE_URL") | default "" -}}
 CAIRN_BACKEND: {{ .Values.env.backend | quote }}
 {{- if $url }}
 CAIRN_ENGINE_URL: {{ $url | quote }}
@@ -129,14 +142,27 @@ CAIRN_ARTIFACT_S3_REGION: {{ .Values.artifacts.s3.region | quote }}
 {{- end -}}
 
 {{/*
-A pullWorker.extraEnv name that must not go in a ConfigMap: anything that looks
-like a credential, the DSN family, or the OTEL headers. Empty when the name is fine.
+A pullWorker.extraEnv NAME that must not go in a ConfigMap; empty when it is fine.
+Case-insensitive. A marker counts as an underscore-separated segment or a segment
+suffix (HF_TOKEN, APITOKEN, MY_API_KEYS: refused; TOKENIZERS_PARALLELISM: allowed):
+KEY, SECRET, TOKEN, PASSWORD, DSN. Also the DSN family (*_STORAGE), the OTEL headers,
+anything containing CONNECTION_STRING, and the CAIRN_CONN_ prefix (the namespace an
+engine mints per submission for declared connections).
 */}}
 {{- define "cairn.pullWorkerUnsafeName" -}}
 {{- $u := upper . -}}
-{{- if or (contains "KEY" $u) (contains "SECRET" $u) (contains "TOKEN" $u) (contains "PASSWORD" $u) (contains "DSN" $u) (hasSuffix "STORAGE" $u) (eq $u "OTEL_EXPORTER_OTLP_HEADERS") -}}
-unsafe
+{{- range $seg := splitList "_" $u -}}
+{{- if regexMatch "(KEY|SECRET|TOKEN|PASSWORD|DSN)S?$" $seg -}}unsafe{{- end -}}
 {{- end -}}
+{{- if or (hasSuffix "STORAGE" $u) (eq $u "OTEL_EXPORTER_OTLP_HEADERS") (contains "CONNECTION_STRING" $u) (hasPrefix "CAIRN_CONN_" $u) -}}unsafe{{- end -}}
+{{- end -}}
+
+{{/*
+A pullWorker.extraEnv VALUE carrying a credential in a URL: userinfo with a password
+(`scheme://user:pass@host`). Empty when it is fine. Only this shape is detected.
+*/}}
+{{- define "cairn.pullWorkerUnsafeValue" -}}
+{{- if regexMatch "[A-Za-z][A-Za-z0-9+.-]*://[^/?#@\\s]*:[^/?#@\\s]+@" (toString .) -}}unsafe{{- end -}}
 {{- end -}}
 
 {{- define "cairn.configMapName" -}}
@@ -284,8 +310,21 @@ deployment that has actually gone wrong somewhere, on compose or on a box.
 {{- fail (printf "pullWorker.extraEnv key %q is not an environment variable name." $k) -}}
 {{- end -}}
 {{- if include "cairn.pullWorkerUnsafeName" $k -}}
-{{- fail (printf "pullWorker.extraEnv.%s looks like a secret or a database setting (KEY, SECRET, TOKEN, PASSWORD, DSN, *_STORAGE, OTEL_EXPORTER_OTLP_HEADERS) — extraEnv is rendered into a ConfigMap. Put it in the worker's own Secret (pullWorker.existingSecret) instead." $k) -}}
+{{- fail (printf "pullWorker.extraEnv.%s looks like a secret or a database setting (a KEY, SECRET, TOKEN, PASSWORD or DSN segment, *_STORAGE, CONNECTION_STRING, CAIRN_CONN_*, OTEL_EXPORTER_OTLP_HEADERS) — extraEnv is rendered into a ConfigMap. Put it in the worker's own Secret (pullWorker.existingSecret) instead." $k) -}}
 {{- end -}}
+{{- end -}}
+{{- range $k, $v := .Values.pullWorker.extraEnv -}}
+{{- if include "cairn.pullWorkerUnsafeValue" $v -}}
+{{- fail (printf "pullWorker.extraEnv.%s has a URL with a password in it (scheme://user:pass@…) — extraEnv is rendered into a ConfigMap. Put the credential in the worker's own Secret (pullWorker.existingSecret) instead." $k) -}}
+{{- end -}}
+{{- end -}}
+{{- $sa := .Values.pullWorker.serviceAccount -}}
+{{- $saName := trim (toString (default "" $sa.name)) -}}
+{{- if and (not $sa.create) (not $saName) -}}
+{{- fail "pullWorker.serviceAccount.create=false needs pullWorker.serviceAccount.name — the pre-provisioned ServiceAccount the worker runs under." -}}
+{{- end -}}
+{{- if eq (include "cairn.pullWorkerServiceAccountName" .) (include "cairn.serviceAccountName" .) -}}
+{{- fail (printf "the pull worker's ServiceAccount %q is the control plane's — the worker must not run under the control plane's identity. Name another one (pullWorker.serviceAccount.name)." (include "cairn.pullWorkerServiceAccountName" .)) -}}
 {{- end -}}
 {{- if and $existing (eq $existing (include "cairn.secretName" .)) -}}
 {{- fail (printf "pullWorker.existingSecret is %q, the control plane's Secret — the pull worker must not receive the JWT secret or the admin password hash. Give it a Secret of its own holding only CAIRN_ENGINE_TOKEN." $existing) -}}

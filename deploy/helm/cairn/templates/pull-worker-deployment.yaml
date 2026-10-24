@@ -11,8 +11,9 @@ With auth on, claiming needs a worker-pool token (`cairn remote worker-token
 OWN (pullWorker.token, rendered below, or pullWorker.existingSecret). Its other
 settings come from a ConfigMap of its own (an allowlist, plus pullWorker.extraEnv),
 and it runs under a ServiceAccount of its own with no API token mounted. It reads
-neither the shared ConfigMap (no database settings, OTEL headers or env.extra) nor
-the control plane's Secret, and never gets the control plane's ServiceAccount.
+neither the shared ConfigMap (no database settings, OTEL headers or env.extra,
+apart from the CAIRN_ENGINE_URL fallback) nor the control plane's Secret, and never
+runs under the control plane's ServiceAccount.
 */}}
 apiVersion: v1
 kind: ConfigMap
@@ -24,10 +25,11 @@ metadata:
 data:
   {{- include "cairn.pullWorkerConfig" . | nindent 2 }}
 ---
+{{- if .Values.pullWorker.serviceAccount.create }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: {{ include "cairn.pullWorkerName" . }}
+  name: {{ include "cairn.pullWorkerServiceAccountName" . }}
   labels:
     {{- include "cairn.labels" . | nindent 4 }}
     app.kubernetes.io/component: pull-worker
@@ -37,6 +39,7 @@ metadata:
   {{- end }}
 automountServiceAccountToken: false
 ---
+{{- end }}
 {{- if not (trim (toString (default "" .Values.pullWorker.existingSecret))) }}
 apiVersion: v1
 kind: Secret
@@ -76,7 +79,8 @@ spec:
         checksum/token: {{ include "cairn.pullWorkerToken" . | sha256sum }}
         {{- end }}
     spec:
-      serviceAccountName: {{ include "cairn.pullWorkerName" . }}
+      serviceAccountName: {{ include "cairn.pullWorkerServiceAccountName" . }}
+      # in every case, also for a pre-provisioned ServiceAccount
       automountServiceAccountToken: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

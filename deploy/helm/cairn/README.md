@@ -136,33 +136,50 @@ key, the SSH key).
 
 Its other settings come from a **ConfigMap of its own** (`<release>-pull-worker`),
 an allowlist: `CAIRN_ENGINE_URL` (`pullWorker.engineUrl`, else
-`env.extra.CAIRN_ENGINE_URL`, else none — the command's `--engine-url` works
-either way), `CAIRN_BACKEND`, `CAIRN_PROFILE`, `MLFLOW_TRACKING_URI`,
-`OTEL_EXPORTER_OTLP_ENDPOINT` and, with `artifacts.s3.enabled`, the
-`CAIRN_ARTIFACT_S3_*` endpoint, bucket and region. Anything else is opt-in through
-`pullWorker.extraEnv` (a map rendered into that ConfigMap); a name that looks like a
-secret or a database setting (`KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `DSN`,
-`*_STORAGE`, `OTEL_EXPORTER_OTLP_HEADERS`) refuses to render — put those in the
-worker's own Secret. The worker does not read the shared ConfigMap, so it receives
-no database settings, no `OTEL_EXPORTER_OTLP_HEADERS` and no `env.extra`.
+`env.extra.CAIRN_ENGINE_URL`, else `env.extra.OBS_ENGINE_URL`, else none — the
+command's `--engine-url` works either way), `CAIRN_BACKEND`, `CAIRN_PROFILE`,
+`MLFLOW_TRACKING_URI`, `OTEL_EXPORTER_OTLP_ENDPOINT` and, with
+`artifacts.s3.enabled`, the `CAIRN_ARTIFACT_S3_*` endpoint, bucket and region.
+The worker does not read the shared ConfigMap, so it receives no database
+settings, no `OTEL_EXPORTER_OTLP_HEADERS` and no `env.extra` (apart from the
+`CAIRN_ENGINE_URL` fallback), and none of `CAIRN_RUNTIME`, `CAIRN_REQUIRE_AUTH`,
+`CAIRN_TEMPORAL_ADDRESS` or `CAIRN_CHECKPOINTER`.
 
-It runs under a **ServiceAccount of its own** (`<release>-pull-worker`) with
-`automountServiceAccountToken: false`; `pullWorker.serviceAccount.annotations` is
-where its own cloud identity goes (IRSA, Workload Identity). The control plane's
-ServiceAccount and its annotations are not used. `imagePullSecrets` still applies
-to the worker's pod.
+Anything else is opt-in through `pullWorker.extraEnv`, a map rendered into that
+ConfigMap. The chart refuses a **name** that looks like a secret or a database
+setting — a `KEY`, `SECRET`, `TOKEN`, `PASSWORD` or `DSN` segment or segment
+suffix, case-insensitive (`HF_TOKEN` and `APITOKEN` are refused,
+`TOKENIZERS_PARALLELISM` is not), `*_STORAGE`, anything containing
+`CONNECTION_STRING`, the `CAIRN_CONN_` prefix, `OTEL_EXPORTER_OTLP_HEADERS` — and a
+**value** with a password in a URL (`scheme://user:pass@…`). That check covers
+names and URL credentials only: any other credential belongs in the worker's
+Secret. The same applies to `MLFLOW_TRACKING_URI` and
+`OTEL_EXPORTER_OTLP_ENDPOINT`, which the worker gets verbatim from
+`profiles.mlflow` / `observability.otlp`.
+
+It runs under a **ServiceAccount of its own** with no API token mounted
+(`automountServiceAccountToken: false` on the pod in every case). By default the
+chart renders it as `<release>-pull-worker`, with
+`pullWorker.serviceAccount.annotations` for its own cloud identity (IRSA, GKE
+Workload Identity). With `pullWorker.serviceAccount.create: false`, name a
+pre-provisioned one in `pullWorker.serviceAccount.name` (required). It may never
+be the control plane's ServiceAccount; the chart refuses that. The control
+plane's ServiceAccount and its annotations are not used. `imagePullSecrets` still
+applies to the worker's pod.
 
 The token is trimmed. Rendering refuses an enabled worker with no token (empty
 or whitespace only) and no `existingSecret`, with both, with `existingSecret`
 set to the control plane's Secret, with a token equal to `secrets.obsJwtSecret`,
 or with a token that is not a string (use `--set-string`). `cairn deploy doctor
---values` reports the same cases.
+--values` reports the same cases, and the `extraEnv` and ServiceAccount ones (it
+warns where the answer depends on the release name, which it does not know).
 
-Changing `pullWorker.token` rolls the worker (`checksum/token`). Rotating the
-token inside a Secret you manage (`existingSecret`) does not; restart the worker
-(`kubectl rollout restart deployment/<release>-pull-worker`). A Secret you
-already have named `<release>-pull-worker` collides with the one the chart
-renders from `pullWorker.token`; use `existingSecret` for it instead.
+Changing `pullWorker.token` rolls the worker (`checksum/token`), and changing its
+ConfigMap rolls it too (`checksum/config`). Rotating the token inside a Secret you
+manage (`existingSecret`) does not; restart the worker (`kubectl rollout restart
+deployment/<release>-pull-worker`). With `pullWorker.token`, the chart's Secret
+holds only `CAIRN_ENGINE_TOKEN`; any other secret the worker's jobs need means
+using `existingSecret` instead.
 
 ### Postgres connection assumptions (in-process leg liveness)
 
@@ -201,18 +218,37 @@ the Postgres volume are annotated `helm.sh/resource-policy: keep`, so
 A rollback rolls back the *manifests*. It does not undo a database migration —
 the DSN is the same database before and after.
 
-**Upgrading a chart with the pull worker enabled:** the worker no longer reads
-the control plane's Secret. Before upgrading, mint a worker-pool token
-(`cairn remote worker-token --name <pool>`) and set `pullWorker.token`, or put
-`CAIRN_ENGINE_TOKEN` in a Secret of its own and set `pullWorker.existingSecret`;
-the render fails until one is set. If the token was in the control plane's
-Secret (or `env.extra`), move it. Anything else the worker's jobs read from the
-control plane's Secret (a model key, an SSH key) must now be put in the worker's
-own Secret, deliberately. The worker no longer reads the shared ConfigMap: an
-`env.extra` key an out-of-tree trainer relied on (an MLflow experiment, a
-checkpoint bucket, a region) moves to `pullWorker.extraEnv`, or to the worker's
-Secret if it is a credential. A cloud identity the worker used through the
-release's ServiceAccount goes in `pullWorker.serviceAccount.annotations`.
+**Upgrading a chart with the pull worker enabled:**
+
+- *Token.* The worker no longer reads the control plane's Secret. Mint a
+  worker-pool token (`cairn remote worker-token --name <pool>`) and set
+  `pullWorker.token`, or put `CAIRN_ENGINE_TOKEN` in a Secret of its own and set
+  `pullWorker.existingSecret`; the render fails until one is set. If the token was
+  in the control plane's Secret (or `env.extra`), move it. Anything else the
+  worker's jobs read from the control plane's Secret (a model key, an SSH key)
+  must be put in the worker's own Secret, deliberately; that needs
+  `existingSecret`, since the chart's Secret holds only the token.
+- *Settings.* The worker no longer reads the shared ConfigMap. An `env.extra` key
+  an out-of-tree trainer relied on (an MLflow experiment, a checkpoint bucket, a
+  region) moves to `pullWorker.extraEnv`, or to the worker's Secret if it is a
+  credential. The worker also stops receiving `CAIRN_RUNTIME`,
+  `CAIRN_REQUIRE_AUTH`, `CAIRN_TEMPORAL_ADDRESS`, `CAIRN_CHECKPOINTER`, the
+  database DSN family and `OTEL_EXPORTER_OTLP_HEADERS`. The `CAIRN_ENGINE_URL`
+  fallback reads `env.extra.CAIRN_ENGINE_URL`, then `env.extra.OBS_ENGINE_URL`.
+- *Cloud identity.* The worker now runs under its own ServiceAccount, and every
+  cloud-side binding is keyed to the ServiceAccount NAME: an IRSA role's trust
+  policy (`sub = system:serviceaccount:<namespace>:<name>`), a GKE Workload
+  Identity binding (`<project>.svc.id.goog[<namespace>/<name>]`) and an EKS Pod
+  Identity association. Moving the annotation to
+  `pullWorker.serviceAccount.annotations` is not enough: update the binding for
+  `<release>-pull-worker` (or set `pullWorker.serviceAccount.create: false` and
+  `pullWorker.serviceAccount.name` to a pre-provisioned ServiceAccount whose
+  binding you manage). Until then the worker has no cloud identity.
+- *Name collisions.* The chart renders a ConfigMap, a ServiceAccount (unless
+  `create: false`) and, with `pullWorker.token`, a Secret named
+  `<release>-pull-worker`. An existing object of that kind and name in the
+  namespace collides; rename or remove it, or use `existingSecret` /
+  `serviceAccount.create: false` for the Secret and the ServiceAccount.
 
 **Upgrading from a 0.1.x image:** see *Upgrade from 0.1.x* in the
 [install docs](https://docs.cairndev.sh/install/#upgrade-from-01x) (pull-worker

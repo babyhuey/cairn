@@ -578,36 +578,86 @@ def env_from_values(values: dict) -> dict[str, str]:
 
 #: A pullWorker.extraEnv name the chart refuses (_helpers.tpl cairn.pullWorkerUnsafeName):
 #: extraEnv is rendered into a ConfigMap, so credentials and database settings go in the
-#: worker's own Secret instead.
-_PULL_WORKER_UNSAFE_MARKERS = ("KEY", "SECRET", "TOKEN", "PASSWORD", "DSN")
+#: worker's own Secret instead. A marker counts as an underscore-separated segment or a
+#: segment suffix, case-insensitively: HF_TOKEN and APITOKEN are refused,
+#: TOKENIZERS_PARALLELISM is not.
+_PULL_WORKER_UNSAFE_SEGMENT = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|DSN)S?\Z")
+#: A value carrying a password in a URL (cairn.pullWorkerUnsafeValue).
+_URL_WITH_PASSWORD = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/?#@\s]*:[^/?#@\s]+@")
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
+def pull_worker_unsafe_name(name: str) -> bool:
+    """The chart's rule for a pullWorker.extraEnv name (see the constants above)."""
+    u = str(name).upper()
+    return (any(_PULL_WORKER_UNSAFE_SEGMENT.search(seg) for seg in u.split("_"))
+            or u.endswith("STORAGE") or u == "OTEL_EXPORTER_OTLP_HEADERS"
+            or "CONNECTION_STRING" in u or u.startswith("CAIRN_CONN_"))
+
+
 def _pull_worker_extra_env_checks(values: dict) -> list[CheckResult]:
-    """The chart's pullWorker.extraEnv refusals, before a render."""
+    """The chart's pullWorker.extraEnv refusals, before a render: names that look like a
+    secret or a database setting, and values with a password in a URL. Names and URL
+    credentials only — any other credential belongs in the worker's Secret."""
     extra = _get(values, "pullWorker", "extraEnv", default={}) or {}
     if not isinstance(extra, dict):
         return [CheckResult("pull_worker_extra_env", "fail",
                             "pullWorker.extraEnv must be a map of NAME: value.", category="secrets")]
     out: list[CheckResult] = []
-    for name in extra:
-        u = str(name).upper()
+    for name, value in extra.items():
         if not _ENV_NAME_RE.match(str(name)):
             out.append(CheckResult("pull_worker_extra_env", "fail",
                                    f"pullWorker.extraEnv key {name!r} is not an environment "
                                    "variable name.", category="secrets"))
-        elif (any(m in u for m in _PULL_WORKER_UNSAFE_MARKERS) or u.endswith("STORAGE")
-              or u == "OTEL_EXPORTER_OTLP_HEADERS"):
+        elif pull_worker_unsafe_name(name):
             out.append(CheckResult("pull_worker_extra_env", "fail",
                                    f"pullWorker.extraEnv.{name} looks like a secret or a database "
                                    "setting — extraEnv is rendered into a ConfigMap; put it in the "
                                    "worker's own Secret (pullWorker.existingSecret).",
                                    category="secrets"))
+        elif _URL_WITH_PASSWORD.search(str(value)):
+            out.append(CheckResult("pull_worker_extra_env", "fail",
+                                   f"pullWorker.extraEnv.{name} has a URL with a password in it — "
+                                   "put the credential in the worker's own Secret.",
+                                   category="secrets"))
     return out
 
 
+def _control_plane_service_account(values: dict) -> str:
+    """The control plane's ServiceAccount name, when the values alone decide it
+    (cairn.serviceAccountName); ``""`` when it depends on the release name."""
+    name = str(_get(values, "serviceAccount", "name", default="") or "").strip()
+    if name:
+        return name
+    if not _get(values, "serviceAccount", "create", default=True):
+        return "default"
+    return str(_get(values, "fullnameOverride", default="") or "").strip()
+
+
+def _pull_worker_service_account_checks(values: dict) -> list[CheckResult]:
+    """The chart's pull-worker ServiceAccount refusals: create=false with no name, and
+    the control plane's ServiceAccount (when the values name it)."""
+    create = _get(values, "pullWorker", "serviceAccount", "create", default=True)
+    name = str(_get(values, "pullWorker", "serviceAccount", "name", default="") or "").strip()
+    if not create and not name:
+        return [CheckResult("pull_worker_service_account", "fail",
+                            "pullWorker.serviceAccount.create=false needs "
+                            "pullWorker.serviceAccount.name (the pre-provisioned ServiceAccount).",
+                            category="secrets")]
+    override = str(_get(values, "fullnameOverride", default="") or "").strip()
+    worker = name or (f"{override}-pull-worker" if override else "")
+    control = _control_plane_service_account(values)
+    if worker and control and worker == control:
+        return [CheckResult("pull_worker_service_account", "fail",
+                            f"the pull worker's ServiceAccount {worker!r} is the control plane's — "
+                            "name another one (pullWorker.serviceAccount.name).",
+                            category="secrets")]
+    return []
+
+
 def _pull_worker_token_checks(values: dict) -> list[CheckResult]:
-    """The chart's four pull-worker token refusals (_helpers.tpl), before a render.
+    """The chart's pull-worker token refusals (_helpers.tpl), before a render: no token,
+    both values, a non-string token, the JWT secret, and the control plane's Secret.
 
     The release name is a `helm install` argument, so the control plane's Secret is
     known here only when `secrets.existingSecret` or `fullnameOverride` names it; a
@@ -711,6 +761,7 @@ def check_values(values: dict, strict: bool = False) -> list[CheckResult]:
     if _get(values, "pullWorker", "enabled"):
         out.extend(_pull_worker_token_checks(values))
         out.extend(_pull_worker_extra_env_checks(values))
+        out.extend(_pull_worker_service_account_checks(values))
 
     # ── ingress ──────────────────────────────────────────────────────────
     if _get(values, "ingress", "enabled", default=True):

@@ -530,40 +530,70 @@ def _doctor(pull: dict, **top) -> dict[str, str]:
 _OTEL_HEADERS = "x-honeycomb-team=hc-otel-header-value"
 
 
-def _value_env(docs: list[dict], workload: dict) -> dict[str, str]:
+def _value_env(docs: list[dict], workload: dict, *, external: str = "") -> dict[str, str]:
     """Like :func:`effective_env`, but with VALUES: ConfigMap data, Secret stringData
-    and inline env, resolved against the manifests rendered in the same pass."""
+    and inline env, resolved against the manifests rendered in the same pass.
+
+    Every ``envFrom`` source must resolve to a rendered manifest, except ``external``
+    (the worker's own ``existingSecret``), which may be the ONLY one that does not: an
+    unresolvable reference would otherwise hide whatever it carries."""
     container = _main_container(workload)
     out: dict[str, str] = {}
+    unresolved: list[str] = []
     for ref in container.get("envFrom", []) or []:
         if "configMapRef" in ref:
-            cm = {d["metadata"]["name"]: d for d in _kinds(docs, "ConfigMap")}[ref["configMapRef"]["name"]]
+            name = ref["configMapRef"]["name"]
+            cm = {d["metadata"]["name"]: d for d in _kinds(docs, "ConfigMap")}.get(name)
+            if cm is None:
+                unresolved.append(f"ConfigMap/{name}")
+                continue
             out.update({k: str(v) for k, v in (cm.get("data") or {}).items()})
         if "secretRef" in ref:
-            sec = {d["metadata"]["name"]: d for d in _kinds(docs, "Secret")}.get(ref["secretRef"]["name"])
-            if sec is not None:
-                out.update({k: str(v) for k, v in (sec.get("stringData") or {}).items()})
+            name = ref["secretRef"]["name"]
+            sec = {d["metadata"]["name"]: d for d in _kinds(docs, "Secret")}.get(name)
+            if sec is None:
+                unresolved.append(f"Secret/{name}")
+                continue
+            out.update({k: str(v) for k, v in (sec.get("stringData") or {}).items()})
     for item in container.get("env", []) or []:
         out[item["name"]] = str(item.get("value"))
+    assert unresolved == ([f"Secret/{external}"] if external else []), unresolved
     return out
 
 
+def _control_plane_secrets(example: str, sets: dict[str, str]) -> list[str]:
+    """The control-plane secret values this render carries: the database password
+    (bundled) or the whole external DSN, the JWT secret, the OTEL headers."""
+    vals = yaml.safe_load(_values(example).read_text())
+    found = [vals["postgres"].get("password") or "", (vals["postgres"].get("external") or {}).get("dsn") or "",
+             vals["secrets"].get("obsJwtSecret") or "", sets.get("observability.otlp.headers", "")]
+    return [v for v in found if v]
+
+
 @needs_helm
-@pytest.mark.parametrize("extra", [
-    {},                                                   # bundled Postgres, chart-managed Secret
-    {"secrets.existingSecret": "my-control-plane"},       # the control plane's own Secret
+@pytest.mark.parametrize("example,extra", [
+    ("values-postgres.example.yaml", {}),                                  # bundled Postgres
+    ("values-postgres.example.yaml", {"secrets.existingSecret": "my-control-plane"}),
+    ("values-postgres.example.yaml", {"artifacts.s3.enabled": "true"}),
+    ("values-external-dsn.example.yaml", {}),                              # an external DSN
+    ("values-external-dsn.example.yaml", {"artifacts.s3.enabled": "true"}),
+    ("values-temporal.example.yaml", {}),
+    ("values-postgres.example.yaml", {"pullWorker.existingSecret": "pool-gpu"}),   # the worker's own
 ])
-def test_no_worker_env_value_carries_a_control_plane_secret(extra):
-    vals = yaml.safe_load(_values("values-postgres.example.yaml").read_text())
-    secrets = [vals["postgres"]["password"], vals["secrets"]["obsJwtSecret"], _OTEL_HEADERS]
-    docs = render("values-postgres.example.yaml", sets={
-        **_PULL, "pullWorker.token": "wp-token", "observability.otlp.headers": _OTEL_HEADERS,
-        "env.extra.SOME_VENDOR_KEY": "vendor-extra-value", **extra})
-    env = _value_env(docs, _by_name(docs, "Deployment", "-pull-worker"))
+def test_no_worker_env_value_carries_a_control_plane_secret(example, extra):
+    token = {} if "pullWorker.existingSecret" in extra else {"pullWorker.token": "wp-token"}
+    sets = {**_PULL, **token, "observability.otlp.headers": _OTEL_HEADERS,
+            "env.extra.SOME_VENDOR_KEY": "vendor-extra-value", **extra}
+    secrets = _control_plane_secrets(example, sets)
+    assert len(secrets) >= 3, secrets                     # the database, the JWT, the headers
+    docs = render(example, sets=sets)
+    env = _value_env(docs, _by_name(docs, "Deployment", "-pull-worker"),
+                     external=extra.get("pullWorker.existingSecret", ""))
     leaks = sorted(k for k, v in env.items() if any(s in v for s in secrets))
     assert not leaks, leaks
     assert "vendor-extra-value" not in env.values()       # env.extra is not the worker's
-    assert env["CAIRN_ENGINE_TOKEN"] == "wp-token"
+    if token:
+        assert env["CAIRN_ENGINE_TOKEN"] == "wp-token"
 
 
 @needs_helm
@@ -596,14 +626,55 @@ def test_extra_env_changes_roll_the_worker():
     assert checksum("0") != checksum("1")
 
 
+_UNSAFE_NAMES = ["HF_TOKEN", "APITOKEN", "hf_token", "MY_API_KEY", "MY_API_KEYS", "DB_PASSWORD",
+                 "aws_secret", "AWS_SECRET_ACCESS_KEY", "CAIRN_STORAGE", "OBS_STORAGE", "PG_DSN",
+                 "CAIRN_DBOS_DSN", "OTEL_EXPORTER_OTLP_HEADERS", "DB_CONNECTION_STRING",
+                 "CAIRN_CONN_HF_ENDPOINT"]
+_SAFE_NAMES = ["TOKENIZERS_PARALLELISM", "KEYBOARD_LAYOUT", "HF_HUB_OFFLINE", "AWS_ENDPOINT_URL",
+               "CAIRN_ENGINE_URL", "CAIRN_CONNECTOR"]
+
+
 @needs_helm
-@pytest.mark.parametrize("name", ["HF_TOKEN", "MY_API_KEY", "DB_PASSWORD", "aws_secret",
-                                  "CAIRN_STORAGE", "OBS_STORAGE", "PG_DSN", "CAIRN_DBOS_DSN",
-                                  "OTEL_EXPORTER_OTLP_HEADERS"])
+@pytest.mark.parametrize("name", _UNSAFE_NAMES)
 def test_a_secret_looking_extra_env_name_is_refused(name):
     err = render_error("values-postgres.example.yaml", sets={
         **_PULL, "pullWorker.token": "wp-token", f"pullWorker.extraEnv.{name}": "v"})
     assert f"pullWorker.extraEnv.{name}" in err and "own Secret" in err, err
+
+
+@needs_helm
+def test_ordinary_extra_env_names_render():
+    docs = render("values-postgres.example.yaml", sets={
+        **_PULL, "pullWorker.token": "wp-token",
+        **{f"pullWorker.extraEnv.{n}": "v" for n in _SAFE_NAMES}})
+    data = _by_name(docs, "ConfigMap", "-pull-worker")["data"]
+    assert set(_SAFE_NAMES) <= set(data)
+
+
+@needs_helm
+@pytest.mark.parametrize("value", ["https://user:pass@ml.example:5000", "postgresql://u:p@db/cairn",
+                                   "redis://:s3cret@cache:6379/0"])
+def test_an_extra_env_value_with_a_password_in_a_url_is_refused(value):
+    err = render_error("values-postgres.example.yaml", sets={
+        **_PULL, "pullWorker.token": "wp-token", "pullWorker.extraEnv.MLFLOW_TRACKING_URI": value})
+    assert "password in it" in err, err
+    assert value not in err                               # the value is never echoed
+
+
+@needs_helm
+@pytest.mark.parametrize("value", ["https://ml.example:5000", "https://user@ml.example", "s3://bucket/a:b"])
+def test_an_extra_env_value_without_a_url_password_renders(value):
+    docs = render("values-postgres.example.yaml", sets={
+        **_PULL, "pullWorker.token": "wp-token", "pullWorker.extraEnv.MLFLOW_TRACKING_URI": value})
+    assert _by_name(docs, "ConfigMap", "-pull-worker")["data"]["MLFLOW_TRACKING_URI"] == value
+
+
+@needs_helm
+def test_the_engine_url_falls_back_to_either_spelling():
+    for key in ("CAIRN_ENGINE_URL", "OBS_ENGINE_URL"):
+        docs = render("values-postgres.example.yaml", sets={
+            **_PULL, "pullWorker.token": "wp-token", f"env.extra.{key}": "https://cp.example"})
+        assert _by_name(docs, "ConfigMap", "-pull-worker")["data"]["CAIRN_ENGINE_URL"] == "https://cp.example"
 
 
 @needs_helm
@@ -624,21 +695,66 @@ def test_the_worker_has_its_own_service_account():
     assert server["serviceAccountName"] != pod["serviceAccountName"]
 
 
+@needs_helm
+def test_a_pre_provisioned_service_account_can_be_named():
+    docs = render("values-postgres.example.yaml", sets={
+        **_PULL, "pullWorker.token": "wp-token", "pullWorker.serviceAccount.create": "false",
+        "pullWorker.serviceAccount.name": "gpu-pool-worker"})
+    pod = _pod_spec(_by_name(docs, "Deployment", "-pull-worker"))
+    assert pod["serviceAccountName"] == "gpu-pool-worker"
+    assert pod["automountServiceAccountToken"] is False
+    assert not [d for d in _kinds(docs, "ServiceAccount") if d["metadata"]["name"] == "gpu-pool-worker"]
+    assert not [d for d in _kinds(docs, "ServiceAccount") if d["metadata"]["name"].endswith("-pull-worker")]
+
+
+@needs_helm
+@pytest.mark.parametrize("sets,needle", [
+    ({"pullWorker.serviceAccount.create": "false"}, "needs pullWorker.serviceAccount.name"),
+    ({"pullWorker.serviceAccount.create": "false", "pullWorker.serviceAccount.name": "cairn"},
+     "is the control plane's"),
+    ({"pullWorker.serviceAccount.name": "cp-sa", "serviceAccount.name": "cp-sa"}, "is the control plane's"),
+])
+def test_the_worker_service_account_is_never_the_control_planes(sets, needle):
+    err = render_error("values-postgres.example.yaml", sets={**_PULL, "pullWorker.token": "wp-token", **sets})
+    assert needle in err, err
+
+
+def _doctor_named(name: str, pull: dict, **top) -> dict[str, str]:
+    from cairn.core.deploy_check import check_values
+
+    values = yaml.safe_load(_values("values-postgres.example.yaml").read_text())
+    values["pullWorker"] = {"enabled": True, "command": ["cairn"], "token": "wp", **pull}
+    values.update(top)
+    return {r.name: r.status for r in check_values(values) if r.name == name}
+
+
 def test_deploy_doctor_refuses_a_secret_looking_extra_env_name():
-    def doctor(extra: dict) -> dict[str, str]:
-        from cairn.core.deploy_check import check_values
-
-        values = yaml.safe_load(_values("values-postgres.example.yaml").read_text())
-        values["pullWorker"] = {"enabled": True, "command": ["cairn"], "token": "wp", "extraEnv": extra}
-        return {r.name: r.status for r in check_values(values) if r.name == "pull_worker_extra_env"}
-
-    for name in ("HF_TOKEN", "MY_API_KEY", "DB_PASSWORD", "CAIRN_STORAGE", "PG_DSN",
-                 "OTEL_EXPORTER_OTLP_HEADERS", "BAD-NAME"):
-        assert doctor({name: "v"}) == {"pull_worker_extra_env": "fail"}, name
-    assert doctor({"HF_HUB_OFFLINE": "1"}) == {}
+    for name in (*_UNSAFE_NAMES, "BAD-NAME"):
+        assert _doctor_named("pull_worker_extra_env", {"extraEnv": {name: "v"}}) == {
+            "pull_worker_extra_env": "fail"}, name
+    for name in _SAFE_NAMES:
+        assert _doctor_named("pull_worker_extra_env", {"extraEnv": {name: "v"}}) == {}, name
 
 
-def test_deploy_doctor_matches_the_four_chart_refusals():
+def test_deploy_doctor_refuses_an_extra_env_value_with_a_url_password():
+    bad = {"extraEnv": {"MLFLOW_TRACKING_URI": "https://user:pass@ml.example"}}
+    assert _doctor_named("pull_worker_extra_env", bad) == {"pull_worker_extra_env": "fail"}
+    ok = {"extraEnv": {"MLFLOW_TRACKING_URI": "https://user@ml.example"}}
+    assert _doctor_named("pull_worker_extra_env", ok) == {}
+
+
+def test_deploy_doctor_checks_the_worker_service_account():
+    sa = "pull_worker_service_account"
+    assert _doctor_named(sa, {"serviceAccount": {"create": False}}) == {sa: "fail"}
+    assert _doctor_named(sa, {"serviceAccount": {"create": False, "name": "cp"}},
+                         serviceAccount={"create": True, "name": "cp"}) == {sa: "fail"}
+    assert _doctor_named(sa, {"serviceAccount": {"name": "x-pull-worker"}},
+                         fullnameOverride="x-pull-worker") == {sa: "fail"}   # control plane SA = fullname
+    assert _doctor_named(sa, {"serviceAccount": {"create": False, "name": "gpu-pool-worker"}}) == {}
+    assert _doctor_named(sa, {}) == {}
+
+
+def test_deploy_doctor_matches_the_chart_token_refusals():
     jwt = yaml.safe_load(_values("values-postgres.example.yaml").read_text())["secrets"]["obsJwtSecret"]
     assert _doctor({}) == {"pull_worker_token": "fail"}                       # no token
     assert _doctor({"token": "  \n"}) == {"pull_worker_token": "fail"}       # whitespace only
