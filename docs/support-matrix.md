@@ -14,7 +14,7 @@ the prod box with a real outcome). "Code exists" alone never earns SUPPORTED. Up
 |---|---|---|
 | Python 3.12, 3.13 | SUPPORTED | `requires-python >=3.12`; CI matrix tests 3.13; prod image 3.13 |
 | In-process runtime (agentic graphs) | SUPPORTED | CI TESTED (`tests/core`) |
-| Temporal runtime (`CAIRN_RUNTIME=temporal`) | SUPPORTED for flow legs only | CI TESTED (`test_temporal_wiring.py`), PRODUCTION PROVEN (prod compose profile); the Temporal pipeline owner sends `flow:` legs to the engine and every other leg through `run_template`, so `task:` legs fail (#1378, `07-runtime.md`); the public feature proof covers DBOS, not Temporal (ADR-0127 D6) |
+| Temporal runtime (`CAIRN_RUNTIME=temporal`) | SUPPORTED for flow, template and gate legs | CI TESTED (`test_temporal_wiring.py`), PRODUCTION PROVEN (prod compose profile); the Temporal pipeline owner sends `flow:` legs to the engine and every other leg through `run_template`, so `task:` legs and `finalizer:` steps are refused at launch (#59, `07-runtime.md`); the public feature proof covers DBOS, not Temporal (ADR-0127 D6) |
 | DBOS runtime | EXPERIMENTAL | `dbos` tests run in the deploy matrix and the hello-cairn feature proof's `dbos` cells (`tests/e2e/hello`, run outside CI), not in CI; an SQLite DBOS system DB needs SQLite >= 3.42 (`unixepoch('subsec')`; boot refuses older — use a uv-managed Python or a Postgres `CAIRN_DBOS_DSN`) |
 
 ## Storage
