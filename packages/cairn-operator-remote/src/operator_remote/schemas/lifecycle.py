@@ -25,8 +25,9 @@ class AcquireInput(BaseModel):
         description="Lease length. >0 stamps a `cairn:release-after` deadline tag on "
                     "the instance, which `cairn compute sweep` enforces from ANY host "
                     "with credentials — so the box does not outlive a crashed control "
-                    "plane. 0 = no lease stamped (the box is then only released by the "
-                    "pipeline's own release finalizer).",
+                    "plane. 0 = no release-after deadline (the `cairn:managed` tag is still "
+                    "stamped; the box is then only released by the pipeline's own "
+                    "release finalizer).",
     )
     wait_ready_s: float = Field(
         600.0, ge=0,

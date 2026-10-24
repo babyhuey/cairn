@@ -33,8 +33,10 @@ provides = ["remote.exec"]
 # ── the compute LIFECYCLE pair (#1787, ADR-0097; public here since ADR-0151 D6, #201) ──
 # remote/exec runs work on a `compute.ssh` box; these two turn the box on and off. Same
 # refs, schemas, risk classes and capabilities as the platform's cairn-operator-compute
-# 0.1.0 (which drops its copies in the same release: both installed would raise
-# DuplicateOperatorError). No `implements` URI yet (ADR-0151 D7). Every EC2 call goes
+# 0.1.0, which must drop its copies in the same release: production loads operators
+# non-strictly, so with both installed the last registration of each name wins with a
+# warning, and the platform's start-then-stamp acquire may be the one that runs. No
+# `implements` URI yet (ADR-0151 D7). Every EC2 call goes
 # through cairn.core.compute_lifecycle — the module `cairn compute sweep` calls too —
 # reached through the operator contract's re-exports (ADR-0120 D7).
 #

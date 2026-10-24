@@ -119,12 +119,20 @@ is not `compute.ssh`, fails closed with the `cairn connect ssh` command that fix
   stops, then submits the release (ADR-0151 D9). A job cancel that fails is logged and
   audited (`leg_job_cancel`, `sent: false`); the release runs regardless.
 - `remote/exec` is `external_write`.
-- In-process and DBOS run finalizers on done, failed and cancelled. The Temporal
-  pipeline owner schedules by `depends_on` only, so a trailing release would run on
-  success alone; ADR-0151 D10 refuses such a plan at launch (a separate change: #196, #197, #199).
+- In-process and DBOS run finalizers on done, failed and cancelled. Under the Temporal
+  pipeline owner the launch door refuses a plan with a `task:` leg or a `finalizer:`
+  step (ADR-0151 D10, #208), so a pipeline that uses these operators runs in-process or
+  on DBOS.
 - Task legs reserve no budget (`08-governance.md`, partial): `acquire` is a paid task
   leg on top of that; the minutes between `acquire` and the first priced flow leg are
   unpriced (ADR-0151 consequences).
+
+**Upgrade.** The platform's `cairn-operator-compute` 0.1.0 declares the same two refs.
+It must drop them in the same release as this pack. The engine does not refuse to boot
+with both installed: production loads operators non-strictly
+(`load_all_operators(strict=False)`), so the second registration of each name replaces
+the first with a warning, whichever entry point loads last wins, and the
+lease-before-start order (D8) is not guaranteed.
 
 ## 6. Failure modes
 
@@ -136,6 +144,7 @@ is not `compute.ssh`, fails closed with the `cairn connect ssh` command that fix
 | a crash between the lease and the start | control plane died | tagged, not running (ADR-0151 D8) | yes |
 | release of a stopped box | finalizer re-run after a restart | `already_stopped: true`, success | n/a |
 | an orphaned trainer after cancel | `kill <pid>` reached only the wrapper (#603) | `remote/exec` kills the process group | yes |
+| a cancelled job relaunched as a "recoverable death" | the kill ends runner.sh before it writes `exit_code` | `_cancel` writes a `cancelled` marker first; `_poll` reads it first and reports `cancelled`, not retriable (ADR-0151 D9); `_submit` clears it | yes |
 
 ## 7. Testing
 

@@ -1,7 +1,7 @@
 """ADR-0103 (#2035) — compute/acquire's ``reports`` declaration must not be
 decorative. Runs the REAL engine path with a strict reporter (via
 ``assert_reports_conform``), so an undeclared name would raise. Reuses this
-pack's fake-EC2 seam (``tests/test_lifecycle.py``) — no AWS call is made.
+pack's fake-EC2 seam (``tests/test_compute_lifecycle.py``) — no AWS call is made.
 """
 from __future__ import annotations
 
