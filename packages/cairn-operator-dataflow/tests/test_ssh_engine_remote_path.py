@@ -428,3 +428,18 @@ def test_a_local_version_in_the_spec_config_is_refused(monkeypatch):
                         config={"dataset_uri": "file:///srv/a.jsonl#sha256=h"})
     with pytest.raises(EngineError, match="durable"):
         _submit(spec)
+
+
+def test_a_handle_stored_before_adr_0149_still_rebuilds():
+    """Storage is not rewritten: a stored pre-ADR-0149 handle, env values and all,
+    still drives poll/cancel/result, and so does its masked API form."""
+    from cairn.core.triggers.routers.pipelines import HIDDEN, public_handle
+
+    old = _handle().model_dump()
+    old["meta"]["exec_input"]["env"] = {"CAIRN_ENGINE_TOKEN": "engine-tok-value"}
+    _, jh, inp = BuiltinSshEngine("gpu")._rebuild(EngineJobHandle(**old))
+    assert jh.meta["workdir"] == ".cairn-jobs/j1" and inp.fetch == ["result.json"]
+    shown = public_handle(old)
+    assert shown["meta"]["exec_input"]["env"] == {"CAIRN_ENGINE_TOKEN": HIDDEN}
+    _, _, inp2 = BuiltinSshEngine("gpu")._rebuild(EngineJobHandle(**shown))
+    assert inp2.fetch == ["result.json"]

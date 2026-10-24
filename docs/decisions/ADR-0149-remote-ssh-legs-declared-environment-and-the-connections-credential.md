@@ -100,6 +100,8 @@ same warning and returns `False`.
 - A co-located leg's dataset locations are unchanged.
 - `needs_durable_inputs` is an optional engine attribute read with `getattr`. An engine that
   does not declare it is treated as co-located.
+- A step handle written before this ADR keeps its env values in storage; `GET /pipelines/{id}`
+  shows each `env` value in it as `[hidden]`, names kept (owner decision 2026-10-24).
 - Job handles from `remote/exec` gain `connection`, `account_id` and `workspace_id` (names only).
   The SSH engine's handle drops `exec_input.env` and gains `env_names`.
 - The resolved location is part of the checkpoint `spec_key`, so the first run of a leg whose
