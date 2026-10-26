@@ -454,11 +454,16 @@ async def _cancel(handle: JobHandle, *, connection: str = "") -> bool:
         except Exception as e:  # noqa: BLE001
             logger.warning("remote/exec: could not mark %s:%s cancelled (%s); killing anyway",
                            handle.meta.get("host"), workdir, type(e).__name__)
-        await conn.run(
-            f'p=$(cat {q2}/pid 2>/dev/null); [ -n "$p" ] && '
-            f'{{ kill -TERM -"$p" 2>/dev/null; sleep 1; kill -KILL -"$p" 2>/dev/null; }}',
+        killed = await conn.run(
+            f'p=$(cat {q2}/pid 2>/dev/null); if [ -n "$p" ]; then '
+            f'kill -TERM -"$p" 2>/dev/null; sleep 1; kill -KILL -"$p" 2>/dev/null; '
+            f'else echo nopid; fi',
             check=False,
         )
+        if "nopid" in str(getattr(killed, "stdout", "") or ""):
+            logger.warning("remote/exec: %s:%s has no pid yet (cancelled inside the launch "
+                           "window); marked cancelled, nothing killed — compute/release stops "
+                           "the box", handle.meta.get("host"), workdir)
     except Exception as e:  # noqa: BLE001
         _unreachable("cancel (the remote process may still be running)", handle, connection, e)
         return False

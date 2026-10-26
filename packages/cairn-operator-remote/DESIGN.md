@@ -148,7 +148,7 @@ lease-before-start order (D8) is not guaranteed.
 
 **Cancel precedence (ADR-0151 D9).** `_poll` reads the cancel marker before anything
 else, so it wins over everything the job left behind: a job that wrote `exit_code` 0 a
-moment before the cancel's marker reads `cancelled`, not `succeeded`. Two edge cases are
+moment before the cancel's marker reads `cancelled`, not `succeeded`. Three edge cases are
 accepted:
 - **Marker written, kill failed** (the box was reachable for the marker, then not):
   the next poll reports `cancelled` while the process may keep running until the
@@ -156,6 +156,10 @@ accepted:
 - **Marker not written, kill ran** (read-only or full disk; the shell's exit status is
   checked and logged): the poll reads the #552 recoverable death, as before the marker
   existed.
+- **Cancel inside the launch window** (the pid file is written just after `_submit`
+  returns): the marker is written but there is no pid to kill. `_cancel` logs it; polls
+  report `cancelled` while the job may still start, and only the pipeline's
+  `compute/release` stops it.
 
 ## 7. Testing
 

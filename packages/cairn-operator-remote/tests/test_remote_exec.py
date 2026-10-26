@@ -697,6 +697,29 @@ async def test_a_marker_the_shell_could_not_write_is_logged_and_still_kills(monk
     remote_exec._reset_conn_cache()
 
 
+async def test_a_cancel_inside_the_launch_window_is_logged(monkeypatch, caplog):
+    """No pid file yet (cancelled just after submit): the marker is written, nothing is
+    killed, and that is logged so the operator knows only compute/release stops the job."""
+
+    class _NoPid(_Conn):
+        async def run(self, cmd, check=False):
+            res = await super().run(cmd, check=check)
+            if "kill -TERM" in cmd:
+                res.stdout = "nopid\n"
+            return res
+
+    async def fake_connect(params):
+        return _NoPid({})
+
+    monkeypatch.setattr(remote_exec, "_connect", fake_connect)
+    monkeypatch.setenv("SSH_PRIVATE_KEY", "key")
+    remote_exec._reset_conn_cache()
+    with caplog.at_level("WARNING", logger="operator_remote.exec"):
+        assert await remote_exec._cancel(_cancel_handle()) is True
+    assert any("launch window" in r.getMessage() for r in caplog.records)
+    remote_exec._reset_conn_cache()
+
+
 async def test_the_cancel_marker_wins_over_a_just_written_exit_code_0(monkeypatch):
     """The race: the job wrote exit_code 0 a moment before the cancel's marker.
     The marker is read first, so the job reads cancelled (documented in DESIGN.md)."""

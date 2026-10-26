@@ -256,7 +256,7 @@ async def test_a_cancelled_remote_job_ends_the_run_instead_of_pausing_again(tmp_
     assert not (isinstance(out, dict) and "__interrupt__" in out), "must not pause again"
     from cairn.core.operator.jobs import JobCancelled
 
-    assert isinstance(out, JobCancelled) or "cancelled" in str(out), out
+    assert isinstance(out, JobCancelled), out
 
     reset_remote_job_store()
     reset_checkpointer()
