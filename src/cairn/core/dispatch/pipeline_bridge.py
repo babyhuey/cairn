@@ -1131,12 +1131,10 @@ class PipelineBridge:
         step(s). Returns the persisted record.
 
         Under ``CAIRN_RUNTIME=temporal`` the pipeline is owned by a durable
-        PipelineWorkflow instead. The check lives HERE — this is the method the
-        ONE launch door (`launch_pipeline`: CLI, console, cron) calls — not only
-        in the legacy wrapper: with it there alone, every modern launch path
-        silently ran in-process/non-durable under the temporal runtime. The
-        drift was masked because the asserting tests failed on the missing
-        `temporalio` import instead of on the routing.
+        PipelineWorkflow instead. The check lives HERE because this is the
+        method the ONE launch door (`launch_pipeline`: CLI, console, cron) calls;
+        a check anywhere else would let a launch run in-process and non-durable
+        under the temporal runtime.
         """
         from cairn.core import settings  # noqa: PLC0415 — cycle: settings → storage → dispatch
 
