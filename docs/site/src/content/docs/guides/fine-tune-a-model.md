@@ -1,12 +1,13 @@
 ---
 title: Fine-tune a model on a GPU box
-description: Prepare a dataset, fine-tune Qwen3-4B with QLoRA on an AWS GPU box that cairn starts and stops for you, approve the spend, and promote the result. Every command, from an empty box to a published adapter.
+description: Prepare a dataset, fine-tune a base model with LoRA or QLoRA on a GPU box that cairn starts and stops for you, approve the spend, and promote the result, all from the CLI.
 ---
 
-This guide runs the governed fine-tune behind
-[`cairndev/qwen3-4b-ifc-bim-qlora`](https://huggingface.co/cairndev/qwen3-4b-ifc-bim-qlora),
-command by command. It fine-tunes Qwen3-4B-Base with 4-bit QLoRA on an IFC/BIM
-instruction dataset. The steps work the same for your own data and base model.
+This guide walks through a governed fine-tune with the
+[`cairn-pack-dataset-prep`](https://pypi.org/project/cairn-pack-dataset-prep/)
+and [`cairn-pack-finetune`](https://pypi.org/project/cairn-pack-finetune/)
+packs. Each step ends with a command you can run and an explanation of what
+cairn checks before it lets the run go further.
 
 What you get:
 
@@ -21,16 +22,12 @@ What you get:
 - **Promotion only after a person decides,** with the losses on the card.
 - **Every step recorded.** You can read the findings and replay the run later.
 
-Our run: 5,646 training rows, 353 steps on a Tesla T4, about 73 minutes of
-training. It settled at **$0.86** against a **$16.50** worst-case estimate.
-Validation loss went from **2.718** for the base model to **0.554**.
-
 ## The layout
 
 | Machine | Runs | Installs |
 |---|---|---|
-| **Control box**: any small Linux machine (we used an EC2 t2.large) | the cairn engine: runs, gates, budget, the data leg, and the box's start and stop | `cairndev`, the two packs |
-| **GPU box**: an EC2 GPU instance (we used a g4dn.xlarge with a 16 GB T4) | only the trainer, started over SSH by the engine | `cairn-operator-training[gpu]` |
+| **Control box**: any small Linux machine | the cairn engine: runs, gates, budget, the data leg, and the box's start and stop | `cairndev`, the two packs |
+| **GPU box**: an EC2 GPU instance | only the trainer, started over SSH by the engine | `cairn-operator-training[gpu]` |
 | **Your laptop** (optional) | the `cairn remote …` CLI, through an SSH tunnel | `cairndev` |
 
 The engine never runs on the GPU box, and nothing listens on it: the
@@ -47,7 +44,12 @@ between the machines through one S3 bucket.
    bucket. On the control box, the role also needs `ec2:DescribeInstances`,
    `ec2:CreateTags`, `ec2:StartInstances` and `ec2:StopInstances` on the GPU
    instance.
-4. **Public Hugging Face Hub access** for the dataset and the base model.
+4. **Network access** to wherever your dataset and base model come from (for
+   example the Hugging Face Hub).
+
+To manage the box yourself, or to use one that isn't on EC2, use
+`finetune/sft-own-box`. It is the same pipeline without the start and stop
+steps, and its connection needs no `instance_id`.
 
 ## 1. Install on the control box
 
@@ -56,8 +58,8 @@ detection and token-length profiling:
 
 ```bash
 uv venv .venv --python 3.13
-uv pip install "cairndev[ssh,storage-postgres]==0.3.1" \
-  "cairn-pack-dataset-prep[all]==0.1.0" "cairn-pack-finetune==0.1.1"
+uv pip install "cairndev[ssh,storage-postgres]" \
+  "cairn-pack-dataset-prep[all]" "cairn-pack-finetune"
 ```
 
 ## 2. Configure and start the engine
@@ -77,7 +79,7 @@ CAIRN_CHECKPOINT_BUCKET=<bucket>
 CAIRN_CHECKPOINT_PREFIX=cairn/checkpoints
 AWS_DEFAULT_REGION=<region>
 CAIRN_REMOTE_ENV=CAIRN_CHECKPOINT_BUCKET,CAIRN_CHECKPOINT_PREFIX,AWS_DEFAULT_REGION
-CAIRN_DATAFLOW_REMOTE_CMD=/home/ubuntu/cairn-train/.venv/bin/cairn-dataflow-run
+CAIRN_DATAFLOW_REMOTE_CMD=<trainer venv on the GPU box>/bin/cairn-dataflow-run
 ```
 
 - **`CAIRN_REMOTE_ENV`** forwards these variables, by name, to the training
@@ -107,9 +109,9 @@ check:
 
 ```bash
 cairn connect add ssh --name gpu \
-  --set host=<gpu private ip> --set user=ubuntu \
+  --set host=<gpu host or private ip> --set user=<ssh user> \
   --set known_hosts=$HOME/.ssh/known_hosts --secret PRIVATE_KEY=GPU_SSH_KEY \
-  --set instance_id=<i-…> --set region=<region> --set hourly_usd=0.66
+  --set instance_id=<i-…> --set region=<region> --set hourly_usd=<rate>
 cairn doctor --strict
 ```
 
@@ -122,22 +124,33 @@ cairn doctor --strict
 Log the CLI in to the engine. `cairn dev` prints its development login:
 
 ```bash
-cairn remote login -u dev -p dev -e http://127.0.0.1:9090
+cairn remote login -u <user> -p <password> -e http://127.0.0.1:9090
 ```
 
 ## 4. Prepare the dataset
 
 `dataset-prep/prepare` pins the source, removes exact and near duplicates,
-profiles lengths with the base model's tokenizer, splits by template family
-so variants never straddle train and test, and registers three dataset
-versions with their roles:
+profiles lengths with the base model's tokenizer, splits by a group key so
+related rows never straddle train and test, and registers three dataset
+versions: training, validation and test.
 
 ```bash
-cairn remote presets dataset-prep/prepare
-cairn remote launch dataset-prep/prepare --preset ifc-bim-alpaca
+cairn remote launch dataset-prep/prepare \
+  -i path=<hf dataset id | s3://… | local .jsonl/.csv/.parquet> \
+  -i revision=<commit or tag, to pin a Hub dataset> \
+  -i register=<name> --save-preset <name>
 ```
 
-It pauses at **`source-ok`**. A person checks the source, its pinned commit
+`cairn remote presets dataset-prep/prepare` lists ready-made presets the pack
+ships; `--preset <name>` launches one.
+
+Rows may be in any of these formats:
+
+- **Alpaca:** `instruction`, `input`, `output`;
+- **Prompt and completion:** `prompt`, `completion`;
+- **Chat:** `messages`.
+
+The pipeline pauses at **`source-ok`**. A person checks the source, its pin
 and the split before anything is read:
 
 ```bash
@@ -145,18 +158,15 @@ cairn remote advance <pl_id> source-ok --approver <you>
 cairn remote findings <pl_id>
 ```
 
-The findings are the evidence. In our run:
+**Read the findings before you train.** They are the evidence for every
+decision after this:
 
-| check | result |
+| Finding | What to look for |
 |---|---|
-| source rows | 42,680 |
-| exact duplicates | 0 |
-| near duplicates (MinHash, 0.8) | 36,385 dropped (85%: the source is template-generated) |
-| kept | 6,295 rows, 1.49 M tokens, none over 2,048 tokens |
-| split | train 5,646 · val 301 · test 348, `split_no_leakage = true` |
-
-For your own data, pass `-i path=<hf id | s3://… | file.jsonl> -i register=<name>`.
-`--save-preset <name>` keeps the inputs for next time.
+| `checks_dedup_exact_dropped`, `checks_dedup_near_dropped` | How much the cleaning removed. A large near-duplicate share usually means template-generated data. Decide on purpose whether to keep that threshold (`near_threshold`), or compare it with a looser one. |
+| `checks_profile_tokens_over_length_rows` | Rows longer than the sequence length you plan to train with |
+| `split_rows_train / val / test` | Split sizes. Small eval sets give noisy losses. |
+| `split_no_leakage` | Must be `true` |
 
 ## 5. Install the trainer on the GPU box
 
@@ -165,20 +175,25 @@ needs only the trainer wheel and the same contract versions as the control
 box:
 
 ```bash
-uv venv ~/cairn-train/.venv --python 3.13
-VIRTUAL_ENV=~/cairn-train/.venv uv pip install \
-  "cairn-operator-training[gpu]==0.1.0" \
-  "cairn-contracts-training==1.0.0" "cairn-contracts-training-stages==1.2.0"
+uv venv <trainer venv> --python 3.13
+VIRTUAL_ENV=<trainer venv> uv pip install \
+  "cairn-operator-training[gpu]" \
+  "cairn-contracts-training==<same as the control box>" \
+  "cairn-contracts-training-stages==<same as the control box>"
 ```
 
 The `cairndev` package comes along as a dependency. Only
 `cairn-dataflow-run` is ever called on this box. You can leave the box
-stopped: `sft` starts it after you approve.
+stopped: `finetune/sft` starts it after you approve.
 
 ## 6. Launch the fine-tune
 
 ```bash
-cairn remote launch finetune/sft --preset ifc-bim-qwen3-4b
+cairn remote launch finetune/sft \
+  -i train_version=dataset:<name>-train@latest \
+  -i val_version=dataset:<name>-val@latest \
+  -i test_version=dataset:<name>-test@latest \
+  -i base_model=<hugging face model id> --save-preset <name>
 ```
 
 Before any record exists, the launch door checks:
@@ -188,9 +203,8 @@ Before any record exists, the launch door checks:
 - the **holdout**: the training data must not overlap the eval sets, exactly
   or near;
 - the **GPU estimate**: `hourly_usd` × each priced leg's timeout × its
-  attempts, against the budget.
-
-Ours: smoke $0.66 + train $15.84 = **$16.50** worst case, with a $25 budget.
+  attempts, against `governance.budget`. A leg with no timeout can't be
+  priced, so the launch is refused.
 
 The run pauses at **`approve-run`**, showing that estimate and the training
 settings:
@@ -201,9 +215,10 @@ cairn remote advance <pl_id> approve-run --approver <you>
 
 Then, in order:
 
-1. **`acquire`** starts the box. It writes a 26-hour lease tag first, so
+1. **`acquire`** starts the box. It writes a lease tag first, so
    `cairn compute sweep` can find an orphaned box.
-2. **`smoke`** runs 5 steps on 64 rows, the whole path on the box.
+2. **`smoke`** runs a few steps on a small sample, the whole path on the
+   box.
 3. **`train`** runs the full training. A killed process is retried once and
    resumes from its last S3 checkpoint.
 4. **`release-box`** stops the box.
@@ -218,9 +233,12 @@ cairn remote pipeline <pl_id>
 cairn remote findings <pl_id>
 ```
 
-Ours: `train_qlora_baseline_eval_loss 2.71788`, `train_qlora_eval_loss
-0.553942`, `train_qlora_steps 353`, and the adapter at its S3 URI with a
-content hash.
+The training findings include:
+
+- `train_qlora_baseline_eval_loss`: the base model's eval loss;
+- `train_qlora_eval_loss` and `train_qlora_train_loss`: the candidate's;
+- `train_qlora_steps`;
+- the adapter's S3 URI and content hash.
 
 ## 7. Decide, promote, check the spend
 
@@ -233,9 +251,8 @@ cairn remote advance <pl_id> promote-model --approver <you>
 cairn remote advance <pl_id> promote --approver <you>
 ```
 
-Each priced leg settles its real box time in `Run.cost.gpu_usd`. Ours:
-smoke $0.05, train $0.81, **$0.86 in total**. Check that both boxes are
-stopped:
+Each priced leg settles its real box time in `Run.cost.gpu_usd`, which you
+can compare with the estimate you approved. Check that the box is stopped:
 
 ```bash
 cairn compute status gpu
@@ -243,39 +260,41 @@ cairn compute status gpu
 
 ## 8. Check it didn't forget (optional, outside cairn for now)
 
-A lower loss on your domain says the model learned the task. It doesn't
+A lower loss on your own data says the model learned the task. It doesn't
 say whether general ability dropped. Compare the base model and base +
 adapter with
 [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness),
 using the same settings for both, on the GPU box:
 
 ```bash
-uv venv ~/lmeval/.venv --python 3.13
-VIRTUAL_ENV=~/lmeval/.venv uv pip install "lm-eval[hf]==0.4.13" peft bitsandbytes accelerate
-BASE="pretrained=unsloth/qwen3-4b-base-unsloth-bnb-4bit,dtype=float16"
-for ARGS in "$BASE" "$BASE,peft=cairndev/qwen3-4b-ifc-bim-qlora"; do
+uv venv <eval venv> --python 3.13
+VIRTUAL_ENV=<eval venv> uv pip install "lm-eval[hf]" peft bitsandbytes accelerate
+for ARGS in "pretrained=<base model>" "pretrained=<base model>,peft=<adapter>"; do
   lm_eval --model hf --model_args "$ARGS" --tasks arc_easy,arc_challenge,hellaswag,winogrande,piqa \
-    --limit 150 --batch_size auto --seed 1234
-  lm_eval --model hf --model_args "$ARGS" --tasks mmlu --limit 5 --batch_size auto --seed 1234
+    --limit <n> --batch_size auto --seed 1234
+  lm_eval --model hf --model_args "$ARGS" --tasks mmlu --limit <n per subject> --batch_size auto --seed 1234
 done
 ```
 
-Ours took about 50 minutes on the T4. No score moved by more than the
-measurement noise (about ±3–4 points at 150 samples). The tables are on the
-[model card](https://huggingface.co/cairndev/qwen3-4b-ifc-bim-qlora). Stop the
-box afterwards. A governed eval step inside `finetune/sft`, priced and
-recorded like training, is in progress
-([cairn-extensions#37](https://github.com/cairndev-sh/cairn-extensions/pull/37)).
+- **Time a small run first.** Run about 50 items, measure the speed, then
+  choose `--limit`.
+- **MMLU's limit is per subject** (there are 57), so give it a separate,
+  smaller limit.
+- **Small samples are noisy.** A few hundred items per task can't resolve
+  changes of a few points.
+
+Stop the box afterwards. A governed eval step inside `finetune/sft`, priced
+and recorded like training, is in progress.
 
 ## What to change for your own run
 
 | | |
 |---|---|
-| Data | `dataset-prep/prepare -i path=… -i register=…`. Rows may be Alpaca (`instruction`/`input`/`output`), `prompt`/`completion`, or chat `messages`. |
-| Base model | `-i base_model=<any Hugging Face causal model>`. The GPU's memory limits the size: a 16 GB T4 fits about 4B with QLoRA. |
-| Recipe | `method`, `lora_r`, `lora_alpha`, `learning_rate`, `max_seq_len`, `epochs`, `per_device_batch_size`, `gradient_accumulation_steps` |
-| Your own box | `finetune/sft-own-box` is the same pipeline without the start and stop steps, for a box you manage. |
-| Tracking | Optional: `-i report_to=mlflow` with `MLFLOW_TRACKING_URI` set on the control box. |
+| Data | `dataset-prep/prepare -i path=… -i register=…`, plus the split ratios, `group_by` and the dedup threshold |
+| Base model | `-i base_model=<any Hugging Face causal model>`. The GPU's memory limits the size: about 4B with QLoRA on a 16 GB GPU. |
+| Recipe | `method` (`lora`/`qlora`), `lora_r`, `lora_alpha`, `learning_rate`, `max_seq_len`, `epochs`, `per_device_batch_size`, `gradient_accumulation_steps` |
+| Your own box | `finetune/sft-own-box` |
+| Tracking | Optional: `-i report_to=mlflow` with `MLFLOW_TRACKING_URI` set on the control box |
 
 ## Known limits
 
