@@ -146,6 +146,17 @@ lease-before-start order (D8) is not guaranteed.
 | an orphaned trainer after cancel | `kill <pid>` reached only the wrapper (#603) | `remote/exec` kills the process group | yes |
 | a cancelled job relaunched as a "recoverable death" | the kill ends runner.sh before it writes `exit_code` | `_cancel` writes a `cancelled` marker first; `_poll` reads it first and reports `cancelled`, not retriable (ADR-0151 D9); `_submit` clears it | yes |
 
+**Cancel precedence (ADR-0151 D9).** `_poll` reads the cancel marker before anything
+else, so it wins over everything the job left behind: a job that wrote `exit_code` 0 a
+moment before the cancel's marker reads `cancelled`, not `succeeded`. Two edge cases are
+accepted:
+- **Marker written, kill failed** (the box was reachable for the marker, then not):
+  the next poll reports `cancelled` while the process may keep running until the
+  pipeline's `compute/release` stops the box. `_cancel` returns `False` and logs it.
+- **Marker not written, kill ran** (read-only or full disk; the shell's exit status is
+  checked and logged): the poll reads the #552 recoverable death, as before the marker
+  existed.
+
 ## 7. Testing
 
 `packages/cairn-operator-remote/tests/`: `test_remote_exec.py` (fake asyncssh

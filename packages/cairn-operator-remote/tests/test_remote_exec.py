@@ -670,3 +670,37 @@ async def test_submit_clears_a_stale_cancel_marker(monkeypatch):
     rm = next(c for c in seen if c.startswith("rm -f") and "exit_code" in c)
     assert "/w/dir/cancelled" in rm
     remote_exec._reset_conn_cache()
+
+
+async def test_a_marker_the_shell_could_not_write_is_logged_and_still_kills(monkeypatch, caplog):
+    """`echo … > file` failing on a read-only or full disk does not raise under
+    check=False: its exit status is read, the failure is logged, the kill still runs."""
+    seen: list[str] = []
+
+    class _ShellFails(_Conn):
+        async def run(self, cmd, check=False):
+            seen.append(cmd)
+            res = await super().run(cmd, check=check)
+            res.exit_status = 1 if "/cancelled" in cmd else 0
+            return res
+
+    async def fake_connect(params):
+        return _ShellFails({})
+
+    monkeypatch.setattr(remote_exec, "_connect", fake_connect)
+    monkeypatch.setenv("SSH_PRIVATE_KEY", "key")
+    remote_exec._reset_conn_cache()
+    with caplog.at_level("WARNING", logger="operator_remote.exec"):
+        assert await remote_exec._cancel(_cancel_handle()) is True
+    assert any("cancel marker" in r.getMessage() and "exit 1" in r.getMessage() for r in caplog.records)
+    assert any("kill -TERM" in c for c in seen), seen
+    remote_exec._reset_conn_cache()
+
+
+async def test_the_cancel_marker_wins_over_a_just_written_exit_code_0(monkeypatch):
+    """The race: the job wrote exit_code 0 a moment before the cancel's marker.
+    The marker is read first, so the job reads cancelled (documented in DESIGN.md)."""
+    _patch_conn(monkeypatch, {"/cancelled": "cancelled", "exit_code": "0"})
+    st = await RemoteExecOp().poll(
+        JobHandle(job_id="box:/w", meta={"host": "box", "workdir": "/w"}), _inp(), _ctx())
+    assert st.state == "cancelled" and st.retriable is False

@@ -442,8 +442,15 @@ async def _cancel(handle: JobHandle, *, connection: str = "") -> bool:
         # reads `cancelled` (not retriable) instead of the #552 recoverable death a
         # kill otherwise looks like. Best-effort: a marker that cannot be written
         # never stops the kill.
+        # A shell-level failure (read-only fs, disk full) does not raise under
+        # check=False, so the exit status is read too: either way it is logged, and
+        # the kill below still runs (the job then reads as the #552 death it is).
         try:
-            await conn.run(f"echo cancelled > {q2}/{_CANCELLED}", check=False)
+            marked = await conn.run(f"echo cancelled > {q2}/{_CANCELLED}", check=False)
+            code = getattr(marked, "exit_status", 0)
+            if code not in (0, None):
+                logger.warning("remote/exec: the cancel marker on %s:%s was not written "
+                               "(exit %s); killing anyway", handle.meta.get("host"), workdir, code)
         except Exception as e:  # noqa: BLE001
             logger.warning("remote/exec: could not mark %s:%s cancelled (%s); killing anyway",
                            handle.meta.get("host"), workdir, type(e).__name__)
