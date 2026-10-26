@@ -1078,56 +1078,6 @@ class PipelineBridge:
         losing its DB session (no lease, no reaper)."""
         return self._sections.hold(pipeline_id)
 
-    # ── launch from a bundle ───────────────────────────────────────────────
-
-    async def run_bundle(
-        self,
-        bundle: Any,
-        *,
-        pipeline_name: Optional[str] = None,
-        inputs: dict,
-        environment: Optional[str] = None,
-        workspace_id: str = "default",
-        trigger: Optional[dict] = None,
-    ) -> PipelineRecord:
-        """Launch a ``[[bundle.pipeline]]`` as a governed pipeline (ADR-0069 §5).
-
-        Selects the named pipeline (or the first), plans it, and starts it. A pipeline
-        pinned to ``mode = "graph"`` (legacy flatten) is rejected here — it runs through
-        ``compile_bundle`` (one run), not this path."""
-        from cairn.core.engine.bundle_pipeline import plan_bundle  # noqa: PLC0415 — avoids an import cycle at module load
-
-        pipes = getattr(bundle, "pipeline", None) or []
-        if not pipes:
-            raise ValueError("bundle has no [[bundle.pipeline]] to run")
-        if pipeline_name:
-            pipe = next((p for p in pipes if p.name == pipeline_name), None)
-            if pipe is None:
-                raise ValueError(f"no pipeline named {pipeline_name!r} in this bundle")
-        else:
-            pipe = pipes[0]
-        if getattr(pipe, "mode", "pipeline") == "graph":
-            raise ValueError(
-                f"pipeline {pipe.name!r} is mode='graph' (legacy flatten) — run it via "
-                "compile_bundle, not the pipeline path"
-            )
-        plan = plan_bundle(pipe)
-        meta = getattr(bundle, "meta", None)
-        ref = f"{getattr(meta, 'name', '')}@{getattr(meta, 'version', '')}" if meta else ""
-        env = environment or (getattr(meta, "profile", "") or None)
-        # ADR-0069 Phase 4: under CAIRN_RUNTIME=temporal the pipeline is owned by a durable
-        # PipelineWorkflow (crash-safe); otherwise the in-process bridge advances it.
-        from cairn.core import settings  # noqa: PLC0415
-        if settings.runtime() == "temporal":
-            return await self._start_temporal_pipeline(
-                plan, inputs=inputs, bundle_ref=ref, environment=env,
-                workspace_id=workspace_id, trigger=trigger,
-            )
-        return await self.start_pipeline(
-            plan, inputs=inputs, bundle_ref=ref, environment=env,
-            workspace_id=workspace_id, trigger=trigger,
-        )
-
     async def _start_temporal_pipeline(
         self, plan: Any, *, inputs: dict, bundle_ref: str, environment: Optional[str],
         workspace_id: str, trigger: Optional[dict], admission: Optional[dict] = None,
