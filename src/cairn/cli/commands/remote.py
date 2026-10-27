@@ -11,12 +11,11 @@ Config lives at ``~/.cairn/config.toml``::
     [profiles.default]
     endpoint = "http://localhost:9090"
     token = "eyJ..."        # written by `remote login`
-    refresh_token = "..."   # the renewable sign-in's refresh credential (#230)
 
-The file holds credentials, so it is written 0600. A verb that meets a 401 trades
-``refresh_token`` for a new access token (``POST /auth/refresh``), saves both and
-retries; when it cannot, it prints ``session expired at HH:MM — run `cairn remote
-login``` and exits :data:`EXIT_SESSION_EXPIRED`.
+The file holds a credential, so it is written 0600. A verb whose session meets a 401
+prints one line, ``session expired at HH:MM — run `cairn remote login```, and exits
+:data:`EXIT_SESSION_EXPIRED`, watches included (#230). The CLI does not renew its
+sign-in: ADR-0142 D8 keeps the CLI on the access token alone.
 
 Resolution precedence for endpoint/token: explicit ``--endpoint``/``--token`` >
 env (``CAIRN_REMOTE_ENDPOINT`` / ``CAIRN_REMOTE_TOKEN``) > the named/default profile
@@ -53,13 +52,9 @@ app = typer.Typer(
 _TERMINAL = {"done", "failed", "cancelled"}
 _LIFECYCLE = {"queued", "running", "awaiting_approval", "resumed", *_TERMINAL}
 _DEFAULT_ENDPOINT = "http://localhost:9090"
-#: #230 — the exit code of a session that met a 401 and could not renew (sysexits'
-#: EX_NOPERM), so a script polling the CLI can tell "sign in again" from a failure.
+#: #230 — the exit code of a session the server refused (sysexits' EX_NOPERM), so a
+#: script polling the CLI can tell "sign in again" from a failure.
 EXIT_SESSION_EXPIRED = 77
-#: #230 — which profile each access token in use came from, so a 401 renews that
-#: profile's session. A token passed with --token or CAIRN_REMOTE_TOKEN is not here:
-#: it is the caller's to replace.
-_TOKEN_PROFILE: dict[str, str] = {}
 
 
 # ─── config (~/.cairn/config.toml) ─────────────────────────────
@@ -100,8 +95,8 @@ def _dump_config(cfg: dict) -> str:
 
 def _save_config(cfg: dict) -> None:
     """Write the config 0600 from the start and swap it in whole (#230): it holds the
-    access token and the refresh credential, and a second cairn process renewing the
-    same profile must never read half a file."""
+    access token, and a second cairn process reading the profile must never see half
+    a file."""
     p = _config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
@@ -124,12 +119,10 @@ def _resolve(
         or _DEFAULT_ENDPOINT
     ).rstrip("/")
     tok = token or getenv("CAIRN_REMOTE_TOKEN") or prof.get("token")
-    if tok and not (token or getenv("CAIRN_REMOTE_TOKEN")):
-        _TOKEN_PROFILE[tok] = prof_name
     return ep, tok
 
 
-# ─── session renewal (#230) ────────────────────────────────────────
+# ─── session expiry (#230) ─────────────────────────────────────────
 
 
 def _token_claims(token: str) -> dict:
@@ -147,37 +140,8 @@ def _token_exp(token: str) -> Optional[float]:
     return float(exp) if isinstance(exp, (int, float)) else None
 
 
-def _renew(endpoint: str, token: Optional[str]) -> Optional[str]:
-    """A fresh access token for a profile session that met a 401, saved to the
-    profile; ``None`` when it cannot renew. Only a token read from a profile renews.
-    The refresh credential rotates on use, so another cairn process may have renewed
-    the profile first: a newer, unexpired token there is adopted as it is."""
-    name = _TOKEN_PROFILE.get(token or "")
-    if not name:
-        return None
-    cfg = _load_config()
-    prof = (cfg.get("profiles") or {}).get(name) or {}
-    new = prof.get("token")
-    exp = _token_exp(new) if new else None
-    if not new or new == token or (exp is not None and exp <= time.time() + 30):
-        raw = prof.get("refresh_token")
-        if not raw:
-            return None
-        try:
-            with _api(endpoint, None) as c:
-                new = c.refresh(raw)
-                prof["refresh_token"] = c.refresh_token or raw
-        except Exception:  # noqa: BLE001 — a refused or unreachable refresh is "cannot renew"
-            return None
-        prof["token"] = new
-        cfg.setdefault("profiles", {})[name] = prof
-        _save_config(cfg)
-    _TOKEN_PROFILE[new] = name
-    return new
-
-
 def _session_ended(token: Optional[str], *, then: str = ""):
-    """The one line a session that cannot renew ends on, and its exit code. With no
+    """The one line a session the server refused ends on, and its exit code. With no
     token at all there is no session: the plain 401 message, exit 1, as before."""
     if not token:
         _fail("401 Unauthorized — run `cairn remote login` (or set CAIRN_REMOTE_TOKEN).")
@@ -188,10 +152,6 @@ def _session_ended(token: Optional[str], *, then: str = ""):
         line = "session refused by the server (401)"
     typer.secho(f"{line} — run `cairn remote login`{then}", fg="red", err=True)
     raise typer.Exit(EXIT_SESSION_EXPIRED)
-
-
-def _renew_or_end(endpoint: str, token: Optional[str], *, then: str = "") -> str:
-    return _renew(endpoint, token) or _session_ended(token, then=then)
 
 
 # ─── http helpers ──────────────────────────────────────────────────
@@ -267,9 +227,9 @@ def store_check() -> Optional[tuple[str, Optional[str], Optional[bool]]]:
     `cairn connect` and `cairn doctor` compare before trusting a write; ``None`` for an
     in-memory store. The endpoint is ``None`` when no engine answers; *same* is
     ``None`` when there is nothing to compare with."""
-    from cairn.core.settings import store_identity  # noqa: PLC0415 — keep `cairn remote` light
+    from cairn.core.settings import connection_store_identity  # noqa: PLC0415 — keep `cairn remote` light
 
-    mine = store_identity(getenv("CAIRN_CONNECTIONS_DB", "").strip() or None)
+    mine = connection_store_identity()
     if mine is None:
         return None
     engine = engine_store_fingerprint()
@@ -330,23 +290,18 @@ def _session(endpoint: Optional[str], token: Optional[str], profile: Optional[st
 
 def _call(fn, *args, **kwargs):
     """Run one client call, translating API errors to the CLI's exit style. A 401
-    renews the session of the client ``fn`` belongs to and retries once (#230)."""
+    ends the session loudly with exit 77 (#230)."""
     import httpx  # noqa: PLC0415 — lazy with the client
     from cairn_client import CairnAPIError  # noqa: PLC0415
 
-    client = getattr(fn, "__self__", None)
-    for attempt in (1, 2):
-        try:
-            return fn(*args, **kwargs)
-        except CairnAPIError as e:
-            if e.status_code != 401:
-                _fail(f"{e.status_code}: {e.detail[:300]}")
-            token = getattr(client, "token", None)
-            if attempt == 2 or client is None:
-                _session_ended(token)
-            client.token = _renew_or_end(client.base_url, token)
-        except httpx.HTTPError as e:
-            _fail(f"transport error talking to the engine: {type(e).__name__}: {e}")
+    try:
+        return fn(*args, **kwargs)
+    except CairnAPIError as e:
+        if e.status_code == 401:
+            _session_ended(getattr(getattr(fn, "__self__", None), "token", None))
+        _fail(f"{e.status_code}: {e.detail[:300]}")
+    except httpx.HTTPError as e:
+        _fail(f"transport error talking to the engine: {type(e).__name__}: {e}")
 
 
 def _poll_pipeline(c, pipeline_id: str) -> dict:
@@ -358,7 +313,6 @@ def _poll_pipeline(c, pipeline_id: str) -> dict:
     import httpx  # noqa: PLC0415 — lazy with the client
     from cairn_client import CairnAPIError  # noqa: PLC0415
 
-    renewed = False
     for _ in range(5):
         try:
             return c.pipeline(pipeline_id)
@@ -367,14 +321,11 @@ def _poll_pipeline(c, pipeline_id: str) -> dict:
         except CairnAPIError as e:
             if e.status_code == 401:
                 # #1234, #230 — the token outlived by a long pipeline (default TTL
-                # ~60 min) renews and the watch goes on. When it cannot, say so in
-                # one line with how to re-attach: the pipeline keeps running.
-                then = (f", then re-attach: `cairn remote pipeline {pipeline_id}` "
-                        "(it is still running server-side)")
-                if renewed:
-                    _session_ended(c.token, then=then)
-                c.token, renewed = _renew_or_end(c.base_url, c.token, then=then), True
-                continue
+                # ~60 min). Say so in one line with how to re-attach, and exit 77:
+                # the pipeline keeps running server-side.
+                _session_ended(c.token, then=(
+                    f", then re-attach: `cairn remote pipeline {pipeline_id}` "
+                    "(it is still running server-side)"))
             _fail(f"{e.status_code}: {e.detail[:300]}")
     _fail("engine stopped responding (5 consecutive poll timeouts).")
 
@@ -408,22 +359,18 @@ def _tail(endpoint: str, token: Optional[str], run_id: str, *, after_seq: int = 
     """Follow a run's SSE event stream, resuming with ``after_seq`` if the
     connection drops before the run reaches a terminal state."""
     import httpx
-    last, renewed = after_seq, False
+    last = after_seq
     while True:
         ev_type = data = seq = None
         saw_terminal = False
         try:
             with _sse_client(endpoint, token, timeout=None) as c:
                 with c.stream("GET", f"/runs/{run_id}/stream", params={"after_seq": last}) as r:
-                    if r.status_code == 401:  # #230 — renew once and reconnect, or end loudly
-                        if renewed:
-                            _session_ended(token)
-                        token, renewed = _renew_or_end(endpoint, token), True
-                        continue
+                    if r.status_code == 401:  # #230 — end loudly, exit 77
+                        _session_ended(token)
                     if r.status_code == 404:
                         _fail(f"run {run_id} not found")
                     r.raise_for_status()
-                    renewed = False
                     for line in r.iter_lines():
                         if line == "":
                             if ev_type is not None:
@@ -452,11 +399,10 @@ def _tail(endpoint: str, token: Optional[str], run_id: str, *, after_seq: int = 
             return
         # Stream closed without a terminal frame: check status; stop if the run
         # actually finished, otherwise reconnect from the last seq we saw. Through
-        # `_call` (#230): a 401 here renews, and anything else is said, never a
+        # `_call` (#230): a 401 here exits 77 and anything else is said, never a
         # silent exit 0 that looks like a quiet run.
         with _api(endpoint, token) as c:
             st = (_call(c.run, run_id) or {}).get("status")
-            token = c.token
         if st in _TERMINAL:
             return
 
@@ -481,42 +427,14 @@ def login(
     password = password or typer.prompt("Password", hide_input=True)
     with _api(ep, None) as c:
         token = _call(c.login, username, password)
-        refresh = c.refresh_token  # #230 — the renewable sign-in's credential, when issued
     cfg = _load_config()
     prof_name = profile or cfg.get("default_profile") or "default"
-    prof = cfg.setdefault("profiles", {}).setdefault(prof_name, {})
-    prof["endpoint"] = ep
-    prof["token"] = token
-    prof["refresh_token"] = refresh  # None (auth off, or an older server) drops a stale one
+    cfg.setdefault("profiles", {}).setdefault(prof_name, {})
+    cfg["profiles"][prof_name]["endpoint"] = ep
+    cfg["profiles"][prof_name]["token"] = token
     cfg.setdefault("default_profile", prof_name)
     _save_config(cfg)
-    typer.secho(f"logged in to {ep} (profile '{prof_name}'); token saved to {_config_path()}"
-                + (" — the session renews itself" if refresh else ""), fg="green")
-
-
-@app.command()
-def whoami(
-    endpoint: Optional[str] = _EP,
-    token: Optional[str] = _TOK,
-    profile: Optional[str] = _PROF,
-):
-    """Show the session this CLI uses: who, until when, and whether it renews (#230).
-
-    Reads the stored token; asks the server nothing."""
-    ep, tok = _resolve(endpoint, token, profile)
-    typer.echo(f"endpoint: {ep}")
-    if not tok:
-        typer.echo("session: none (an engine with auth off needs none; else `cairn remote login`)")
-        return
-    claims = _token_claims(tok)
-    typer.echo(f"subject: {claims.get('sub', '?')}")
-    exp = _token_exp(tok)
-    if exp is not None:
-        typer.echo(f"expires: {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp))}"
-                   + ("  (expired)" if exp <= time.time() else ""))
-    name = _TOKEN_PROFILE.get(tok)
-    renews = bool(name and ((_load_config().get("profiles") or {}).get(name) or {}).get("refresh_token"))
-    typer.echo(f"renewable: {'yes' if renews else 'no'}")
+    typer.secho(f"logged in to {ep} (profile '{prof_name}'); token saved to {_config_path()}", fg="green")
 
 
 @app.command()
@@ -597,11 +515,8 @@ def watch(
     ep, tok = _resolve(endpoint, token, profile)
 
     def _frame():
-        nonlocal tok
         with _api(ep, tok) as c:
-            rows = _call(c.runs, status=status, limit=limit)
-            tok = c.token  # #230 — a renewed session carries into the next frame
-        return _runs_table(rows)
+            return _runs_table(_call(c.runs, status=status, limit=limit))
 
     console = Console()
     if once:
@@ -809,22 +724,18 @@ def _watch_hitl(endpoint, token, run_id: str, *, approver, decision_opt,
     resume — until terminal. Reconnects by ``after_seq`` like :func:`_tail`."""
     import httpx  # noqa: PLC0415 — lazy like _tail (heavy http client)
 
-    last, renewed = 0, False
+    last = 0
     while True:
         ev_type = data = seq = None
         paused = saw_terminal = False
         try:
             with _sse_client(endpoint, token, timeout=None) as c:
                 with c.stream("GET", f"/runs/{run_id}/stream", params={"after_seq": last}) as r:
-                    if r.status_code == 401:  # #230 — renew once and reconnect, or end loudly
-                        if renewed:
-                            _session_ended(token)
-                        token, renewed = _renew_or_end(endpoint, token), True
-                        continue
+                    if r.status_code == 401:  # #230 — end loudly, exit 77
+                        _session_ended(token)
                     if r.status_code == 404:
                         _fail(f"run {run_id} not found")
                     r.raise_for_status()
-                    renewed = False
                     for line in r.iter_lines():
                         if line == "":
                             if ev_type is not None:
@@ -858,7 +769,6 @@ def _watch_hitl(endpoint, token, run_id: str, *, approver, decision_opt,
         if not paused:
             with _api(endpoint, token) as c:  # #230 — as in `_tail`: never a silent 0
                 st = (_call(c.run, run_id) or {}).get("status")
-                token = c.token
             if st in _TERMINAL:
                 return 0
             if st != "awaiting_approval":
@@ -882,7 +792,6 @@ def _watch_hitl(endpoint, token, run_id: str, *, approver, decision_opt,
             return 1
         with _api(endpoint, token) as c:
             out = _call(c.resume_run, run_id, decision=decision, approver=approver)
-            token = c.token
         still = (out or {}).get("still_paused")
         typer.secho(f"{decision}d — {'advanced to the next gate' if still else 'resuming'}",
                     fg="green")
@@ -1368,22 +1277,16 @@ def findings(
                 doors.reverse()
             out, kind, last = None, "", None
             for door_kind, door in doors:
-                for attempt in (1, 2):
-                    try:
-                        out, kind = door(target_id), door_kind
-                        break
-                    except CairnAPIError as e:
-                        if e.status_code == 401:  # #230 — renew once, or end loudly
-                            if attempt == 2:
-                                _session_ended(c.token)
-                            c.token = _renew_or_end(c.base_url, c.token)
-                            continue
-                        if e.status_code != 404:
-                            _fail(f"{e.status_code}: {e.detail[:300]}")
-                        last = e
-                        break
-                if out is not None:
+                try:
+                    out = door(target_id)
+                    kind = door_kind
                     break
+                except CairnAPIError as e:
+                    if e.status_code == 401:  # #230 — end loudly, exit 77
+                        _session_ended(c.token)
+                    if e.status_code != 404:
+                        _fail(f"{e.status_code}: {e.detail[:300]}")
+                    last = e
             if out is None:
                 _fail(f"no run or pipeline {target_id!r} "
                       f"({last.status_code if last else 404})")

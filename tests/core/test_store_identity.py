@@ -19,8 +19,9 @@ from cairn.core import settings  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _no_sqlite_override(monkeypatch):
-    monkeypatch.delenv("CAIRN_SQLITE_DB", raising=False)
-    monkeypatch.delenv("OBS_SQLITE_DB", raising=False)
+    for name in ("SQLITE_DB", "CONNECTIONS_DB"):
+        monkeypatch.delenv(f"CAIRN_{name}", raising=False)
+        monkeypatch.delenv(f"OBS_{name}", raising=False)
 
 
 def _ident(monkeypatch, storage: str, **env: str):
@@ -76,12 +77,11 @@ def test_postgres_and_sqlite_never_share_a_fingerprint(tmp_path, monkeypatch):
     assert pg != lite
 
 
-def test_healthz_advertises_the_store_fingerprint(tmp_path, monkeypatch):
+def _healthz(tmp_path, monkeypatch) -> dict:
     from fastapi.testclient import TestClient
 
     from cairn.core.triggers.server import build_app
 
-    monkeypatch.setenv("CAIRN_STORAGE", f"sqlite:///{tmp_path}/engine.db")
     monkeypatch.setenv("CAIRN_RUN_DB", str(tmp_path / "r.db"))
 
     class FakeRunner:
@@ -91,6 +91,31 @@ def test_healthz_advertises_the_store_fingerprint(tmp_path, monkeypatch):
         async def run(self, *a, **k):
             return {}
 
-    body = TestClient(build_app(FakeRunner(), enable_scheduler=False)).get("/healthz").json()
+    return TestClient(build_app(FakeRunner(), enable_scheduler=False)).get("/healthz").json()
+
+
+def test_healthz_advertises_the_store_fingerprint(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAIRN_STORAGE", f"sqlite:///{tmp_path}/engine.db")
+    body = _healthz(tmp_path, monkeypatch)
     assert body["store_fingerprint"] == settings.store_identity()[1]
     assert str(tmp_path) not in str(body)  # a fingerprint, never the path
+
+
+def test_healthz_names_the_connections_db_the_engine_reads(tmp_path, monkeypatch):
+    """An engine started with `CAIRN_CONNECTIONS_DB` reads connections from that file,
+    not the shared one: `/healthz` names it, as the CLI's check does with the same env,
+    so the two sides compare the same store (#229 review, B3)."""
+    monkeypatch.setenv("CAIRN_STORAGE", f"sqlite:///{tmp_path}/engine.db")
+    monkeypatch.setenv("CAIRN_CONNECTIONS_DB", str(tmp_path / "conns.db"))
+    body = _healthz(tmp_path, monkeypatch)
+    assert body["store_fingerprint"] == settings.connection_store_identity()[1]
+    assert body["store_fingerprint"] == settings.store_identity(str(tmp_path / "conns.db"))[1]
+    assert body["store_fingerprint"] != settings.store_identity()[1]
+
+
+def test_postgres_storage_wins_over_connections_db(monkeypatch):
+    """As `default_connection_store` chooses: a Postgres `CAIRN_STORAGE` is the
+    connection store whatever `CAIRN_CONNECTIONS_DB` says."""
+    monkeypatch.setenv("CAIRN_STORAGE", "postgresql://u:pw@db:5432/cairn")
+    monkeypatch.setenv("CAIRN_CONNECTIONS_DB", "/tmp/ignored.db")
+    assert settings.connection_store_identity() == settings.store_identity()

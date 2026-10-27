@@ -1034,11 +1034,12 @@ def build_app(
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
-        # #229 — a fingerprint of the store this engine reads (never its path or DSN),
-        # so a CLI about to write a connection can tell it is writing another one.
-        from cairn.core.settings import store_identity  # noqa: PLC0415 — healthz only
+        # #229 — a fingerprint of the connection store this engine reads (never its
+        # path or DSN), so a CLI about to write a connection can tell it is writing
+        # another one.
+        from cairn.core.settings import connection_store_identity  # noqa: PLC0415 — healthz only
 
-        ident = store_identity()
+        ident = connection_store_identity()
         return {
             "ok": True,
             "store_fingerprint": ident[1] if ident else None,

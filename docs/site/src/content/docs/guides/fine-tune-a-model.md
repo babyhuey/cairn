@@ -313,6 +313,7 @@ and recorded like training, is in progress.
   audit sink yet
   ([cairn-extensions#38](https://github.com/cairndev-sh/cairn-extensions/issues/38)).
   Approvals and run events are still recorded in the run store.
-- **Token expiry:** the CLI renews its login on its own when the server issued
-  a renewable sign-in (`cairn remote whoami` says whether it did). When it cannot,
-  a command prints `session expired at HH:MM — run cairn remote login` and exits 77.
+- **Token expiry:** the CLI's login expires and is not renewed. A command that
+  meets an expired login, a watch included, prints `session expired at HH:MM — run
+  cairn remote login` and exits 77; the pipeline keeps running on the server. Log in
+  again and re-attach with `cairn remote pipeline <id>`.

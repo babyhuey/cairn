@@ -14,7 +14,6 @@ Design (ADR-0085 D7):
 from __future__ import annotations
 
 from typing import Any, Optional
-from urllib.parse import urlsplit
 
 import httpx
 
@@ -25,8 +24,6 @@ __all__ = ["CairnClient", "AsyncCairnClient", "CairnAPIError", "AskUnavailableEr
 _SURFACE: dict[str, tuple[str, str]] = {
     "healthz": ("get", "/healthz"),
     "login": ("post", "/token"),
-    # #230 — renew a sign-in with the refresh credential `/token` issued (ADR-0142)
-    "refresh": ("post", "/auth/refresh"),
     "runs": ("get", "/runs"),
     "run": ("get", "/runs/{run_id}"),
     "resume_run": ("post", "/runs/{run_id}/resume"),
@@ -123,29 +120,6 @@ def _capture_export_body(kinds, since, holdout_fraction) -> dict:
     return body
 
 
-#: ADR-0142 — the cookie ``POST /token`` sets for a renewable sign-in. ``POST
-#: /auth/refresh`` trades it for a new access token (and a new cookie: it rotates).
-_REFRESH_COOKIE = "cairn_refresh"
-
-
-def _refresh_cookie(cookies: httpx.Cookies) -> Optional[str]:
-    """The refresh credential the last response set, if any (the last one wins)."""
-    value = None
-    for c in cookies.jar:
-        if c.name == _REFRESH_COOKIE:
-            value = c.value
-    return value
-
-
-def _refresh_headers(base_url: str, raw: str) -> dict:
-    """What ``POST /auth/refresh`` asks of its caller: the credential as the cookie it
-    was issued as, plus the server's CSRF guard (the ``X-Cairn-Refresh`` header and an
-    ``Origin`` naming the server itself)."""
-    parts = urlsplit(base_url)
-    return {"X-Cairn-Refresh": "1", "Origin": f"{parts.scheme}://{parts.netloc}",
-            "Cookie": f"{_REFRESH_COOKIE}={raw}"}
-
-
 class CairnAPIError(RuntimeError):
     """A non-2xx response, carrying the status and the server's detail."""
 
@@ -190,9 +164,6 @@ class CairnClient:
         same door."""
         self.base_url = base_url.rstrip("/")
         self.token = token
-        #: the refresh credential of the last :meth:`login` / :meth:`refresh`, when
-        #: the server issued one (a deployment with auth on, ADR-0142)
-        self.refresh_token: Optional[str] = None
         self._http = httpx.Client(
             base_url=self.base_url, timeout=timeout, transport=transport
         )
@@ -226,22 +197,9 @@ class CairnClient:
 
     # ── auth ─────────────────────────────────────────────────────────────
     def login(self, username: str, password: str) -> str:
-        """POST /token (form-encoded, the FastAPI OAuth2 shape) and hold the JWT, and
-        the refresh credential in :attr:`refresh_token` when the server issues one."""
+        """POST /token (form-encoded, the FastAPI OAuth2 shape) and hold the JWT."""
         out = self.request("post", "/token", data={"username": username, "password": password})
         self.token = out["access_token"]
-        self.refresh_token = _refresh_cookie(self._http.cookies)
-        return self.token
-
-    def refresh(self, refresh_token: Optional[str] = None) -> str:
-        """POST /auth/refresh — trade a refresh credential (default: the held one) for
-        a new access token, as the console does. The server rotates the credential:
-        the new one replaces :attr:`refresh_token`. A refused one raises a 401."""
-        raw = refresh_token or self.refresh_token or ""
-        self._http.cookies.clear()
-        out = self.request("post", "/auth/refresh", headers=_refresh_headers(self.base_url, raw))
-        self.token = out["access_token"]
-        self.refresh_token = _refresh_cookie(self._http.cookies)
         return self.token
 
     # ── health ───────────────────────────────────────────────────────────
@@ -497,7 +455,6 @@ class AsyncCairnClient:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
-        self.refresh_token: Optional[str] = None
         self._http = httpx.AsyncClient(
             base_url=self.base_url, timeout=timeout, transport=transport
         )
@@ -531,15 +488,6 @@ class AsyncCairnClient:
     async def login(self, username: str, password: str) -> str:
         out = await self.request("post", "/token", data={"username": username, "password": password})
         self.token = out["access_token"]
-        self.refresh_token = _refresh_cookie(self._http.cookies)
-        return self.token
-
-    async def refresh(self, refresh_token: Optional[str] = None) -> str:
-        raw = refresh_token or self.refresh_token or ""
-        self._http.cookies.clear()
-        out = await self.request("post", "/auth/refresh", headers=_refresh_headers(self.base_url, raw))
-        self.token = out["access_token"]
-        self.refresh_token = _refresh_cookie(self._http.cookies)
         return self.token
 
     # ── health ───────────────────────────────────────────────────────────

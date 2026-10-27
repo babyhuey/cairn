@@ -93,7 +93,7 @@ governed pipeline.
 | `cairn connect rm <name>` | Deletes a connection, leaving the secret itself untouched. |
 
 `connect add` and `connect rm` write this CLI's store: the one `CAIRN_STORAGE` names,
-else `~/.cairn/cairn.db`. Before writing, they ask the engine at the endpoint
+else the `CAIRN_CONNECTIONS_DB` file, else `~/.cairn/cairn.db`. Before writing, they ask the engine at the endpoint
 `cairn remote` uses (its `/healthz` reports a fingerprint of its store, never a path or
 DSN) whether it reads the same store. If it reads another one, nothing is written and
 the command exits 3, naming this CLI's store; set `CAIRN_STORAGE` to the value the engine
@@ -110,15 +110,14 @@ anyway. When no engine answers, the write goes ahead and the line names the stor
 ## A remote server
 
 Drive a deployed cairn from your terminal. Log in once; the token is stored in
-your profile (`~/.cairn/config.toml`, written with mode 0600). When the server issues a
-renewable sign-in, the profile also keeps its refresh credential, and a command that
-meets an expired session renews it and carries on, `--watch` included. When it cannot
-renew, it prints `session expired at HH:MM — run cairn remote login` and exits 77.
+your profile (`~/.cairn/config.toml`, written with mode 0600). The token is not renewed:
+a command that meets an expired session, `--watch` and `--follow` included, prints
+`session expired at HH:MM — run cairn remote login` and exits 77. A watched pipeline keeps
+running on the server; log in again and re-attach with `cairn remote pipeline <id>`.
 
 | Command | What it does |
 |---|---|
-| `cairn remote login -e <url>` | Signs in and stores the token (and the refresh credential, when the server issues one). |
-| `cairn remote whoami` | Who the stored session signs in as, when its access token expires, and whether it renews. Reads the token; asks the server nothing. |
+| `cairn remote login -e <url>` | Signs in and stores the token. |
 | `cairn remote pipelines` | Lists the pipelines on the server. |
 | `cairn remote launch <ref>` | Launches a pipeline. `-i key=value`, `--preset` to start from a saved input set, `--watch` to follow it. |
 | `cairn remote pipeline <id>` | One pipeline's full record: its plan and the state of every step. |

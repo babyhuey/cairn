@@ -217,6 +217,15 @@ def store_identity(sqlite_path: Optional[str] = None) -> Optional[tuple[str, str
     return label, hashlib.sha256(label.encode()).hexdigest()[:16]
 
 
+def connection_store_identity() -> Optional[tuple[str, str]]:
+    """:func:`store_identity` of the connection store, chosen as
+    ``connections.default_connection_store`` chooses it: ``CAIRN_STORAGE`` first, then
+    the ``CAIRN_CONNECTIONS_DB`` SQLite path. The engine's ``/healthz`` and the CLI's
+    store check both call this, so a ``CAIRN_CONNECTIONS_DB`` set on either side is
+    compared, not silently ignored on one of them (#229)."""
+    return store_identity(getenv("CAIRN_CONNECTIONS_DB", "").strip() or None)
+
+
 # ─── Run store ───────────────────────────────────────────────────────
 
 
