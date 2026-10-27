@@ -213,7 +213,7 @@ def store_identity(sqlite_path: Optional[str] = None) -> Optional[tuple[str, str
         path = sqlite_path or default_sqlite_db()
         if not path or path == ":memory:":
             return None
-        label = f"sqlite {os.path.realpath(os.path.expanduser(path))}"
+        label = f"sqlite {os.path.realpath(path)}"  # as sqlite3 opens it: no `~` expansion
     return label, hashlib.sha256(label.encode()).hexdigest()[:16]
 
 

@@ -159,3 +159,22 @@ def test_doctor_reports_the_mismatch(tmp_path, monkeypatch):
 
     _engine_on(monkeypatch, None)
     assert doctor.check_engine_store() is None
+
+
+def test_the_cli_compares_the_connections_db_it_writes(tmp_path, monkeypatch):
+    """`CAIRN_CONNECTIONS_DB` on the CLI side is the store it writes, so that file is
+    what it compares with the engine's fingerprint (#238 review, B3)."""
+    conns = tmp_path / "conns.db"
+    monkeypatch.setenv("CAIRN_CONNECTIONS_DB", str(conns))
+    fp = settings.store_identity(str(conns))[1]
+    monkeypatch.setattr(remote, "engine_store_fingerprint", lambda *a, **k: (ENGINE, fp))
+    res = cli.invoke(connect.app, ["add", "openai", "--name", "gpu"])
+    assert res.exit_code == 0, res.output
+    assert _saved(conns) == ["gpu"]
+
+    _engine_on(monkeypatch, None)  # an engine on the shared file, not conns.db
+    monkeypatch.setattr(remote, "engine_store_fingerprint",
+                        lambda *a, **k: (ENGINE, settings.store_identity()[1]))
+    res = cli.invoke(connect.app, ["add", "openai", "--name", "other"])
+    assert res.exit_code == 3, res.output
+    assert _saved(conns) == ["gpu"]

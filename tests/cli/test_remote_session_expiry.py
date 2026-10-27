@@ -178,3 +178,101 @@ def test_launch_watch_ends_loudly_mid_poll_with_how_to_reattach(tmp_path, monkey
     with pytest.raises(typer.Exit) as exc:
         remote._poll_pipeline(_Client(), "pl_1")
     assert exc.value.exit_code == 77
+
+
+class _Stream:
+    """One SSE response: a status code and no frames (the stream closes at once)."""
+
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+    def raise_for_status(self):
+        return None
+
+    def iter_lines(self):
+        return iter(())
+
+
+class _Sse:
+    def __init__(self, status_code):
+        self._code = status_code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+    def stream(self, *a, **k):
+        return _Stream(self._code)
+
+
+class _RunClient:
+    """`GET /runs/{id}` answering from a script: an exception to raise, or a status."""
+
+    def __init__(self, script):
+        self._script = script
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+    def run(self, run_id):
+        step = self._script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return {"status": step}
+
+
+def _offline(monkeypatch, sse_code, script):
+    monkeypatch.setenv("CAIRN_JWT_SECRET", SECRET)
+    monkeypatch.setattr(remote, "_sse_client", lambda ep, tok, timeout=None: _Sse(sse_code))
+    monkeypatch.setattr(remote, "_api", lambda ep, tok, timeout=30.0: _RunClient(script))
+
+
+def test_approve_watch_ends_loudly_when_the_stream_is_refused(monkeypatch):
+    import typer
+
+    _offline(monkeypatch, 401, [])
+    with pytest.raises(typer.Exit) as exc:
+        remote._watch_hitl("http://e", _expired_token(), "run_x", approver=None,
+                           decision_opt=None, native=False, timeout=None,
+                           on_timeout=None, flow=None, dump=None)
+    assert exc.value.exit_code == 77
+
+
+@pytest.mark.parametrize("follow", ["tail", "watch_hitl"])
+def test_a_refused_status_check_at_the_end_of_a_stream_exits_77_not_0(monkeypatch, follow):
+    """The stream closes without a terminal frame and the status check meets a 401:
+    exit 77, never the silent exit 0 that looks like a quiet run."""
+    import typer
+    from cairn_client import CairnAPIError
+
+    _offline(monkeypatch, 200, [CairnAPIError(401, "expired", "get", "/runs/run_x")])
+    with pytest.raises(typer.Exit) as exc:
+        if follow == "tail":
+            remote._tail("http://e", _expired_token(), "run_x")
+        else:
+            remote._watch_hitl("http://e", _expired_token(), "run_x", approver=None,
+                               decision_opt=None, native=False, timeout=None,
+                               on_timeout=None, flow=None, dump=None)
+    assert exc.value.exit_code == 77
+
+
+def test_a_transport_error_at_the_end_of_a_stream_reconnects(monkeypatch):
+    """An engine restarting between frames is not an ending: reconnect, then stop
+    when the run is terminal."""
+    import httpx
+
+    script = [httpx.ConnectError("engine restarting"), "done"]
+    _offline(monkeypatch, 200, script)
+    remote._tail("http://e", "tok", "run_x")
+    assert script == []

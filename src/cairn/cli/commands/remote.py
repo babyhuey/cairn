@@ -127,7 +127,7 @@ def _resolve(
 
 def _token_claims(token: str) -> dict:
     """The JWT's claims, read without verifying it (the server verifies; the CLI only
-    wants ``sub`` and ``exp`` to say who and until when). ``{}`` when unreadable."""
+    wants ``exp`` to say when the session ended). ``{}`` when unreadable."""
     try:
         seg = token.split(".")[1]
         return json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
@@ -304,6 +304,24 @@ def _call(fn, *args, **kwargs):
         _fail(f"transport error talking to the engine: {type(e).__name__}: {e}")
 
 
+def _run_status(endpoint: str, token: Optional[str], run_id: str) -> Optional[str]:
+    """A run's status for a stream that closed without a terminal frame (#230). A 401
+    exits 77 and any other API error is said, never a silent exit 0 that looks like a
+    quiet run; a transport error (an engine restarting) is ``None``: reconnect."""
+    import httpx  # noqa: PLC0415 — lazy with the client
+    from cairn_client import CairnAPIError  # noqa: PLC0415
+
+    try:
+        with _api(endpoint, token) as c:
+            return (c.run(run_id) or {}).get("status")
+    except CairnAPIError as e:
+        if e.status_code == 401:
+            _session_ended(token)
+        _fail(f"{e.status_code}: {e.detail[:300]}")
+    except httpx.HTTPError:
+        return None
+
+
 def _poll_pipeline(c, pipeline_id: str) -> dict:
     """One watch poll. The inprocess engine can stall its event loop for
     longer than the client timeout while a leg does CPU-heavy work (found
@@ -398,12 +416,8 @@ def _tail(endpoint: str, token: Optional[str], run_id: str, *, after_seq: int = 
         if saw_terminal:
             return
         # Stream closed without a terminal frame: check status; stop if the run
-        # actually finished, otherwise reconnect from the last seq we saw. Through
-        # `_call` (#230): a 401 here exits 77 and anything else is said, never a
-        # silent exit 0 that looks like a quiet run.
-        with _api(endpoint, token) as c:
-            st = (_call(c.run, run_id) or {}).get("status")
-        if st in _TERMINAL:
+        # actually finished, otherwise reconnect from the last seq we saw.
+        if _run_status(endpoint, token, run_id) in _TERMINAL:
             return
 
 
@@ -767,8 +781,7 @@ def _watch_hitl(endpoint, token, run_id: str, *, approver, decision_opt,
         if saw_terminal:
             return 0
         if not paused:
-            with _api(endpoint, token) as c:  # #230 — as in `_tail`: never a silent 0
-                st = (_call(c.run, run_id) or {}).get("status")
+            st = _run_status(endpoint, token, run_id)  # #230 — as in `_tail`
             if st in _TERMINAL:
                 return 0
             if st != "awaiting_approval":
