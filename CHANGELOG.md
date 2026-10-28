@@ -13,6 +13,9 @@ All notable changes to this project are documented here. The format follows [Kee
 - `cairn connect add` and `cairn connect rm` check, before writing, that the engine at the endpoint `cairn remote` uses reads the store this CLI writes. On a mismatch nothing is written and the command exits 3, naming this CLI's store without credentials; `--force` writes anyway (on `add`, `--force` already meant overwrite). `cairn doctor` reports the same comparison as `engine_store`. When no engine answers, the write goes ahead and names the store. (#229)
 - `~/.cairn/config.toml` is created with mode 0600 and replaced whole, instead of written and then restricted. (#230)
 
+### Fixed
+- Failed and retried flow-leg attempts now retain known partial spend in run cost accounting and subsequent budget reservations.
+
 ## [0.3.1] - 2026-10-26
 
 A patch release: GPU time on a priced `compute.ssh` box is counted in the budget, and a public pipeline can start and stop its box. Everything is additive or internal; nothing that worked on 0.3.0 changes unless a pipeline runs on a `compute.ssh` connection that sets `hourly_usd`.
@@ -170,6 +173,8 @@ A minor release: it changes behaviour that operators, operator packs and library
 ### Changed
 - The installer (`https://docs.cairndev.sh/install.sh`) installs from PyPI by default; every package is published there from 0.1.3. `CAIRN_RELEASE=<version>` still takes cairn's wheels from that GitHub Release, which is the way to install a version before 0.1.3.
 - The CI gate examples (`examples/ci/`) install `cairndev`; they named the bare `cairn` distribution, which on PyPI is an unrelated project.
+
+### Fixed
 
 ## [0.1.3]
 
