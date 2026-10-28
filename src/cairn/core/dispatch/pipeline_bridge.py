@@ -71,6 +71,10 @@ from cairn.core.gate_notify import (
     release_commands,
 )
 from cairn.core.notifier import NotifyEvent
+# #222 — one pipeline, one trace: the root span's W3C context is stored on the record.
+from cairn.core.obs.telemetry import (
+    current_trace_id, span, trace_carrier, tracing_active, use_parent,
+)
 # ADR-0125 — the owner lock (D2) and the owner verdict (D3). Core → core; neither
 # imports dispatch, so this is not a cycle.
 from cairn.core import liveness
@@ -80,6 +84,7 @@ from cairn.core.storage.pipeline_store import (
     PipelineRecord,
     StepState,
     default_pipeline_store,
+    new_pipeline_id,
 )
 from cairn.core.storage.protocols import ACTIVE_STATUSES, PIPELINE_ID_KEY, SCAN_COUNT_LIMIT
 # The gate signal both leg kinds raise (#1759/#1760). Top-level: `approval`
@@ -355,6 +360,97 @@ def _in_record_workspace(method):
             return await method(self, rec, *args, **kwargs)
 
     return wrapper
+
+
+def _launch_root(plan: Any, *, bundle_ref: str, workspace_id: str,
+                 environment: Optional[str]) -> tuple[str, dict[str, str]]:
+    """#222 — the pipeline's id and the W3C context of its root span.
+
+    The root is a SHORT ``cairn.pipeline`` span opened and closed at launch: a gate
+    wait can outlive the request, the process and the server, so no span stays open
+    for it. Its context is what the record stores; every later span (legs, gates,
+    flow stages, the terminal ``cairn.pipeline.settle``) starts as its child.
+    ``{}`` when tracing is off."""
+    pid = new_pipeline_id()
+    with span("cairn.pipeline", {
+        "pipeline": getattr(plan, "name", ""), "pipeline_ref": bundle_ref,
+        "content_hash": getattr(plan, "content_hash", ""), "run_id": pid,
+        "workspace_id": workspace_id, "environment": environment,
+        "legs": len(getattr(plan, "steps", None) or []),
+    }):
+        return pid, trace_carrier()
+
+
+def _in_pipeline_trace(method):
+    """Run a bridge method whose first argument is the pipeline record with the
+    record's stored trace context as the ambient parent, so the legs it starts (and
+    the tasks they spawn, the dispatcher's ``cairn.run`` among them) join the
+    pipeline's trace even when this is a later request or another process."""
+
+    @functools.wraps(method)
+    async def wrapper(self: Any, rec: Any, *args: Any, **kwargs: Any) -> Any:
+        with use_parent(getattr(rec, "trace_context", None)):
+            return await method(self, rec, *args, **kwargs)
+
+    return wrapper
+
+
+def _flow_leg_traced(method):
+    """``cairn.flow_leg`` around ``_run_flow_leg``: a child of the pipeline root, the
+    parent of the leg's ``cairn.flow_stage`` spans. Zero work when tracing is off."""
+
+    @functools.wraps(method)
+    async def wrapper(self: Any, rec: Any, s: Any, run: Any, *args: Any, **kwargs: Any) -> Any:
+        if not tracing_active():
+            return await method(self, rec, s, run, *args, **kwargs)
+        try:
+            engine = getattr(self._leg_engine(s), "name", "") or ""
+        except Exception:  # noqa: BLE001 — a label, never a reason to fail the leg
+            engine = ""
+        budget = ((getattr(rec, "governance", None) or {}).get("budget") or {}).get("usd")
+        with span("cairn.flow_leg", {
+            "flow": s.ref, "step": s.id, "leg_run_id": getattr(run, "id", ""),
+            "run_id": rec.pipeline_id, "engine": engine, "budget_usd": budget,
+            "adopted": bool(kwargs.get("adopt")),
+        }, parent=getattr(rec, "trace_context", None)) as sp:
+            try:
+                return await method(self, rec, s, run, *args, **kwargs)
+            finally:
+                try:
+                    done = await self.dispatcher.store.get(run.id)
+                    if sp is not None and done is not None:
+                        sp.set_attribute("outcome", str(done.status))
+                except Exception:  # noqa: BLE001
+                    logger.debug("flow-leg span outcome unreadable", exc_info=True)
+
+    return wrapper
+
+
+def _settle_span(rec: Any) -> None:
+    """``cairn.pipeline.settle`` (#222): the closing child of the root, emitted once, at
+    the transition to a terminal status (done / failed / cancelled)."""
+    if tracing_active():
+        with span("cairn.pipeline.settle", {"run_id": rec.pipeline_id, "status": rec.status},
+                  parent=getattr(rec, "trace_context", None)):
+            pass
+
+
+def _gate_span(rec: Any, step_id: str, decision: str, actor: str = "") -> None:
+    """``cairn.gate`` for one gate decision (#222): started when the pause began
+    (``awaiting_since``) and ended now, at the decision, so its duration is the wait
+    — emitted by whichever request or process decides, as a child of the stored
+    root. A data gate (a predicate) has no wait: it is an instant span."""
+    if not tracing_active():
+        return
+    st = (getattr(rec, "step_state", None) or {}).get(step_id)
+    waiting = getattr(st, "awaiting_since", None)
+    status = str(getattr(st, "status", "") or "")
+    kind = status.removeprefix("awaiting_") if status.startswith("awaiting_") else "data"
+    with span("cairn.gate", {
+        "step": step_id, "kind": kind, "decision": decision, "actor": actor or None,
+        "run_id": rec.pipeline_id,
+    }, parent=getattr(rec, "trace_context", None), start_time=waiting):
+        pass
 
 
 _NO_WORKSPACE_REASON = "record names no workspace"
@@ -1089,11 +1185,11 @@ class PipelineBridge:
         from temporalio.client import Client  # noqa: PLC0415 — optional dep (temporal extra)
 
         from cairn.core import settings  # noqa: PLC0415
-        from cairn.core.storage.pipeline_store import new_pipeline_id  # noqa: PLC0415
 
-        pid = new_pipeline_id()
+        pid, trace_context = _launch_root(
+            plan, bundle_ref=bundle_ref, workspace_id=workspace_id, environment=environment)
         rec = PipelineRecord(
-            pipeline_id=pid, bundle_ref=bundle_ref, pipeline_name=getattr(plan, "name", ""),
+            pipeline_id=pid, trace_context=trace_context, bundle_ref=bundle_ref, pipeline_name=getattr(plan, "name", ""),
             status="queued", plan=plan, inputs=dict(inputs or {}), environment=environment,
             workspace_id=workspace_id, trigger={**(trigger or {}), "owner": "temporal"},
             governance=dict(getattr(plan, "governance", None) or {}),  # #1688
@@ -1144,7 +1240,10 @@ class PipelineBridge:
                 environment=environment, workspace_id=workspace_id,
                 trigger=trigger, admission=admission,
             )
+        pid, trace_context = _launch_root(
+            plan, bundle_ref=bundle_ref, workspace_id=workspace_id, environment=environment)
         rec = PipelineRecord(
+            pipeline_id=pid, trace_context=trace_context,
             bundle_ref=bundle_ref, pipeline_name=getattr(plan, "name", ""),
             status="running", plan=plan, inputs=dict(inputs or {}),
             environment=environment, workspace_id=workspace_id, trigger=trigger or {},
@@ -1465,6 +1564,7 @@ class PipelineBridge:
             # persisted output. Fail → the step never submits; the pipeline
             # terminates with a cited reason (ADR-0069 acceptance).
             if s.gate and not eval_gate_predicate(s.gate, bundle_input=rec.inputs, steps=outputs):
+                _gate_span(rec, s.id, "blocked")  # #222
                 st.status = "skipped"
                 st.verdict = "gate_blocked"
                 rec.step_state[s.id] = st
@@ -1552,6 +1652,7 @@ class PipelineBridge:
             logger.exception("leg %s (%s): failed to terminalize", s.ref, run.id)
 
     @_in_record_workspace
+    @_in_pipeline_trace
     async def _submit_step(self, rec: PipelineRecord, s: Any, outputs: dict, *,
                            after_restart: bool = False) -> Optional[bool]:
         """Resolve a ready step's inputs from persisted output + submit it as its OWN
@@ -1591,6 +1692,8 @@ class PipelineBridge:
             rec.cursor = [c for c in rec.cursor if c != s.id]
             await self._audit(rec, s.id, "gate_passed",
                               {"predicate": s.gate} if data_gate else {})
+            if data_gate:
+                _gate_span(rec, s.id, "data")  # #222 — a human gate's span is the decision's
             # #1627 — a loop body may END on a gate: the last word of a
             # retrain cycle is a human deciding whether to promote.
             # A gate leg has no RUN, so its completion never reaches
@@ -1697,6 +1800,7 @@ class PipelineBridge:
                 bundle_pipeline_id=rec.pipeline_id,
                 step_id=s.id,
                 workspace_id=rec.workspace_id,
+                trace_id=current_trace_id(),  # #222 — the pipeline's trace
                 owner=liveness.self_owner(),  # ADR-0125 D1 — the poll loop runs here
             )
 
@@ -1838,6 +1942,7 @@ class PipelineBridge:
         )
 
     @_in_record_workspace
+    @_flow_leg_traced
     async def _run_flow_leg(self, rec: PipelineRecord, s: Any, run: Any, resolved: dict,
                             *, adopt: Optional[dict] = None) -> None:
         """The background half of a flow leg: execute → persist outcome → emit the
@@ -1951,6 +2056,7 @@ class PipelineBridge:
             bundle_pipeline_id=rec.pipeline_id,
             step_id=s.id,
             workspace_id=rec.workspace_id,
+            trace_id=current_trace_id(),  # #222 — the pipeline's trace
             owner=liveness.self_owner(),  # ADR-0125 D1 — the op runs in this process
         )
         await self.dispatcher.store.create(run)
@@ -2098,7 +2204,6 @@ class PipelineBridge:
         from cairn.core.approval.enforce import (  # noqa: PLC0415 - cycle, as above
             ApprovalIntent, approved_state, enforce_gate,
         )
-        from cairn.core.obs.telemetry import span  # noqa: PLC0415
         from cairn.core.operator.registry import default_registry  # noqa: PLC0415
         from cairn.core.operator.runtime import (  # noqa: PLC0415 - cycle, as above
             invoke_operator_core, resolve_is_mocked,
@@ -2141,7 +2246,7 @@ class PipelineBridge:
         with span("cairn.operator", {
             "operator": op_label, "node": s.id, "executor": "in_process",
             "mocked": bool(is_mocked), "run_id": str(rec.pipeline_id),
-        }):
+        }, parent=rec.trace_context):  # #222 — under the pipeline root, in any process
             # ONE invoke path with the template operation node (#1542): config
             # layering + governance-strip + secret scoping + sharding all
             # happen inside the core, not re-implemented (and drifted) here.
@@ -2728,11 +2833,14 @@ class PipelineBridge:
         every finalizer has settled. Until then the record honestly reads
         `running`, because it is: the `finally:` block is executing."""
         finals = {s.id for s in self._finalizer_steps(rec)}
+        was_terminal = rec.status in PIPELINE_TERMINAL
         if not finals:
             statuses = [v.status for v in rec.step_state.values()]
             if all(x in ("done", "skipped") for x in statuses):
                 rec.status = "done"
                 rec.ended_at = _now()
+                if not was_terminal:
+                    _settle_span(rec)
                 self._cleanup_pipeline_triggers(rec.pipeline_id)
             elif (any(x in ("awaiting_advance", "awaiting_approval") for x in statuses)
                   and not any(x in ("running", "queued") for x in statuses)):
@@ -2757,6 +2865,8 @@ class PipelineBridge:
             return
         rec.status = rec.terminal_intent
         rec.ended_at = _now()
+        if not was_terminal:
+            _settle_span(rec)
         self._cleanup_pipeline_triggers(rec.pipeline_id)
 
     # ── human-in-the-loop: advance a manual / approval step ─────────────────
@@ -2803,6 +2913,7 @@ class PipelineBridge:
             # Temporal-owned pipeline (Phase 4): the durable workflow holds the wait —
             # deliver an `approve_step` signal; the workflow re-checks the gate + advances.
             if (rec.trigger or {}).get("owner") == "temporal":
+                _gate_span(rec, step_id, "approved" if approver else "advanced", approver or "")  # #222
                 # #2299 — record the approver BEFORE the signal: the released step's
                 # SUBMIT re-runs the flow-leg gate against the stored approval, and a
                 # signal that wins the race would re-gate it as unapproved.
@@ -2838,6 +2949,7 @@ class PipelineBridge:
                                           reviewer=approver or "",
                                           rationale=f"blocked by gate: {step.gate}")
                 return await self.store.get(pipeline_id)  # type: ignore[return-value]
+            _gate_span(rec, step_id, "approved" if approver else "advanced", approver or "")  # #222
             if approver:
                 st.approver = approver
             if fire_key is not None:
@@ -2898,6 +3010,7 @@ class PipelineBridge:
                     f"{st.status if st else 'unknown'}) — only a gate parked at "
                     f"awaiting_approval can be rejected")
             reason_line = f"step '{step_id}' rejected by {decider}: {reason}"
+            _gate_span(rec, step_id, "rejected", decider)  # #222
             st.verdict = "rejected"
             st.approver = decider
             if (rec.trigger or {}).get("owner") == "temporal":
@@ -2978,6 +3091,7 @@ class PipelineBridge:
                 else:
                     rec.status = "cancelled"
                     rec.ended_at = _now()
+                    _settle_span(rec)
                     await self.store.put(rec)
                 # The human queue closes at REQUEST time either way: a cancelled
                 # pipeline must not still be collecting approvals while its
@@ -3456,6 +3570,7 @@ class PipelineBridge:
         if not self._finalizer_steps(rec):
             rec.status = "failed"
             rec.ended_at = _now()
+            _settle_span(rec)
             self._cleanup_pipeline_triggers(rec.pipeline_id)
             await self._audit(rec, "", "pipeline_failed", {"reason": reason})
             await self.store.put(rec)
