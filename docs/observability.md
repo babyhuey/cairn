@@ -27,7 +27,7 @@ OTEL_CONSOLE=1
 Spans print to the process log. No endpoint, no backend — handy while developing.
 
 ### 3. Direct OTLP to a managed backend — recommended for most deployments
-The engine speaks OTLP directly, so **no collector is needed**. In your `.env`:
+The engine speaks OTLP directly, so **no collector is needed**. The OTLP exporter ships in the `telemetry` extra: install `cairndev[telemetry]` before setting the endpoint (without it the engine logs a warning and runs with tracing off). In your `.env`:
 ```
 OTEL_EXPORTER_OTLP_ENDPOINT=https://<your-otlp-endpoint>
 OTEL_EXPORTER_OTLP_HEADERS=authorization=<token>

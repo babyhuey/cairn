@@ -15,6 +15,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 - Failed and retried flow-leg attempts now retain known partial spend in run cost accounting and subsequent budget reservations.
+- Setting `OTEL_EXPORTER_OTLP_ENDPOINT` without `cairndev[telemetry]` no longer stops the server at startup: `init_tracing` logs one warning naming the extra and runs with tracing off, as metrics already did (whose warning now names `cairndev[telemetry]`, not `cairn[telemetry]`). (#248)
 
 ## [0.3.1] - 2026-10-26
 
