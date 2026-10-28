@@ -105,6 +105,44 @@ async def test_tamper_is_detected(tmp_path, capsys, monkeypatch):
     assert "chain broken" in err
 
 
+async def _write_non_lineage_log(path):
+    """Three real audit/store rows, none a lineage.record."""
+    import os
+
+    os.environ["OBS_AUDIT_LOG"] = str(path)
+    op = AuditStoreOp()
+    for action in ("llm.call", "operation.approval", "tool.call"):
+        await op.run(AuditWriteInput(action=action, outcome="ok", target="t", metadata={}), _ctx())
+
+
+async def test_broken_chain_without_lineage_rows_is_reported(tmp_path, capsys, monkeypatch):
+    log = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("OBS_AUDIT_LOG", str(log))
+    await _write_non_lineage_log(log)
+    rows = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+    assert len(rows) == 3
+    rows[1]["actor"] = "mallory"  # alter row 1 without recomputing the chain
+    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    rc = lineage_cmd.main(["--audit-log", str(log)])
+    cap = capsys.readouterr()
+    assert rc == 2
+    assert "no lineage records" in cap.out
+    assert "chain broken at row(s) [1]" in cap.err
+
+
+async def test_intact_chain_without_lineage_rows_still_exits_1(tmp_path, capsys, monkeypatch):
+    log = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("OBS_AUDIT_LOG", str(log))
+    await _write_non_lineage_log(log)
+
+    rc = lineage_cmd.main(["--audit-log", str(log)])
+    cap = capsys.readouterr()
+    assert rc == 1
+    assert "no lineage records" in cap.out
+    assert "chain broken" not in cap.err
+
+
 async def test_generic_non_model_record(tmp_path, capsys, monkeypatch):
     """The reader is domain-neutral: a record with a totally different shape (an
     incident RCA — no dataset/adapter/model keys) is found, rendered from whatever

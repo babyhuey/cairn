@@ -182,7 +182,8 @@ def _run(subject: Optional[str], *, json: bool, audit_log: Optional[str]) -> int
         print(f"no lineage records{where} in {path}")
         if not _writer_installed():
             print("\n".join(_no_writer_lines()), file=sys.stderr)
-        return 1
+        if not broken:
+            return 1
     elif subject:
         for i, r in enumerate(matches):
             if i:
