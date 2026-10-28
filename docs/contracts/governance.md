@@ -31,7 +31,15 @@ and name the reason and the remedy in the error (`FlowNotRunnableError`, door
 ## Audit
 `audit_emit` (`src/cairn/core/obs/audit.py:140`) writes governed actions to the configured
 sink; the bridge publishes `pipeline.<event>` (`pipeline_bridge.py:2330`); every
-approval/verdict is on the durable record. Redaction: `src/cairn/core/obs/redact.py`
+approval/verdict is on the durable record. #233: a pipeline run also writes `pipeline.*` /
+`leg.*` rows through `audit_emit` (the helpers are in `dispatch/leg_hooks.py`, shared by the
+in-process bridge and the Temporal activities): `pipeline.admitted`, `pipeline.refused`,
+`pipeline.gate_approved`, `pipeline.step_advanced`, `pipeline.gate_rejected`,
+`pipeline.cancelled`, `pipeline.finished`, `approval.expired`, `approval.dismissed`,
+`leg.submitted`, `leg.retrying`, `leg.budget_refused`, `leg.finished`, `leg.compute_acquired`,
+`leg.compute_released`, `leg.promoted`, `leg.cancelled`, `run.cancelled` (fields:
+`docs/site/src/content/docs/concepts/runs.md`). These are additive row kinds on an existing
+seam; the payload carries ids, refs, states, amounts and actors only. Redaction: `src/cairn/core/obs/redact.py`
 (`redact.text` in `src/cairn/profiles/secure.toml`). What is **not** audited today: policy
 evaluation itself (only its effect on the plan), and flow-leg admission (see above).
 

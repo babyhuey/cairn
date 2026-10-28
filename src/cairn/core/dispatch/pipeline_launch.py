@@ -571,7 +571,39 @@ async def _price_and_check(plan: PipelinePlan, admission: Any, *, workspace_id: 
         raise _refuse(*reasons)
 
 
-async def launch_pipeline_def(
+async def launch_pipeline_def(d: PipelineDef, **kw: Any) -> Any:
+    """The launch door's body (:func:`_launch_pipeline_def`) plus its audit rows (#233): a
+    governance refusal writes ``pipeline.refused`` (the reasons, before any record
+    exists) and an admitted launch writes ``pipeline.admitted`` (the verdict and the
+    estimate recorded on the record). Ids, refs and reasons only — never the inputs."""
+    from cairn.core.dispatch.leg_hooks import audit_bound, audit_pipeline_event  # noqa: PLC0415 — cycle: hooks → executor → storage
+
+    ref = kw.get("bundle_ref") or f"{PIPELINE_PREFIX}{d.pack}/{d.name}"
+    src = str((kw.get("trigger") or {}).get("source") or "launch")
+    try:
+        rec = await _launch_pipeline_def(d, **kw)
+    except (AdmissionRefusedError, PolicyDeniedError, ServiceDoorError, GovernanceInputError) as e:
+        if audit_bound():
+            dec = getattr(e, "decision", None)
+            reasons = list(dec.refusing_reasons) if dec is not None else [str(e)]
+            await audit_pipeline_event(
+                "pipeline.refused", pipeline_id=ref, outcome="deny", refusal=type(e).__name__,
+                reasons=" | ".join(reasons), environment=kw.get("environment") or "",
+                workspace_id=kw.get("workspace_id") or "default", source=src)
+        raise
+    if audit_bound():
+        adm = dict(getattr(rec, "admission", None) or {})
+        est = adm.get("cost_estimate") or {}
+        await audit_pipeline_event(
+            "pipeline.admitted", pipeline_id=rec.pipeline_id, ref=ref, verdict=adm.get("verdict"),
+            degrading_reasons=" | ".join(adm.get("degrading_reasons") or []),
+            estimated_usd=est.get("estimate_usd"), environment=kw.get("environment") or "",
+            workspace_id=getattr(rec, "workspace_id", None), source=src,
+            budget_usd=((getattr(rec, "governance", None) or {}).get("budget") or {}).get("usd"))
+    return rec
+
+
+async def _launch_pipeline_def(
     d: PipelineDef,
     *,
     inputs: Optional[dict] = None,

@@ -925,9 +925,14 @@ def build_pipelines_router(dispatcher, pipeline_bridge) -> APIRouter:
                 "verdict": "rejected", "decider": decider}
 
     @r.post("/pipelines/{pipeline_id}/cancel", dependencies=[Depends(require_auth), Depends(support.writable_workspace)])
-    async def cancel_pipeline_route(pipeline_id: str) -> dict[str, Any]:
+    async def cancel_pipeline_route(
+        pipeline_id: str,
+        token: Annotated[Optional[str], Depends(_oauth2_scheme)] = None,
+    ) -> dict[str, Any]:
         await _pipeline_in_ws_or_404(pipeline_id)
-        rec = await pipeline_bridge.cancel_pipeline(pipeline_id)
+        # #233 — who stopped a (possibly paid) run: the token's identity, as approve records it
+        actor = await decision_actor(token, None, fallback="anonymous")
+        rec = await pipeline_bridge.cancel_pipeline(pipeline_id, actor=actor)
         return {"pipeline_id": pipeline_id, "status": rec.status}
 
     return r

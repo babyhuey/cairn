@@ -55,8 +55,9 @@ from cairn.core.dispatch.leg_executor import (
     recorded_stage_contracts,
 )
 from cairn.core.dispatch.leg_hooks import (
-    FlowLegHooks, budget_cap_usd, compute_target_for_kind, estimate_evidence, flow_leg_record, leg_price_kwargs,
-    pipeline_spent_usd,
+    FlowLegHooks, audit_bound, audit_flow_leg_finished, audit_leg_finished, audit_leg_submitted,
+    audit_pipeline_event, budget_cap_usd, compute_target_for_kind, estimate_evidence, flow_leg_record,
+    leg_price_kwargs, pipeline_spent_usd,
 )
 from cairn.core.dispatch.pipeline_resume import plan_resume
 from cairn.core.dispatch.target_concurrency import in_flight_on_target, target_cap
@@ -491,6 +492,8 @@ class PipelineBridge:
         # lock — for 20-30s+). Held here so the tasks aren't garbage-collected
         # mid-flight; stop() cancels them (a restart re-adopts from the store).
         self._leg_tasks: dict[str, asyncio.Task] = {}
+        #: #233 — pipelines whose terminal row (`pipeline.finished`) this process wrote
+        self._audited_terminal: set[str] = set()
         # ADR-0086 H5 (#1247) + #1532p2 — per-target count→admit critical
         # section. Was a single process-local lock, honestly documented as "a
         # brake, not a distributed mutex"; with the #1531 store-side count
@@ -1357,6 +1360,7 @@ class PipelineBridge:
                     announce = False  # no pipeline to settle the leg against
                     return
                 if rec.status in PIPELINE_TERMINAL:
+                    await self._audit_run_terminal(pid, step_id, term, run)   # #233 — still an outcome
                     return  # a leg finishing after its pipeline ended: announced, no-op
                 await self._apply_leg_terminal(rec, pid, step_id, term, run_id, run,
                                                after_restart)
@@ -1390,6 +1394,7 @@ class PipelineBridge:
         """The step-and-pipeline half of :meth:`_handle_terminal`, run under the
         pipeline lock once the terminal is known to apply."""
         output = reconstruct_step_output(run)
+        await self._audit_run_terminal(pid, step_id, term, run)
         st = rec.step_state.get(step_id) or StepState()
         st.run_id = run_id
         st.status = "done" if term == "done" else "failed"
@@ -1421,6 +1426,16 @@ class PipelineBridge:
         step = rec.plan.step(step_id) if rec.plan else None
         if step is not None:
             await self._emit_step_event(rec, step, output)
+
+    async def _audit_run_terminal(self, pid: str, step_id: str, term: str, run: Any) -> None:
+        """#233 — ``leg.finished`` for a leg run's terminal. A FLOW leg wrote its own row
+        from the engine outcome (:func:`audit_flow_leg_finished`: attempts, engine, cost),
+        so only the other kinds are written here."""
+        ref = str(getattr(run, "template_ref", "") or "")
+        if not audit_bound() or ref.startswith("flow:"):
+            return
+        await audit_leg_finished(pid, step_id, ref=ref, state=term, run=run,
+                                 reason=str(getattr(run, "error", "") or ""))
 
     async def _decide_loop(self, rec: PipelineRecord, step_id: str) -> bool:
         """Act on a bounded loop whose current iteration just completed (#1155).
@@ -1518,6 +1533,8 @@ class PipelineBridge:
         and parked for a person when it is not safe. Passes driven by run
         events or the advance door never set it."""
         rec = _rec or await self.store.get(pipeline_id)
+        if rec is not None and rec.status in PIPELINE_TERMINAL:
+            await self._audit_pipeline_finished(rec)   # #233 — ended on a path that skipped `_settle`
         if rec is None or rec.status != "running":
             return
         plan = rec.plan
@@ -1559,6 +1576,8 @@ class PipelineBridge:
                 st.ended_at = _now()
                 rec.step_state[s.id] = st
                 await self._audit(rec, s.id, "routed_off", {"when": s.when})
+                await audit_leg_finished(rec.pipeline_id, s.id, ref=s.ref, state="skipped",
+                                         reason=f"routed off: when {s.when}")
                 continue  # NOT a failure — the next steps see the skip as satisfied
             # GATE — governance as a trigger condition, evaluated by core over
             # persisted output. Fail → the step never submits; the pipeline
@@ -1569,6 +1588,8 @@ class PipelineBridge:
                 st.verdict = "gate_blocked"
                 rec.step_state[s.id] = st
                 await self._audit(rec, s.id, "gate_blocked", {"gate": s.gate})
+                await audit_leg_finished(rec.pipeline_id, s.id, ref=s.ref, state="skipped",
+                                         reason=f"blocked by gate: {s.gate}")
                 await self._fail_pipeline(rec, f"step '{s.id}' blocked by gate: {s.gate}")
                 return
             # The step is READY (deps done + gate passed). What gates the actual submit?
@@ -1694,6 +1715,8 @@ class PipelineBridge:
                               {"predicate": s.gate} if data_gate else {})
             if data_gate:
                 _gate_span(rec, s.id, "data")  # #222 — a human gate's span is the decision's
+            await audit_leg_finished(rec.pipeline_id, s.id, ref=s.ref, state="done",
+                                     reason="data gate predicate true" if data_gate else "gate approved")
             # #1627 — a loop body may END on a gate: the last word of a
             # retrain cycle is a human deciding whether to promote.
             # A gate leg has no RUN, so its completion never reaches
@@ -1757,6 +1780,7 @@ class PipelineBridge:
         rec.step_state[s.id] = st
         rec.cursor = sorted(set(rec.cursor) | {s.id})
         await self._audit(rec, s.id, "step_submitted", {"run_id": run.id, "ref": s.ref})
+        await audit_leg_submitted(rec, s.id, run, s.ref)   # #233 — hash-chained trail
 
     async def _submit_flow_leg(self, rec: PipelineRecord, s: Any, resolved: dict) -> Any:
         """Submit a `flow:` leg as its OWN governed run — no template wrapper (#1127).
@@ -2509,6 +2533,7 @@ class PipelineBridge:
                     st.ended_at = _now()
                     cur.step_state[s.id] = st
                     await self.store.put(cur)
+        await audit_leg_finished(rec.pipeline_id, s.id, ref=s.ref, state="cancelled", run=run, reason=reason)
         await self.dispatcher._emit(run.id, "cancelled",
                                     {"leg": s.ref, "step_id": s.id, "error": reason},
                                     pipeline_id=rec.pipeline_id)
@@ -2678,6 +2703,9 @@ class PipelineBridge:
             {"leg": s.ref, "step_id": s.id, "error": outcome.error or ""},
             pipeline_id=rec.pipeline_id,
         )
+        await audit_flow_leg_finished(
+            rec.pipeline_id, s.id, ref=s.ref, run=run, outcome=outcome, status=_leg_run_status(outcome),
+            engine=str((getattr(hooks, "leg_handle", None) or {}).get("engine", "") or ""))
 
     def _leg_engine(self, s: Any) -> Any:
         """The environment's engine for this leg's FLOW's kind.
@@ -2773,6 +2801,8 @@ class PipelineBridge:
                 st.ended_at = _now()
                 rec.step_state[s.id] = st
                 await self._audit(rec, s.id, "finalizer_skipped", {"error": str(e)})
+                await audit_leg_finished(rec.pipeline_id, s.id, ref=s.ref, state="skipped",
+                                         reason=f"finalizer skipped: {e}")
                 continue
             try:
                 if await self._submit_step(rec, s, outputs) is _REFUSED:
@@ -2812,12 +2842,32 @@ class PipelineBridge:
         """The side effects a terminal transition owes — fired on the transition,
         so a deferred failure announces when it is APPLIED, not when it was
         decided (and never twice)."""
+        await self._audit_pipeline_finished(rec, failure_reason)
         if rec.status != "failed":
             return
         reason = failure_reason or str((rec.trigger or {}).get("failure_reason") or "")
         await self._audit(rec, "", "pipeline_failed", {"reason": reason})
         await self._notify_pipeline_failed(rec, reason)
         logger.info("pipeline %s failed: %s", rec.pipeline_id, reason)
+
+    async def _audit_pipeline_finished(self, rec: PipelineRecord, failure_reason: str = "") -> None:
+        """#233 — ``pipeline.finished``: the terminal state with the pipeline's total settled
+        spend, once per pipeline per process. Read from the legs' run records, never estimated."""
+        # setdefault: a bridge built without __init__ (tests use __new__) has no set yet
+        audited = self.__dict__.setdefault("_audited_terminal", set())
+        if rec.pipeline_id in audited or not audit_bound():
+            return
+        audited.add(rec.pipeline_id)
+        try:
+            spent = await pipeline_spent_usd(rec, self.dispatcher.store)
+        except Exception:  # noqa: BLE001 — unknown spend is omitted, never reported as 0
+            spent = None
+        reason = failure_reason or str((rec.trigger or {}).get("failure_reason") or "")
+        await audit_pipeline_event(
+            "pipeline.finished", pipeline_id=rec.pipeline_id,
+            outcome={"done": "ok", "cancelled": "ok"}.get(rec.status, "error"),
+            state=rec.status, reason=reason, spent_usd=spent,
+            budget_usd=((getattr(rec, "governance", None) or {}).get("budget") or {}).get("usd"))
 
     def _recompute_status(self, rec: PipelineRecord) -> None:
         """`done` when every step is done/skipped; `paused` when something waits on a
@@ -2910,6 +2960,7 @@ class PipelineBridge:
                     f"step {step_id!r} is not awaiting (status="
                     f"{st.status if st else 'unknown'})"
                 )
+            awaiting = st.status
             # Temporal-owned pipeline (Phase 4): the durable workflow holds the wait —
             # deliver an `approve_step` signal; the workflow re-checks the gate + advances.
             if (rec.trigger or {}).get("owner") == "temporal":
@@ -2921,6 +2972,7 @@ class PipelineBridge:
                     st.approver = approver
                     rec.step_state[step_id] = st
                     await self.store.put(rec)
+                await self._audit_gate_decision(rec, step_id, approver, awaiting)   # #233 — before the leg it releases
                 await self._signal_temporal(pipeline_id, "approve_step", step_id)
                 await self._audit(rec, step_id, "approved" if approver else "advanced",
                                   {"approver": approver, "owner": "temporal"})
@@ -2960,6 +3012,7 @@ class PipelineBridge:
                 await self.store.put(rec)
                 await self._audit(rec, step_id, "fire_recorded", {"fired_key": fire_key})
             self._cleanup_step_triggers(pipeline_id, step_id)  # a schedule/event step is now firing
+            await self._audit_gate_decision(rec, step_id, approver, awaiting)   # #233 — before the leg it releases
             if await self._submit_step(rec, step, outputs) is _REFUSED:
                 await self._decide_review(
                     pipeline_id, step_id, "rejected", reviewer=approver or "",
@@ -2975,6 +3028,16 @@ class PipelineBridge:
             self._recompute_status(rec)
             await self.store.put(rec)
             return rec
+
+    async def _audit_gate_decision(self, rec: PipelineRecord, step_id: str, approver: Optional[str],
+                                   awaiting: str) -> None:
+        """#233 — ``pipeline.gate_approved`` (a person, the token's identity) or
+        ``pipeline.step_advanced`` (a manual/schedule/event wait released with no named
+        person), in the hash-chained trail. Written by the control plane for BOTH owners."""
+        await audit_pipeline_event(
+            "pipeline.gate_approved" if approver else "pipeline.step_advanced",
+            pipeline_id=rec.pipeline_id, step_id=step_id, actor=approver, wait=awaiting,
+            owner=(rec.trigger or {}).get("owner") or "inprocess")
 
     async def reject_step(
         self, pipeline_id: str, step_id: str, *, decider: str, reason: str,
@@ -3028,9 +3091,12 @@ class PipelineBridge:
                                       reviewer=decider, rationale=reason)
             await self._audit(rec, step_id, "rejected",
                               {"step": step_id, "decider": decider, "reason": reason})
+            await audit_pipeline_event(
+                "pipeline.gate_rejected", pipeline_id=pipeline_id, step_id=step_id, actor=decider,
+                outcome="deny", reason=reason, owner=(rec.trigger or {}).get("owner") or "inprocess")
             return await self.store.get(pipeline_id)  # type: ignore[return-value]
 
-    async def cancel_pipeline(self, pipeline_id: str) -> PipelineRecord:
+    async def cancel_pipeline(self, pipeline_id: str, *, actor: Optional[str] = None) -> PipelineRecord:
         """Cancel a pipeline as a unit (no new steps submit).
 
         #2540 — a child run a gate paused at ``awaiting_approval`` is settled
@@ -3056,7 +3122,8 @@ class PipelineBridge:
         (``scripts/ops/settle_dangling_runs.py``, D6).
         A finalizer's run is never touched: the teardown is what a cancel still
         owes (#1787). A Temporal-owned pipeline has its workflow cancelled
-        first, which is how its executing legs stop; #2555 (8): its
+        first, which is how its executing legs stop; #233: ``actor`` (the caller's token
+        identity) goes on the audit trail with the cancel; #2555 (8): its
         ``awaiting_approval`` child runs are then settled the same way, because
         nothing in the workflow or its activities does (cancelling the workflow
         cancels only the activity awaiting the run). Calling cancel again on a
@@ -3074,7 +3141,12 @@ class PipelineBridge:
                     await self._cancel_temporal(pipeline_id)  # cancel the durable workflow
                 self._cleanup_pipeline_triggers(pipeline_id)
                 await self._audit(rec, "", "pipeline_cancelled", {})
-                self._settle_human_waits_on_cancel(rec)
+                await audit_pipeline_event(
+                    "pipeline.cancelled", pipeline_id=pipeline_id, actor=actor, prior_status=rec.status,
+                    owner=(rec.trigger or {}).get("owner") or "inprocess")
+                for sid in self._settle_human_waits_on_cancel(rec):
+                    await audit_leg_finished(pipeline_id, sid, ref=getattr(rec.plan.step(sid), "ref", ""),
+                                             state="cancelled", reason="pipeline cancelled while waiting")
                 if self._finalizer_steps(rec):
                     # #1787 — cancel is the third terminal state a `finally:`
                     # must survive, and the one that used to leave a box billing
@@ -3093,6 +3165,7 @@ class PipelineBridge:
                     rec.ended_at = _now()
                     _settle_span(rec)
                     await self.store.put(rec)
+                    await self._audit_pipeline_finished(rec)
                 # The human queue closes at REQUEST time either way: a cancelled
                 # pipeline must not still be collecting approvals while its
                 # teardown runs.
@@ -3246,7 +3319,7 @@ class PipelineBridge:
             except Exception:  # noqa: BLE001 — settle the rest regardless
                 logger.exception("pipeline %s: could not cancel child run %s", pid, run.id)
 
-    def _settle_human_waits_on_cancel(self, rec: PipelineRecord) -> None:
+    def _settle_human_waits_on_cancel(self, rec: PipelineRecord) -> list[str]:
         """#2541 — a step parked on a person will never run once its pipeline is
         cancelled, so it stops reading as waiting: `skipped` with verdict
         `cancelled`, the same settlement `_settle_cancelled_while_queued` gives a
@@ -3256,12 +3329,15 @@ class PipelineBridge:
         Finalizer steps are left alone (#1787): their settlement is the teardown's
         own business, and marking one `skipped` here would count it as settled."""
         finals = {s.id for s in self._finalizer_steps(rec)}
+        settled: list[str] = []
         for sid, st in rec.step_state.items():
             if sid in finals or st.status not in ("awaiting_approval", "awaiting_advance"):
                 continue
             st.status = "skipped"
             st.verdict = "cancelled"
             st.ended_at = _now()
+            settled.append(sid)
+        return settled
 
     # ── Temporal-owned pipelines (Phase 4): signal / cancel the workflow ────
 
@@ -3574,6 +3650,7 @@ class PipelineBridge:
             self._cleanup_pipeline_triggers(rec.pipeline_id)
             await self._audit(rec, "", "pipeline_failed", {"reason": reason})
             await self.store.put(rec)
+            await self._audit_pipeline_finished(rec, reason)   # #233
             # #1791 — opt-in per [profile.notify]; the pause events are the default.
             await self._notify_pipeline_failed(rec, reason)
             logger.info("pipeline %s failed: %s", rec.pipeline_id, reason)
