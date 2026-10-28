@@ -20,31 +20,18 @@ from __future__ import annotations
 from cairn.core.operator import getenv
 
 import asyncio
-import hashlib
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cairn.core.operator import AuditEvent
+from cairn.core.operator import AuditEvent, GENESIS_HASH, chain_hash
 from cairn.core.operator import Operation, OperationContext, ReportSpec, register_operator
 
 from operator_audit_store.schemas.audit_store import (
     AuditWriteInput,
     AuditWriteOutput,
 )
-
-_GENESIS = "0" * 64
-
-
-def _canonical(payload: dict) -> str:
-    """Stable serialization for hashing — key order + separators are fixed."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _chain_hash(prev_hash: str, payload: dict) -> str:
-    return hashlib.sha256((prev_hash + _canonical(payload)).encode("utf-8")).hexdigest()
-
 
 def _default_path() -> Path:
     """Override with ``CAIRN_AUDIT_LOG``; defaults to ``audit.jsonl`` (CWD)."""
@@ -68,8 +55,8 @@ class _HashChainLog:
     def _recover_prev(self) -> str:
         try:
             if not self._path.exists():
-                return _GENESIS
-            last = _GENESIS
+                return GENESIS_HASH
+            last = GENESIS_HASH
             with self._path.open("r") as f:
                 for line in f:
                     line = line.strip()
@@ -81,7 +68,7 @@ class _HashChainLog:
                         continue
             return last
         except Exception:  # noqa: BLE001 — unreadable file → start a fresh chain
-            return _GENESIS
+            return GENESIS_HASH
 
     def _write_row(self, row: dict) -> None:
         """Blocking file append — run via asyncio.to_thread so the audit write
@@ -92,7 +79,7 @@ class _HashChainLog:
 
     async def append(self, payload: dict) -> str:
         async with self._lock:
-            h = _chain_hash(self._prev, payload)
+            h = chain_hash(self._prev, payload)
             row = {**payload, "prev_hash": self._prev, "hash": h}
             await asyncio.to_thread(self._write_row, row)
             self._prev = h
