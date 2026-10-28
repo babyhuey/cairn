@@ -26,7 +26,7 @@ cairn_engine = ">=0.1.0"
 # convention; no new store. Dispatches in-process; also usable as a template
 # `operation` node to write an audit row explicitly.
 [operator."audit/store"]
-version       = "0.1.0"
+version       = "0.1.1"
 implements    = ["contract://audit.sink/1.0.0"]
 input_schema  = "AuditWriteInput"
 output_schema = "AuditWriteOutput"
