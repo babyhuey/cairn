@@ -4,12 +4,18 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Upgrade notes
+- **A local rate prices local legs.** If you set `local_hourly_usd` in `[profile.budget]`, a flow leg the builtin engine runs on its own machine is priced and must declare a `timeout`; a pipeline that launched before can be refused for a missing `timeout` or an estimate that does not fit its cap. Without the setting nothing changes.
+
 ### Added
+- `[profile.budget]` gives a deployment a budget: `default_usd` (the cap of a pipeline that declares no `governance.budget`), `ceiling_usd` (the most any launch is capped at; a pipeline can lower its cap, and a declared figure above the ceiling runs under the ceiling) and `local_hourly_usd` (the rate of the engine's own machine). The launch door records the effective cap and its source on `PipelineRecord.admission.budget`, and the reservations, the Temporal activity, the gate's cost line and `cairn pipeline explain` read that figure. With no `[profile.budget]` behaviour is unchanged. (ADR-0155, #250, #251)
+- A flow leg the builtin engine runs on its own machine is priced at `local_hourly_usd × timeout` when the profile sets a rate, checked at the launch door and settled on every outcome like a leg on a priced `compute.ssh` box. (ADR-0155, #251)
 - `cairn pipeline explain` and `cairn pipeline show --plan` take `--preset <name>`, resolved by the launch door's own preset step (`expand_preset`, now shared with `launch_pipeline_def`): the same lookup, the same refusal of a preset key the pipeline no longer declares, and `-i` keys layered over the preset. Each input shows the layer it came from (`← preset 'name'`). (#231)
 - A `cairn remote` session the server refuses ends in one line, `session expired at HH:MM — run cairn remote login` (or `session refused by the server (401)`), and exit code 77, in every verb: `launch --watch` (with how to re-attach; the pipeline keeps running), `logs --follow` and `approve --watch` included. Before, a watch could go quiet or a follow could end with exit 0. The CLI still does not renew its sign-in (ADR-0142 D8). (#230)
 - `/healthz` reports `store_fingerprint`, a short hash naming the connection store the engine reads (`CAIRN_STORAGE`, else `CAIRN_CONNECTIONS_DB`, else the shared SQLite file; never its path or DSN). (#229)
 
 ### Changed
+- `cairn pipeline explain` shows the budget the launch door enforces (the pipeline's figure, or the deployment's default or ceiling) and no longer lists a workspace's `cost_cap_usd` variable as a source of a pipeline's budget, because the launch door never read it for a pipeline. The variable keeps its run-dialog role for workflow runs. (ADR-0155 D7)
 - `cairn connect add` and `cairn connect rm` check, before writing, that the engine at the endpoint `cairn remote` uses reads the store this CLI writes. On a mismatch nothing is written and the command exits 3, naming this CLI's store without credentials; `--force` writes anyway (on `add`, `--force` already meant overwrite). `cairn doctor` reports the same comparison as `engine_store`. When no engine answers, the write goes ahead and names the store. (#229)
 - `~/.cairn/config.toml` is created with mode 0600 and replaced whole, instead of written and then restricted. (#230)
 
