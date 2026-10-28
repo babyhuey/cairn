@@ -110,8 +110,19 @@ async def pipeline_submit_step(
     """
     from cairn.core.dispatch.leg_executor import leg_kind_of  # noqa: PLC0415 — engine code stays out of workflow imports
 
+    from cairn.core.obs.telemetry import span, use_parent  # noqa: PLC0415 — engine code stays out of workflow imports
+
+    # #222 — the workflow stays deterministic: it carries no trace state. The activity
+    # reads the root span's context from the pipeline record (stored at launch) and
+    # starts the leg as its child, in whatever worker process runs it.
+    parent = await _pipeline_trace_context(pipeline_id)
     if leg_kind_of(ref) == "flow":
-        return await _run_flow_leg(ref, resolved, pipeline_id, step_id, environment, step or {})
+        with span("cairn.flow_leg", {"flow": ref, "step": step_id, "run_id": pipeline_id,
+                                     "owner": "temporal"}, parent=parent) as sp:
+            run_id = await _run_flow_leg(ref, resolved, pipeline_id, step_id, environment, step or {})
+            if sp is not None:
+                sp.set_attribute("leg_run_id", run_id)
+            return run_id
     from cairn.core.storage.pipeline_store import default_pipeline_store  # noqa: PLC0415 — cycle
     from cairn.core.workspace import workspace_scope  # noqa: PLC0415 — engine code stays out of workflow imports
 
@@ -119,12 +130,28 @@ async def pipeline_submit_step(
     # request context, so the pipeline record names the leg's workspace — the one the
     # leg's run is stamped with and its connections and secrets resolve in.
     rec = await _leg_pipeline_record(default_pipeline_store(), pipeline_id, step_id)
-    with workspace_scope(getattr(rec, "workspace_id", "") or ""):
+    with workspace_scope(getattr(rec, "workspace_id", "") or ""), use_parent(parent):
         run = await _dispatcher().run_template(
             ref, resolved, environment=environment or None,
             bundle_pipeline_id=pipeline_id, step_id=step_id,
         )
     return run.id
+
+
+async def _pipeline_trace_context(pipeline_id: str) -> dict:
+    """The W3C context of the pipeline's root span, from its record (#222). Best
+    effort and ``{}`` when tracing is off: reading it must never fail or delay a leg
+    (the leg's own governed read of the record, ``_leg_pipeline_record``, still runs)."""
+    from cairn.core.obs.telemetry import tracing_active  # noqa: PLC0415 — engine code stays out of workflow imports
+
+    if not tracing_active():
+        return {}
+    try:
+        from cairn.core.storage.pipeline_store import default_pipeline_store  # noqa: PLC0415 — cycle
+        rec = await default_pipeline_store().get(pipeline_id)
+        return dict(getattr(rec, "trace_context", None) or {})
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 async def _leg_pipeline_record(pstore: Any, pipeline_id: str, step_id: str, *,
@@ -560,9 +587,15 @@ async def pipeline_mirror_state(pipeline_id: str, step_state: dict, status: str)
         rec.step_state = merged
         rec.status = status
         rec.updated_at = now
-        if status in ("done", "failed", "cancelled") and not rec.ended_at:
+        newly_terminal = status in ("done", "failed", "cancelled") and not rec.ended_at
+        if newly_terminal:
             rec.ended_at = now
         await store.put(rec)
+        if newly_terminal:
+            from cairn.core.obs.telemetry import span  # noqa: PLC0415 — engine code stays out of workflow imports
+            with span("cairn.pipeline.settle", {"run_id": pipeline_id, "status": status, "owner": "temporal"},
+                      parent=getattr(rec, "trace_context", None)):  # #222 — the trace's closing span
+                pass
     except Exception as e:  # noqa: BLE001 — read-model, never fail the workflow on it
         logger.debug("pipeline_mirror_state failed for %s: %s", pipeline_id, e)
 

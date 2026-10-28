@@ -29,6 +29,7 @@ from cairn.core.budget_reservations import (
 from cairn.core.dataflow import DataflowSpec
 from cairn.core.runtime.retry import RetryPolicy
 from cairn.core.dataflow.engine import is_terminal
+from cairn.core.obs.telemetry import StageSpans
 
 logger = logging.getLogger("cairn.core.dispatch.leg_executor")
 
@@ -475,9 +476,12 @@ async def execute_leg(
                         await on_submit(handle)
                     except Exception:  # noqa: BLE001
                         logger.debug("leg %s: on_submit persistence failed", ref, exc_info=True)
+            stage_spans = StageSpans()  # #222 — cairn.flow_stage children of the leg's span
+
             def _remember_status(polled: Any) -> None:
                 nonlocal status
                 status = polled
+                stage_spans.observe(polled)
 
             status = await _poll_until_terminal(
                 engine, handle, poll_budget_s, heartbeat=heartbeat,
