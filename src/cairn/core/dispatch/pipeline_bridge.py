@@ -2864,6 +2864,59 @@ class PipelineBridge:
             await self.store.put(rec)
             return rec
 
+    async def reject_step(
+        self, pipeline_id: str, step_id: str, *, decider: str, reason: str,
+    ) -> PipelineRecord:
+        """Reject a gate parked at ``awaiting_approval`` (ADR-0156 D5) — the attributable
+        "no" beside :meth:`advance_step`'s "yes". The step becomes ``skipped`` with the
+        verdict ``rejected`` and ``approver=decider``; the pipeline fails through
+        :meth:`_fail_pipeline` (so finalizers run and in-flight legs are handled as on any
+        failure), with ``step '<step>' rejected by <decider>: <reason>`` as the failure
+        reason; the gate's review is decided ``rejected`` (reviewer + rationale); and a
+        ``pipeline.rejected`` event carries ``{step, decider, reason}``. The pipeline's
+        status vocabulary is unchanged: the status is ``failed``, the verdict tells a
+        rejection from any other failure. Any other wait is refused (``ValueError``):
+        a manual, schedule or event wait is released or cancelled, not rejected.
+
+        Under a Temporal owner the verdict and decider are recorded first, then the
+        ``reject_step`` signal (the twin of ``approve_step``) ends the durable workflow as
+        failed; it schedules nothing more."""
+        async with self._lock(pipeline_id):
+            rec = await self.store.get(pipeline_id)
+            if rec is None:
+                raise ValueError(f"no pipeline {pipeline_id!r}")
+            if rec.status in ("done", "failed", "cancelled"):
+                raise ValueError(f"pipeline {pipeline_id!r} is {rec.status}")
+            if getattr(rec, "terminal_intent", ""):
+                raise ValueError(
+                    f"pipeline {pipeline_id!r} is finalizing "
+                    f"({rec.terminal_intent}) — no step can be rejected")
+            st = rec.step_state.get(step_id)
+            if st is None or st.status != "awaiting_approval":
+                raise ValueError(
+                    f"step {step_id!r} is not awaiting approval (status="
+                    f"{st.status if st else 'unknown'}) — only a gate parked at "
+                    f"awaiting_approval can be rejected")
+            reason_line = f"step '{step_id}' rejected by {decider}: {reason}"
+            st.verdict = "rejected"
+            st.approver = decider
+            if (rec.trigger or {}).get("owner") == "temporal":
+                rec.step_state[step_id] = st
+                rec.trigger = {**(rec.trigger or {}), "failure_reason": reason_line}
+                await self.store.put(rec)
+                await self._signal_temporal(pipeline_id, "reject_step", step_id)
+            else:
+                st.status = "skipped"
+                st.ended_at = st.ended_at or _now()
+                rec.step_state[step_id] = st
+                self._cleanup_step_triggers(pipeline_id, step_id)
+                await self._fail_pipeline(rec, reason_line)
+            await self._decide_review(pipeline_id, step_id, "rejected",
+                                      reviewer=decider, rationale=reason)
+            await self._audit(rec, step_id, "rejected",
+                              {"step": step_id, "decider": decider, "reason": reason})
+            return await self.store.get(pipeline_id)  # type: ignore[return-value]
+
     async def cancel_pipeline(self, pipeline_id: str) -> PipelineRecord:
         """Cancel a pipeline as a unit (no new steps submit).
 
