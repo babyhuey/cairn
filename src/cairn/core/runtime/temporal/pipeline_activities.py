@@ -297,7 +297,9 @@ async def _run_flow_leg(
     from cairn.core.dataflow.defs import flow_def_for  # noqa: PLC0415 — cycle: defs → pack registry
     from cairn.core.dispatch.dispatcher import new_run_id  # noqa: PLC0415 — cycle
     from cairn.core.dispatch.leg_executor import execute_leg, parse_flow_ref, recorded_stage_contracts  # noqa: PLC0415 — cycle
-    from cairn.core.dispatch.leg_hooks import FlowLegHooks, flow_leg_record, leg_price_kwargs, pipeline_spent_usd  # noqa: PLC0415 — cycle
+    from cairn.core.dispatch.leg_hooks import (  # noqa: PLC0415 — cycle
+        FlowLegHooks, budget_cap_usd, flow_leg_record, leg_price_kwargs, pipeline_spent_usd,
+    )
     from cairn.core.dispatch.pipeline_bridge import (  # noqa: PLC0415 — cycle
         _flow_leg_output,
         _leg_retry_policy,
@@ -328,7 +330,7 @@ async def _run_flow_leg(
     # the earlier legs ACTUALLY spent. Read before anything is created; an
     # unreadable run store is "unknown", so the activity retries (#2223).
     series_id = str(gov.get("series", "") or "")
-    budget_usd = float((gov.get("budget") or {}).get("usd", 0.0) or 0.0)
+    budget_usd = budget_cap_usd(rec)   # ADR-0155 D4: the recorded effective cap, as in the bridge
     spent_usd = 0.0
     if series_id and budget_usd:
         try:
