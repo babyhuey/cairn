@@ -77,8 +77,18 @@ with the gate `awaiting_approval`. From the same pipeline:
   a restart of the server resumes the pipeline at the same pause.
 - **Approving** releases the gate and records who approved, when, and any
   rationale: `cairn remote advance <pipeline_id> <gate>`, or
-  `POST /pipelines/<pipeline_id>/steps/<gate>/approve`. To refuse, cancel the
-  pipeline: `cairn remote cancel-pipeline <pipeline_id>`.
+  `POST /pipelines/<pipeline_id>/steps/<gate>/approve`.
+- **Rejecting** refuses the gate, with the person and the reason on the record:
+  `cairn remote reject <pipeline_id> <gate> --reason "…"`, or
+  `POST /pipelines/<pipeline_id>/steps/<gate>/reject` with `{"reason": "…"}`.
+  The same people may reject who may approve, and the reason is required. The
+  gate's step ends `skipped` with the verdict `rejected` and the person as its
+  approver; the pipeline ends `failed` with the reason `step '<gate>' rejected by
+  <person>: <reason>`, after any `finally:` steps have run; the gate's review is
+  closed as rejected; and a `pipeline.rejected` event is published. Only a gate
+  waiting for approval can be rejected; any other wait answers 409. A cancel is
+  different: `cairn remote cancel-pipeline <pipeline_id>` is the operator's abort,
+  not a decision on a gate.
 
 A gate can't have both `predicate:` and `approvers:`: the pipeline is refused
 at load with "a gate is answered by data OR a human, never both". If you need
@@ -153,7 +163,8 @@ rules:
 
 A task leg paused this way is approved with the same
 `cairn remote advance`. An approval inside an agentic flow pauses its run;
-decide it with `cairn remote approve <run_id>` or `cairn remote reject <run_id>`.
+decide it with `cairn remote approve <run_id>` or `cairn remote reject <run_id>`
+(a single run id: the run-level form, not the pipeline gate form above).
 
 ## Next
 

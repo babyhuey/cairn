@@ -22,7 +22,6 @@ from cairn.core.operator import getenv
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import os
@@ -30,7 +29,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cairn.core.operator import AuditEvent
+from cairn.core.operator import AuditEvent, GENESIS_HASH, chain_hash
 from cairn.core.operator import Operation, OperationContext, ReportSpec, register_operator
 
 from operator_audit_store.schemas.audit_store import (
@@ -39,17 +38,6 @@ from operator_audit_store.schemas.audit_store import (
 )
 
 logger = logging.getLogger(__name__)
-
-_GENESIS = "0" * 64
-
-
-def _canonical(payload: dict) -> str:
-    """Stable serialization for hashing — key order + separators are fixed."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _chain_hash(prev_hash: str, payload: dict) -> str:
-    return hashlib.sha256((prev_hash + _canonical(payload)).encode("utf-8")).hexdigest()
 
 
 def _default_path() -> Path:
@@ -113,7 +101,7 @@ def _tail_state(f) -> tuple[str, bool]:
     """
     size = f.seek(0, os.SEEK_END)
     if size == 0:
-        return _GENESIS, True
+        return GENESIS_HASH, True
     f.seek(size - 1)
     ends_nl = f.read(1) == b"\n"
     pos, buf = size, b""
@@ -136,7 +124,7 @@ def _tail_state(f) -> tuple[str, bool]:
             if isinstance(h, str) and h:
                 return h, ends_nl
     logger.warning("audit log has no readable chain head; starting a new chain")
-    return _GENESIS, ends_nl
+    return GENESIS_HASH, ends_nl
 
 
 class _HashChainLog:
@@ -159,7 +147,7 @@ class _HashChainLog:
         with self._path.open("a+b") as f:
             with _exclusive(f, self._path):
                 prev, ends_nl = _tail_state(f)
-                h = _chain_hash(prev, payload)
+                h = chain_hash(prev, payload)
                 row = {**payload, "prev_hash": prev, "hash": h}
                 data = ("" if ends_nl else "\n") + json.dumps(row, default=str) + "\n"
                 f.write(data.encode("utf-8"))
