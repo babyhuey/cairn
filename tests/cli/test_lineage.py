@@ -204,3 +204,17 @@ def test_writer_installed_reads_the_lineage_capability_from_the_manifests(monkey
     monkeypatch.setattr(L, "discover_operator_pack_manifests",
                         lambda: {"audit/store": _Entry(["audit.sink"]), "any/writer": _Entry(["lineage.record"])})
     assert lineage_cmd._writer_installed() is True
+
+
+async def test_expect_head_detects_rows_missing_from_the_tail(tmp_path, capsys, monkeypatch):
+    log = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("OBS_AUDIT_LOG", str(log))
+    await _write_lineage_row(log, target="a")
+    await _write_lineage_row(log, target="b")
+    head = json.loads(log.read_text().splitlines()[-1])["hash"]
+    assert lineage_cmd.main(["--expect-head", head[:12]]) == 0
+    capsys.readouterr()
+
+    log.write_text(log.read_text().splitlines()[0] + "\n")   # the last row is gone
+    assert lineage_cmd.main(["--expect-head", head[:12]]) == 2
+    assert "expected head" in capsys.readouterr().err
