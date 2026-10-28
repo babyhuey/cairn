@@ -79,7 +79,14 @@ def init_tracing(service_name: str | None = None) -> None:
     provider = TracerProvider(resource=resource)
 
     if otlp_endpoint:
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        try:
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        except ImportError:
+            logger.warning(
+                "OTLP trace exporter not installed — tracing disabled; "
+                "`pip install 'cairndev[telemetry]'` to enable it"
+            )
+            return
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{otlp_endpoint}/v1/traces")))
 
     if console_export:
