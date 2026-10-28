@@ -54,8 +54,9 @@ dataset version always points at one exact file.
 With the audit trail on, cairn appends security-relevant events to a log in
 which every row carries `sha256(previous hash + row)`. Changing or deleting a
 row breaks every hash after it. The log records operator approvals inside
-flows, model calls, actions and artifact changes. Pipeline gate decisions live
-on the pipeline record, as above.
+flows, model calls and actions, and every governed step of a pipeline run, listed
+below. The pipeline record and the run events stay the place to replay a run; the
+log is the part that is tamper-evident.
 
 The audit trail is part of the environment: it is on when the profile binds
 `audit.sink` to the `audit/store` operator. The `secure` profile does, and so
@@ -63,6 +64,33 @@ does the Docker Compose stack; `sandbox` and `local-dev` do not. A pipeline
 can also write an audit row as a leg of its own, as the example's
 `profile-and-publish` does with `task: audit/store`. The log file is
 `CAIRN_AUDIT_LOG` (`./audit.jsonl` when unset).
+
+### What a pipeline run writes
+
+Each row names an `action`, an `outcome` (`ok`, `deny` or `error`), the `actor`
+where a person acted (the signed-in identity, never a name typed into a request),
+a `target` (`<pipeline id>/<step>`) and ids, refs, states and amounts in its
+metadata. Inputs, outputs, prompts and tokens are never written.
+
+| Action | Written when | Notable fields |
+|---|---|---|
+| `pipeline.admitted` | the launch door admits a pipeline | `verdict`, `degrading_reasons`, `estimated_usd`, `budget_usd`, `source` |
+| `pipeline.refused` | the launch door refuses (data roles, holdout, licence, policy deny, service door, run hook, the GPU estimate or the budget) | `reasons`, `refusal`, outcome `deny` |
+| `pipeline.gate_approved` | a person releases a gate (`actor`); `pipeline.step_advanced` when a manual, schedule or event wait is released with no named person | `step_id`, `wait`, `owner` |
+| `pipeline.gate_rejected` | a person rejects a gate (`actor`) | `reason`, outcome `deny` |
+| `pipeline.cancelled` | a pipeline is cancelled (`actor`) | `prior_status` |
+| `approval.expired` · `approval.dismissed` | the TTL sweep expires a waiting approval · a person dismisses it (`actor`) | `run_id`, `pipeline_id`, `reason` |
+| `leg.submitted` | a leg exists as its own run | `ref`, `kind`, `engine`, `compute_target`, `estimated_usd` |
+| `leg.retrying` | a flow leg starts another attempt | `attempt`, `reason` |
+| `leg.budget_refused` | the leg's reservation would pass the series cap | `estimated_usd`, `spent_usd`, `budget_usd`, outcome `deny` |
+| `leg.finished` | a leg ends: `done`, `failed`, `cancelled` or `skipped` | `state`, `reason`, `attempts`, `engine`, `compute_target`, `settled_usd`, `llm_usd`, `gpu_usd` |
+| `leg.compute_acquired` · `leg.compute_released` · `leg.promoted` | a `compute/acquire`, `compute/release` or `artifact/promote` leg succeeds | `operator`, `capability` |
+| `leg.cancelled` · `run.cancelled` | `POST /runs/{id}/cancel` stops a leg's run · any other run (`actor`) | `prior_status` |
+| `pipeline.finished` | a pipeline reaches `done`, `failed` or `cancelled` | `state`, `reason`, `spent_usd`, `budget_usd` |
+
+The in-process owner (also used under `CAIRN_RUNTIME=dbos`) and the Temporal owner write
+the same rows; under Temporal they are written by activities, never by the workflow.
+With no `audit.sink` bound none of this is written and nothing else changes.
 
 ### Verify the audit trail
 
