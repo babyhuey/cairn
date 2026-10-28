@@ -1,6 +1,6 @@
 # ADR-0156 — CLI: `cairn audit verify`, a pipeline-gate reject, and the verb list as it is
 
-- **Status:** PROPOSED 2026-10-28. Approval: pending maintainer.
+- **Status:** ACCEPTED 2026-10-28. Approval: maintainer, 2026-10-28 (the recommendation in each open question taken as the decision).
 - **Date:** 2026-10-28
 - **Issues:** cairndev-sh/cairn#246 (verify the audit hash chain), cairndev-sh/cairn#257 (an
   attributable reject for a pipeline gate); related: cairndev-sh/cairn#247 (the `cairn lineage`

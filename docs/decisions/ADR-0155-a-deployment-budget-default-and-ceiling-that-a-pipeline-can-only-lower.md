@@ -1,6 +1,6 @@
 # ADR-0155 — A deployment budget: a default and a ceiling that a pipeline can only lower
 
-- **Status:** PROPOSED 2026-10-28. Approval: pending maintainer.
+- **Status:** ACCEPTED 2026-10-28. Approval: maintainer, 2026-10-28 (the recommendation in each open question taken as the decision).
 - **Date:** 2026-10-28
 - **Issues:** cairndev-sh/cairn#250 (a deployment-level default and ceiling), cairndev-sh/cairn#251
   (price a flow leg on the local machine); related: cairndev-sh/cairn#237 (legs that `when:` routes
