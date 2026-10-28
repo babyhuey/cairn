@@ -15,6 +15,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 - Failed and retried flow-leg attempts now retain known partial spend in run cost accounting and subsequent budget reservations.
+- `cairn lineage` (text mode) reports a broken audit chain (warning, exit 2) even when no `lineage.record` row matches, as `--json` already did; an intact chain with no match still exits 1. (#247)
 
 ## [0.3.1] - 2026-10-26
 
