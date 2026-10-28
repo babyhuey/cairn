@@ -109,12 +109,25 @@ applies_to:
   pipeline_legs: ["*/lora"]     # globs over leg refs: the flow hello-cairn/lora, the task train/lora
 rules:
   - effect: require_hitl
+    approval_role: ml-leads     # optional: who may decide the inserted gate
     reason: a person approves every fine-tune before it starts
 ```
 
 The inserted gate carries the name of the policy that added it, so the approver
-and the audit trail see why it exists. A leg that already sits behind a person
-gate isn't gated twice.
+and the audit trail see why it exists. If the rule sets `approval_role`, that is
+the gate's `approvers`, and the approve door applies it like any other
+`approvers:` value (see above). Without one, the gate takes the pipeline's
+`governance.approvers`.
+
+The policy's gate is satisfied only by its own decision. A leg that already sits
+behind a person gate isn't gated twice, but only when that gate always asks (it
+has no `when:`) and, if the rule sets `approval_role`, is staffed by that role.
+A gate with a `when:` can be skipped, so the policy's gate is inserted as well.
+
+`pipeline_legs` is matched when the pipeline is planned, and only then. A policy
+that sets nothing but `pipeline_legs` does not apply to individual operator
+calls; add `action_types`, `risks`, `environments` or `capabilities` to match
+those too.
 
 ## Approvals an operator asks for
 
