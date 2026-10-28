@@ -1,0 +1,119 @@
+# Fork-side dispatch wrapper: the `public` and `public-e2e` jobs of ci.yml (steps lifted
+# verbatim) and the dco check, run against any branch, tag or SHA of this fork.
+name: fork-ci
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: branch, tag or SHA to check out
+        required: true
+permissions:
+  contents: read
+jobs:
+  public:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: sk-ci-dummy
+      UV_PYTHON: '3.13'
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ inputs.target_ref }}
+        persist-credentials: false
+    - run: echo "checked-out SHA $(git rev-parse HEAD)"
+    - uses: astral-sh/setup-uv@v7
+      with:
+        version: 0.11.9
+        enable-cache: true
+        cache-dependency-glob: uv.lock
+    - name: Locked install of the public set only
+      run: uv sync --locked --extra dev --extra rag --extra rag-sqlite-vec --extra runtime-sqlite --extra runtime-temporal
+        --extra telemetry --extra auth --extra metaflow --extra skypilot
+    - name: Lint (ruff, the `python` job's rule set)
+      run: uvx ruff check .
+    - name: Nothing private is installed
+      run: .venv/bin/python scripts/check_public_set.py --extras metaflow,skypilot
+    - name: The optional operator packs' own tests (ADR-0134 D1)
+      run: env -u OBS_STORAGE -u CAIRN_STORAGE .venv/bin/pytest -q --no-header -p no:cacheprovider -m "not dbos and not timing
+        and not e2e" --junitxml=/tmp/test-results/public-optional.xml packages/cairn-operator-dataflow-metaflow/tests packages/cairn-operator-dataflow-skypilot/tests
+    - name: The public core's tests/core files (tests/core is exactly the public set here)
+      run: env -u OBS_STORAGE -u CAIRN_STORAGE .venv/bin/pytest -q --no-header -p no:cacheprovider -m "not dbos and not timing
+        and not e2e" --junitxml=/tmp/test-results/public.xml tests/core
+    - name: The public CLI and Helm chart tests (tests/cli, tests/deploy)
+      run: env -u OBS_STORAGE -u CAIRN_STORAGE .venv/bin/pytest -q --no-header -p no:cacheprovider -m "not dbos and not timing
+        and not e2e" --junitxml=/tmp/test-results/public-cli.xml tests/cli tests/deploy
+    - name: The CLI on the public core with the example pack
+      run: |
+        .venv/bin/cairn --help > /dev/null
+        CAIRN_PACK_PATH=examples/hello-cairn .venv/bin/cairn pipeline ls | tee /tmp/pipelines.txt
+        grep -q "hello-cairn" /tmp/pipelines.txt
+        CAIRN_PACK_PATH=examples/hello-cairn .venv/bin/cairn pipeline explain hello-cairn/profile-and-publish > /dev/null
+    - name: The built wheels (ADR-0137) — five, and cairndev carries the builtins and the core contracts
+      run: env -u OBS_STORAGE -u CAIRN_STORAGE .venv/bin/python scripts/check_folded_wheels.py
+    - if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-results-public
+        path: /tmp/test-results
+  public-e2e:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: sk-ci-dummy
+      UV_PYTHON: '3.13'
+      UV_PYTHON_PREFERENCE: only-managed
+      CAIRN_E2E: '1'
+      CAIRN_PROOF_PG_DSN: postgres://cairn:cairn@127.0.0.1:5432/cairn
+      HELLO_TRAIN_MODEL: sshleifer/tiny-gpt2
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: cairn
+          POSTGRES_PASSWORD: cairn
+          POSTGRES_DB: cairn
+        ports:
+        - 5432:5432
+        options: --health-cmd "pg_isready -U cairn" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ inputs.target_ref }}
+        persist-credentials: false
+    - run: echo "checked-out SHA $(git rev-parse HEAD)"
+    - uses: astral-sh/setup-uv@v7
+      with:
+        version: 0.11.9
+        enable-cache: true
+        cache-dependency-glob: uv.lock
+    - name: Locked install of the public set with the proof extras (train when the root declares it)
+      run: uv sync --locked --extra dev --extra rag --extra rag-sqlite-vec --extra storage-postgres --extra runtime-sqlite
+        --extra runtime-postgres --extra runtime-dbos --extra hello $(grep -q '^train = ' pyproject.toml && echo --extra train)
+    - name: Every matrix and crash cell of the feature proof (tests/e2e/hello)
+      run: env -u OBS_STORAGE -u CAIRN_STORAGE .venv/bin/pytest -q --no-header -p no:cacheprovider -rs -m e2e --junitxml=/tmp/test-results/public-e2e.xml
+        tests/e2e
+    - if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-results-public-e2e
+        path: /tmp/test-results
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ inputs.target_ref }}
+        persist-credentials: false
+        fetch-depth: 0
+    - run: echo "checked-out SHA $(git rev-parse HEAD)"
+    - name: Every commit not on upstream main is signed off
+      run: |
+        set -euo pipefail
+        git fetch --no-tags https://github.com/cairndev-sh/cairn.git main
+        missing=0
+        for c in $(git rev-list --no-merges FETCH_HEAD..HEAD); do
+          if ! git log -1 --format=%B "$c" | grep -qE '^Signed-off-by: .+ <[^>]+>$'; then
+            echo "::error::commit $c has no Signed-off-by line (git commit -s)"
+            missing=1
+          fi
+        done
+        exit "$missing"
