@@ -245,6 +245,12 @@ WORKER_TARGET_PREFIX = "worker:"
 #: (ADR-0152): any other engine's ``<kind>_target`` means something else (a legacy
 #: Metaflow metadata root, a pool, a cluster) and is never priced.
 PRICED_ENGINE = "builtin"
+#: ADR-0155 D6 — the connection name recorded for a leg priced on the engine's own
+#: machine. Not a registered connection: the rate is ``[profile.budget] local_hourly_usd``.
+LOCAL_CONNECTION = "local"
+#: Where the launch door records the effective budget: ``PipelineRecord.admission["budget"]``
+#: (ADR-0155 D3), never a column.
+BUDGET_KEY = "budget"
 
 
 class LegPriceUnreadable(RuntimeError):
@@ -289,12 +295,15 @@ def _hourly_rate(name: str, config: dict) -> float:
 
 async def price_flow_leg(target: str, timeout_s: Optional[float], *,
                          store: Any = None, multiplier: int = 1,
-                         multiplier_basis: str = "") -> Optional[dict]:
+                         multiplier_basis: str = "",
+                         local_hourly_usd: Optional[float] = None) -> Optional[dict]:
     """ADR-0151 D1 — the price of one flow leg on ``target``: ``hourly_usd ×
     timeout``, read from the target's connection config core-to-core (the way
     ``target_cap`` reads ``max_in_flight``; no secret is resolved).
 
-    ``None`` when the leg has no target. "Not priced" only for the definite cases:
+    ``None`` when the leg has no target, unless the deployment gave its own machine a
+    rate (ADR-0155 D6: ``local_hourly_usd`` from ``[profile.budget]``): the leg is then
+    priced like a remote one, on connection ``"local"``. "Not priced" only for the definite cases:
     a target that is not a ``compute.ssh`` connection (a ``worker:`` pool, another
     kind) or one that sets no ``hourly_usd`` — ``{"priced": False, "connection",
     "basis": "not priced: …"}``, never $0. A store, connection or rate that cannot
@@ -308,6 +317,9 @@ async def price_flow_leg(target: str, timeout_s: Optional[float], *,
     fields are ``None`` for a priced leg with no timeout, which the door refuses (D3)."""
     name = str(target or "").strip()
     if not name:
+        if local_hourly_usd and local_hourly_usd > 0:
+            return _priced_entry(LOCAL_CONNECTION, float(local_hourly_usd), timeout_s, multiplier,
+                                 multiplier_basis, where="the local machine (profile)")
         return None
     if name.startswith(WORKER_TARGET_PREFIX):
         return {"priced": False, "connection": name,
@@ -339,15 +351,21 @@ async def price_flow_leg(target: str, timeout_s: Optional[float], *,
     if hourly <= 0:
         return {"priced": False, "connection": name,
                 "basis": f"{NOT_PRICED}: connection {name!r} sets no hourly_usd"}
+    return _priced_entry(name, hourly, timeout_s, multiplier, multiplier_basis, where=name)
+
+
+def _priced_entry(name: str, hourly: float, timeout_s: Optional[float], multiplier: int,
+                  multiplier_basis: str, *, where: str) -> dict:
+    """One priced leg's entry: ``hourly × timeout`` per attempt, × the bounded runs."""
     runs = max(1, int(multiplier or 1))
     if not timeout_s or float(timeout_s) <= 0:
         return {"priced": True, "connection": name, "hourly_usd": hourly, "hours": None,
                 "per_attempt_usd": None, "runs": runs, "estimate_usd": None,
-                "basis": f"${hourly:g}/h on {name}, no timeout declared"}
+                "basis": f"${hourly:g}/h on {where}, no timeout declared"}
     hours = float(timeout_s) / 3600.0
     per = round(hourly * hours, 6)
     est = round(per * runs, 6)
-    basis = f"${hourly:g}/h × {hours:g}h on {name}"
+    basis = f"${hourly:g}/h × {hours:g}h on {where}"
     if runs > 1:
         basis += f" × {runs} ({multiplier_basis or 'runs'})"
     return {"priced": True, "connection": name, "hourly_usd": hourly, "hours": round(hours, 6),
@@ -377,12 +395,26 @@ def _leg_runs(plan: Any, s: Any, flow_kind: str) -> tuple[int, str]:
     return iterations * attempts, " × ".join(parts)
 
 
-async def price_plan(plan: Any, *, store: Any = None) -> dict:
+def deployment_budget() -> dict[str, float]:
+    """``[profile.budget]`` of the deployment profile (ADR-0155 D1); ``{}`` when the
+    environment names no profile or the profile sets none (D8). A profile that
+    cannot be read raises ``ProfileError`` — the launch door refuses on it."""
+    from cairn.core.pack.profile import load_profile_from_env  # noqa: PLC0415 - function-local, as the rest of dispatch reads profiles
+
+    return dict(load_profile_from_env().budget or {})
+
+
+async def price_plan(plan: Any, *, store: Any = None,
+                     local_hourly_usd: Optional[float] = None) -> dict:
     """The launch door's estimate (D2): every flow leg with a compute target,
     priced by :func:`price_flow_leg` at its bounded worst case (loop iterations ×
     attempts), in plan order. ``{}`` when no leg has a target, so a pipeline with
     no box records exactly what it recorded before. Raises
-    :class:`LegPriceUnreadable` naming the leg when a price cannot be read."""
+    :class:`LegPriceUnreadable` naming the leg when a price cannot be read.
+
+    ``local_hourly_usd`` (the profile's, read by the caller; ADR-0155 D6) prices a
+    builtin-engine leg with no target on the engine's own machine; unset, such a leg
+    is skipped as before."""
     from cairn.core.dispatch.leg_executor import flow_kind_of, leg_kind_of  # noqa: PLC0415 - cycle: executor → storage → here
 
     legs: list[dict] = []
@@ -395,7 +427,7 @@ async def price_plan(plan: Any, *, store: Any = None) -> dict:
         except Exception as e:  # noqa: BLE001 — a selection error is unknown, never "no target"
             raise LegPriceUnreadable(f"leg {s.id!r}: its engine and compute target cannot be read "
                                      f"({type(e).__name__}: {e})") from e
-        if not target:
+        if not target and (engine != PRICED_ENGINE or not local_hourly_usd):
             continue
         if engine != PRICED_ENGINE:
             # ADR-0152 — only the builtin engine dispatches to a connection; another
@@ -406,7 +438,8 @@ async def price_plan(plan: Any, *, store: Any = None) -> dict:
         runs, why = _leg_runs(plan, s, kind)
         try:
             price = await price_flow_leg(target, getattr(s, "timeout_s", None), store=store,
-                                         multiplier=runs, multiplier_basis=why)
+                                         multiplier=runs, multiplier_basis=why,
+                                         local_hourly_usd=local_hourly_usd)
         except LegPriceUnreadable as e:
             raise LegPriceUnreadable(f"leg {s.id!r}: {e}") from e
         if price is not None:
@@ -456,6 +489,25 @@ def leg_price_kwargs(rec: Any, step_id: str, run: Any) -> dict:
                 "adopted_started_at": getattr(run, "started_at", None)}
     gov = getattr(rec, "governance", None) or {}
     return {"estimated_usd": float(gov.get("estimated_usd", 0.0) or 0.0)}
+
+
+def recorded_budget(rec: Any) -> dict:
+    """The effective budget the launch door recorded on ``rec.admission`` (ADR-0155
+    D3): ``{usd, source, declared_usd, default_usd, ceiling_usd}``. ``{}`` for a record
+    admitted before the ADR or in a deployment with no ``[profile.budget]``."""
+    b = (getattr(rec, "admission", None) or {}).get(BUDGET_KEY)
+    return dict(b) if isinstance(b, dict) else {}
+
+
+def budget_cap_usd(rec: Any) -> float:
+    """The cap every reader of a pipeline's budget uses (ADR-0155 D4): the recorded
+    ``admission.budget.usd`` when present, else the pipeline's own
+    ``governance.budget.usd`` (records admitted before the ADR). 0.0 = no cap."""
+    rb = recorded_budget(rec)
+    if rb.get("usd") is not None:
+        return float(rb["usd"] or 0.0)
+    b = (getattr(rec, "governance", None) or {}).get("budget")
+    return float((b.get("usd") if isinstance(b, dict) else 0.0) or 0.0)
 
 
 def estimate_evidence(rec: Any, step_id: str) -> dict:
@@ -717,7 +769,8 @@ class FlowLegHooks:
         }
 
 
-__all__ = ["COST_ESTIMATE_KEY", "FlowLegHooks", "LegPriceUnreadable", "NOT_PRICED", "PRICED_ENGINE",
+__all__ = ["BUDGET_KEY", "COST_ESTIMATE_KEY", "LOCAL_CONNECTION", "budget_cap_usd", "deployment_budget",
+           "recorded_budget", "FlowLegHooks", "LegPriceUnreadable", "NOT_PRICED", "PRICED_ENGINE",
            "PRICED_TARGET_KIND", "engine_and_target_for_kind",
            "compute_target_for_kind", "estimate_evidence", "leg_price_kwargs", "price_flow_leg",
-           "price_plan", "publish_pipeline_audit", "recorded_cost_estimate", "recorded_leg_price"]
+           "price_plan", "publish_pipeline_audit", "budget_cap_usd", "recorded_budget", "recorded_cost_estimate", "recorded_leg_price"]

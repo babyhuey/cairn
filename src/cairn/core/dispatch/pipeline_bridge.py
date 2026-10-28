@@ -56,7 +56,7 @@ from cairn.core.dispatch.leg_executor import (
 )
 from cairn.core.dispatch.leg_hooks import (
     FlowLegHooks, audit_bound, audit_flow_leg_finished, audit_leg_finished, audit_leg_submitted,
-    audit_pipeline_event, compute_target_for_kind, estimate_evidence, flow_leg_record,
+    audit_pipeline_event, budget_cap_usd, compute_target_for_kind, estimate_evidence, flow_leg_record,
     leg_price_kwargs, pipeline_spent_usd,
 )
 from cairn.core.dispatch.pipeline_resume import plan_resume
@@ -2637,7 +2637,7 @@ class PipelineBridge:
         # fresh (unreadable → refused) vs adopted (unreadable → unknown, never
         # refused; a fresh retry after it is refused by execute_leg) rule.
         series_id = str(gov.get("series", "") or "")
-        budget_usd = float((gov.get("budget") or {}).get("usd", 0.0) or 0.0)
+        budget_usd = budget_cap_usd(rec)   # ADR-0155 D4: the recorded effective cap
         spent_usd, spend_error = await self._admission_spend(
             rec, s, capped=bool(series_id and budget_usd), adopt=adopt)
 
@@ -3685,11 +3685,10 @@ class PipelineBridge:
     def _budget_context(self, rec: PipelineRecord) -> dict[str, Any]:
         """Cost context WHEN PRESENT — never invented. The only cost number the
         bridge actually holds at a pause is the budget this pipeline was
-        admitted under (``governance.budget``, #1688); a gate author who wants a
+        admitted under (``governance.budget``, #1688, bounded by the deployment: ADR-0155); a gate author who wants a
         measured number surfaces it with ``show:``, and that arrives separately
         as the gate context's fields."""
-        budget = ((getattr(rec, "governance", None) or {}).get("budget") or {})
-        usd = budget.get("usd") if isinstance(budget, dict) else None
+        usd = budget_cap_usd(rec)   # ADR-0155 D4: the effective cap the launch door recorded
         return {"budget_usd": usd} if usd else {}
 
     async def _spend_evidence(self, rec: PipelineRecord) -> dict[str, Any]:
