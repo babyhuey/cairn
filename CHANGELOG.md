@@ -14,6 +14,9 @@ All notable changes to this project are documented here. The format follows [Kee
 - `~/.cairn/config.toml` is created with mode 0600 and replaced whole, instead of written and then restricted. (#230)
 
 ### Fixed
+- A policy-injected gate (`applies_to.pipeline_legs` with `require_hitl`) is satisfied only by its own decision: an upstream gate stands in for it only when it always asks (no `when:`) and, if the rule sets `approval_role`, is staffed by that role. Before, any upstream gate counted, including one a `when:` could skip. A loop's later iterations still run on the first iteration's decision; that is unchanged and open for a decision.
+- `approval_role` on a `require_hitl` rule is enforced for a policy-injected gate: it becomes the gate's `approvers`, and the approve door applies it. (A per-operation approval still records the role without checking the decider.)
+- A policy that sets only `applies_to.pipeline_legs` is matched when a pipeline is planned and no longer applies to individual operator calls at dispatch. (#34)
 - Failed and retried flow-leg attempts now retain known partial spend in run cost accounting and subsequent budget reservations.
 - `cairn lineage` (text mode) reports a broken audit chain (warning, exit 2) even when no `lineage.record` row matches, as `--json` already did; an intact chain with no match still exits 1. (#247)
 - Setting `OTEL_EXPORTER_OTLP_ENDPOINT` without `cairndev[telemetry]` no longer stops the server at startup: `init_tracing` logs one warning naming the extra and runs with tracing off, as metrics already did (whose warning now names `cairndev[telemetry]`, not `cairn[telemetry]`). (#248)
