@@ -8,8 +8,8 @@ output is a per-category report with one of three statuses per check:
 
   ✓ ok    — set / reachable / writable
   ⚠ warn  — unset-but-optional, unreachable, defaulted in a way operators often
-            want to override (e.g. unset CAIRN_RUN_DB → in-memory store
-            that loses state on restart)
+            want to override (e.g. unset CAIRN_STORAGE and CAIRN_RUN_DB →
+            in-memory store that loses state on restart)
   ✗ fail  — required-but-missing, unwritable path, or invalid value
 
 Pairs with ``cairn validate`` (artifact validation) and ``cairn ls``
@@ -32,6 +32,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import typer
 
@@ -90,12 +91,33 @@ def check_settings() -> list[CheckResult]:
 
 
 def check_run_db() -> CheckResult:
-    """If CAIRN_RUN_DB is set, verify the parent dir is writable."""
-    path = _settings.run_db_path()
+    """Where the run store persists, chosen as ``storage.default_store`` chooses it:
+    ``CAIRN_STORAGE`` (Postgres or a ``sqlite://`` file), else ``CAIRN_RUN_DB``, else
+    in-memory (#61). A SQLite file's parent dir must be writable."""
+    url = getenv("CAIRN_STORAGE", "").strip()
+    if url.startswith(("postgres://", "postgresql://")):
+        label = _settings.store_identity()[0]  # host:port/db, never the user or password
+        return CheckResult("run_db", "ok", f"{label} (CAIRN_STORAGE)", category="store")
+    if url.startswith("sqlite://"):
+        path, knob = _settings.sqlite_path_from_url(url) or ":memory:", "CAIRN_STORAGE"
+    elif url:
+        try:  # only the scheme: the value may carry a user and password
+            scheme = urlsplit(url).scheme
+        except ValueError:
+            scheme = ""
+        if not url.lower().startswith(f"{scheme}://"):
+            scheme = ""
+        named = f"has an unrecognized scheme {scheme!r}" if scheme else "is not a storage URL"
+        return CheckResult("run_db", "fail",
+                           f"CAIRN_STORAGE {named}; the run store refuses it "
+                           "(postgres://…, sqlite:///path.db, sqlite://:memory:)",
+                           category="store")
+    else:
+        path, knob = _settings.run_db_path(), "CAIRN_RUN_DB"
     if not path:
         return CheckResult(
             "run_db", "warn",
-            "CAIRN_RUN_DB unset → in-memory store (state lost on restart)",
+            "CAIRN_STORAGE and CAIRN_RUN_DB unset → in-memory store (state lost on restart)",
             category="store",
         )
     if path == ":memory:":
@@ -111,7 +133,7 @@ def check_run_db() -> CheckResult:
         return CheckResult("run_db", "fail",
                            f"parent dir {parent} is not writable", category="store")
     return CheckResult("run_db", "ok",
-                       f"parent {parent} is writable", category="store")
+                       f"{path} ({knob}); parent {parent} is writable", category="store")
 
 
 def check_engine_store() -> Optional[CheckResult]:

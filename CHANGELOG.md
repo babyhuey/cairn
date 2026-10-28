@@ -33,6 +33,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - Failed and retried flow-leg attempts now retain known partial spend in run cost accounting and subsequent budget reservations.
 - `cairn lineage` (text mode) reports a broken audit chain (warning, exit 2) even when no `lineage.record` row matches, as `--json` already did; an intact chain with no match still exits 1. (#247)
 - Setting `OTEL_EXPORTER_OTLP_ENDPOINT` without `cairndev[telemetry]` no longer stops the server at startup: `init_tracing` logs one warning naming the extra and runs with tracing off, as metrics already did (whose warning now names `cairndev[telemetry]`, not `cairn[telemetry]`). (#248)
+- `cairn doctor`'s `run_db` row reads the run store the way the store chooses it: `CAIRN_STORAGE` first (a Postgres DSN is reported as `postgres host:port/db`, a `sqlite://` URL by its file), then `CAIRN_RUN_DB`, else in-memory. It no longer warns "in-memory" when `CAIRN_STORAGE` persists runs, names the file it checked, and fails on a `CAIRN_STORAGE` that is not a storage URL, as the store refuses it. (#61)
 
 ## [0.3.1] - 2026-10-26
 
