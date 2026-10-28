@@ -12,7 +12,7 @@
 
 [pack]
 name        = "obs-operator-audit-store"
-version     = "0.1.0"
+version     = "0.1.1"
 type        = "operator"
 description = "Zero-dep hash-chained append-only audit log — provides the audit.sink capability."
 kind        = "service_provider"

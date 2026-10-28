@@ -14,6 +14,9 @@ All notable changes to this project are documented here. The format follows [Kee
 - `~/.cairn/config.toml` is created with mode 0600 and replaced whole, instead of written and then restricted. (#230)
 
 ### Fixed
+- `audit/store` keeps one hash chain per log however many writers share it: each append takes an exclusive file lock and reads the last row's hash from the file, instead of chaining off a head held in memory per instance. The service sink, a `task: audit/store` leg and a second process (the server and a CLI run under one `CAIRN_AUDIT_LOG`) now extend the same chain, and `cairn lineage` verifies it. Pack version 0.1.1.
+- `cairn lineage --expect-head <hash>` compares the log's last row with a receipt quoted earlier, so rows missing from the end of a log are reported (the chain alone verifies the same with or without them); the broken-chain warning no longer says "truncated" for what the chain alone can show.
+- `POST /approvals/dismiss` records the token's identity as the actor when auth is on, as gate decisions do; a different `actor` in the body is ignored and logged.
 - Failed and retried flow-leg attempts now retain known partial spend in run cost accounting and subsequent budget reservations.
 - `cairn lineage` (text mode) reports a broken audit chain (warning, exit 2) even when no `lineage.record` row matches, as `--json` already did; an intact chain with no match still exits 1. (#247)
 - Setting `OTEL_EXPORTER_OTLP_ENDPOINT` without `cairndev[telemetry]` no longer stops the server at startup: `init_tracing` logs one warning naming the extra and runs with tracing off, as metrics already did (whose warning now names `cairndev[telemetry]`, not `cairn[telemetry]`). (#248)

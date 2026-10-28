@@ -105,7 +105,7 @@ anyway. When no engine answers, the write goes ahead and the line names the stor
 | Command | What it does |
 |---|---|
 | `cairn replay <run-id>` | Replays a past run's recorded event trace as a timeline. `--json` for the raw events. |
-| `cairn lineage [subject]` | Shows provenance records from the audit log, matched on a subject such as a model name, and checks the hash chain as it reads. Omit the subject to list them all. The operator that writes lineage records is part of cairn-platform. |
+| `cairn lineage [subject]` | Shows provenance records from the audit log, matched on a subject such as a model name, and checks the hash chain as it reads. Omit the subject to list them all. `--expect-head <hash>` also checks that the log ends at a receipt you quoted earlier, which shows rows missing from its end. The operator that writes lineage records is part of cairn-platform. |
 
 ## A remote server
 

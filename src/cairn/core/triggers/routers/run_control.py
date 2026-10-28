@@ -322,12 +322,16 @@ def build_run_control_router(dispatcher, *, pipeline_bridge=None) -> APIRouter:
         updated = await dispatcher.get(run_id)
         return (updated or inv).model_dump(mode="json")
 
-    @r.post("/approvals/dismiss", dependencies=[Depends(support.writable_workspace)])
-    async def dismiss_approvals_endpoint(body: DismissApprovals) -> dict[str, Any]:
+    @r.post("/approvals/dismiss", dependencies=[Depends(require_auth), Depends(support.writable_workspace)])
+    async def dismiss_approvals_endpoint(
+        body: DismissApprovals,
+        token: Annotated[Optional[str], Depends(_oauth2_scheme)] = None,
+    ) -> dict[str, Any]:
         """Bulk-dismiss stale HITL gates (the console action). ``all_stale`` sweeps
         every awaiting_approval run past the governance TTL now; otherwise the named
         ``run_ids`` are expired. Workspace-scoped + fail-closed: only awaiting_approval
-        runs in the caller's workspace are touched, each audited."""
+        runs in the caller's workspace are touched, each audited. Under auth the
+        recorded actor is the token's identity, as for a gate decision (#2310)."""
         from cairn.core.approval.reaper import dismiss_runs, expire_stale_approvals, ttl_hours_from_env
 
         ws = current_workspace()
@@ -336,8 +340,9 @@ def build_run_control_router(dispatcher, *, pipeline_bridge=None) -> APIRouter:
                 dispatcher.store, ttl_hours=ttl_hours_from_env(), workspace_id=ws,
             )
             return {"expired": expired, "skipped": [], "count": len(expired)}
+        actor = await decision_actor(token, body.actor, fallback="console")
         result = await dismiss_runs(
-            dispatcher.store, body.run_ids, actor=body.actor, workspace_id=ws,
+            dispatcher.store, body.run_ids, actor=actor, workspace_id=ws,
         )
         return {**result, "count": len(result["expired"])}
 

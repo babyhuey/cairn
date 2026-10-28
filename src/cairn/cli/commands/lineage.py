@@ -157,7 +157,19 @@ def _render_line(row: dict) -> str:
     return f"{_subject_of(row):24}  {run_id:28}  {receipt}…"
 
 
-def _run(subject: Optional[str], *, json: bool, audit_log: Optional[str]) -> int:
+def _head_mismatch(rows: list[dict], expect_head: Optional[str]) -> bool:
+    """True when ``expect_head`` (a full hash or a prefix of one, as quoted from an
+    earlier receipt) is not the hash of the log's last row. This is how a log that
+    lost rows from its tail is told apart from one that did not: the chain alone
+    verifies the same either way."""
+    if not expect_head:
+        return False
+    last = str(rows[-1].get("hash") or "") if rows else ""
+    return not (last and last.startswith(expect_head.strip()))
+
+
+def _run(subject: Optional[str], *, json: bool, audit_log: Optional[str],
+         expect_head: Optional[str] = None) -> int:
     path = _audit_path(audit_log)
     if not path.exists() and not _writer_installed():
         print("\n".join(_no_writer_lines()), file=sys.stderr)
@@ -170,11 +182,12 @@ def _run(subject: Optional[str], *, json: bool, audit_log: Optional[str]) -> int
 
     rows, broken = _read_chain(path)
     matches = [r for r in rows if _matches(r, subject)]
+    head_mismatch = _head_mismatch(rows, expect_head)
 
     if json:
         print(_json.dumps(
             {"records": [r.get("metadata") or r for r in matches],
-             "chain_ok": not broken},
+             "chain_ok": not broken and not head_mismatch},
             indent=2, default=str,
         ))
     elif not matches:
@@ -182,7 +195,7 @@ def _run(subject: Optional[str], *, json: bool, audit_log: Optional[str]) -> int
         print(f"no lineage records{where} in {path}")
         if not _writer_installed():
             print("\n".join(_no_writer_lines()), file=sys.stderr)
-        if not broken:
+        if not broken and not head_mismatch:
             return 1
     elif subject:
         for i, r in enumerate(matches):
@@ -196,8 +209,13 @@ def _run(subject: Optional[str], *, json: bool, audit_log: Optional[str]) -> int
             print(f"  {_render_line(r)}")
 
     if broken:
-        print(f"\n⚠ audit chain broken at row(s) {broken} — the log was altered "
-              f"or truncated; provenance is NOT trustworthy.", file=sys.stderr)
+        print(f"\n⚠ audit chain broken at row(s) {broken} — the log was altered; "
+              f"provenance is NOT trustworthy.", file=sys.stderr)
+        return 2
+    if head_mismatch:
+        print(f"\n⚠ the log's last row is not the expected head {expect_head!r} — rows "
+              f"are missing from its end or it is a different log; provenance is NOT trustworthy.",
+              file=sys.stderr)
         return 2
     return 0
 
@@ -215,9 +233,14 @@ def cmd(
     audit_log: Optional[str] = typer.Option(
         None, "--audit-log", help="Audit log path (default: $CAIRN_AUDIT_LOG or ./audit.jsonl)."
     ),
+    expect_head: Optional[str] = typer.Option(
+        None, "--expect-head",
+        help="Hash of the last row you expect (a receipt quoted earlier, full or a prefix). "
+        "The chain alone cannot show rows missing from its end; this does.",
+    ),
 ) -> None:
     """Show the content-addressed provenance/lineage record(s) for a subject."""
-    raise typer.Exit(code=_run(subject, json=json, audit_log=audit_log))
+    raise typer.Exit(code=_run(subject, json=json, audit_log=audit_log, expect_head=expect_head))
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -228,8 +251,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("subject", nargs="?", default=None)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--audit-log", default=None)
+    parser.add_argument("--expect-head", default=None)
     args = parser.parse_args(argv)
-    return _run(args.subject, json=args.json, audit_log=args.audit_log)
+    return _run(args.subject, json=args.json, audit_log=args.audit_log, expect_head=args.expect_head)
 
 
 if __name__ == "__main__":
