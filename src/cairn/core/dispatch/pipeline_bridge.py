@@ -2748,9 +2748,11 @@ class PipelineBridge:
     async def _audit_pipeline_finished(self, rec: PipelineRecord, failure_reason: str = "") -> None:
         """#233 — ``pipeline.finished``: the terminal state with the pipeline's total settled
         spend, once per pipeline per process. Read from the legs' run records, never estimated."""
-        if rec.pipeline_id in self._audited_terminal or not audit_bound():
+        # setdefault: a bridge built without __init__ (tests use __new__) has no set yet
+        audited = self.__dict__.setdefault("_audited_terminal", set())
+        if rec.pipeline_id in audited or not audit_bound():
             return
-        self._audited_terminal.add(rec.pipeline_id)
+        audited.add(rec.pipeline_id)
         try:
             spent = await pipeline_spent_usd(rec, self.dispatcher.store)
         except Exception:  # noqa: BLE001 — unknown spend is omitted, never reported as 0
