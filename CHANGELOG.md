@@ -4,8 +4,16 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-28
+
+A patch release: a governed pipeline run leaves a complete, verifiable trail. Its governance decisions and spend reach the hash-chained audit log, `cairn audit verify` checks that log, a pipeline gate can be rejected with an attributed reason, a pipeline run is one OpenTelemetry trace, and a deployment can set a budget default and ceiling. New fields and tables are additive and off by default; the behaviour changes below are tightenings of governance that was weaker than documented.
+
 ### Upgrade notes
+- **A policy-injected gate needs its own decision.** A gate a policy adds (`applies_to.pipeline_legs` with `require_hitl`) is no longer satisfied by approving the leg it guards or another gate; approve the injected gate itself. Its `approval_role` is now enforced as the gate's approvers, so an approver outside that role is refused.
+- **A `pipeline_legs`-only policy applies when the pipeline is planned, not at run admission.** A policy that sets only `applies_to.pipeline_legs` no longer also matches each leg's run.
+- **`POST /approvals/dismiss` and the cancel routes record the token's identity** as the actor when sign-in is on; a body-supplied actor is ignored there.
 - **A local rate prices local legs.** If you set `local_hourly_usd` in `[profile.budget]`, a flow leg the builtin engine runs on its own machine is priced and must declare a `timeout`; a pipeline that launched before can be refused for a missing `timeout` or an estimate that does not fit its cap. Without the setting nothing changes.
+- The example pack `cairn-pack-hello` is 0.2.5 in this release (unchanged apart from the version).
 
 ### Added
 - A governed pipeline run's hash-chained audit log (`audit.sink`) now records every governance decision and spend, so `cairn audit verify` shows a complete trail. Through the one `audit_emit` chokepoint, with ids, refs, states, amounts and actors only: `pipeline.admitted` and `pipeline.refused` (the launch door, with the reasons), `pipeline.gate_approved` / `pipeline.step_advanced` / `pipeline.gate_rejected` (the actor is the token's identity), `pipeline.cancelled` and `leg.cancelled` / `run.cancelled` (`POST /pipelines/{id}/cancel` and `POST /runs/{id}/cancel` now record who cancelled), `approval.expired` / `approval.dismissed`, `leg.submitted` and `leg.finished` for task, flow and template legs (engine, compute target, attempts, estimated and settled cost, the reason a leg failed, was cancelled or skipped), `leg.retrying`, `leg.budget_refused`, `leg.compute_acquired` / `leg.compute_released` / `leg.promoted`, and `pipeline.finished` with the total spend. The in-process bridge (and DBOS) and the Temporal owner (from activities) write the same rows; with no sink bound nothing is written. `PipelineBridge.cancel_pipeline`, `RunDispatcher.cancel`, `expire_run` and `expire_stale_approvals` take an optional `actor`. (#233)
