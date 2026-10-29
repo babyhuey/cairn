@@ -3,6 +3,8 @@
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Security
+- A storage or bus URL's user and password are no longer printed (GHSA-gw2v-3922-g7gm, reported by Hannah Lyons). `default_store()`'s refusal of an unrecognised `CAIRN_STORAGE` names at most its scheme instead of echoing the value. In `cairn doctor`, the `set:` rows show a URL as `<scheme>://host:port/path` (no user, password or query) and a value with an `@` but no scheme as `***`; this covers `CAIRN_BUS`, `CAIRN_TRIGGER_INBOX` and `CAIRN_JOB_CHANNEL`, which printed a valid DSN in full, and `CAIRN_STORAGE`, whose mask kept the first 8 characters. The `config[<key>]` rows show a backend kind: a value with no scheme that is not a plain kind word is `unrecognized`, never the value, and `CAIRN_BUS` resolves to its kind (`postgres`) as `CAIRN_STORAGE` does. Anyone who shared `cairn doctor` output or kept CI logs from a deployment whose storage or bus URL carries a password should rotate that password.
 
 ## [0.3.2] - 2026-10-28
 

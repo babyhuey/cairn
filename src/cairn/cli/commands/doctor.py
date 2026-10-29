@@ -49,9 +49,13 @@ _PROBE_TIMEOUT_SECONDS = 2.0
 
 
 def _mask(value: str) -> str:
-    """Mask a secret like 'xoxb-1234567' → 'xoxb-12******'."""
+    """Mask a secret like 'xoxb-1234567' → 'xoxb-12******'. A URL, or a DSN missing
+    its scheme, goes through ``redacted_url`` instead: its first characters are the
+    user and password (GHSA-gw2v-3922-g7gm)."""
     if not value:
         return ""
+    if _settings.url_scheme(value) or "@" in value:
+        return _settings.redacted_url(value)
     keep = min(8, max(2, len(value) // 4))
     return value[:keep] + "*" * max(4, len(value) - keep)
 
@@ -76,7 +80,8 @@ def check_settings() -> list[CheckResult]:
                                        "unset (optional)",
                                        category=spec.category))
             continue
-        shown = _mask(raw) if spec.secret else raw
+        # A knob not marked secret can still hold a DSN (CAIRN_BUS, CAIRN_JOB_CHANNEL)
+        shown = _mask(raw) if spec.secret else _settings.redacted_url(raw)
         if legacy and not os.environ.get(spec.env_var):  # ADR-0122 D4: read until 1.0, then ignored
             out.append(CheckResult(spec.env_var, "warn",
                                    f"set: {shown} via {legacy} — deprecated, rename it to {spec.env_var}",
@@ -971,7 +976,7 @@ def _backend_provenance_checks() -> list[CheckResult]:
         # so a colon here would make a diagnostic row masquerade as a check.
         CheckResult(
             f"config[{r['key']}]", "ok",
-            f"{r['key']}={r['value']} (from {r['provenance']}"
+            f"{r['key']}={_settings.redacted_url(str(r['value']))} (from {r['provenance']}"
             + (f": {r['env']}" if r["provenance"] == "env" and r["env"] else "")
             + ")",
             category="profile",
